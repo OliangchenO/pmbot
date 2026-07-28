@@ -320,6 +320,23 @@ def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_p
     bot.metrics.close()
 
 
+def test_cooldown_recovery_only_keeps_complement_for_meaningful_inventory(tmp_path):
+    """冷却期只能保留降低裸仓的互补买单，平仓市场仍完全撤单。"""
+    bot = _bot(tmp_path)
+    market = _market()
+    desired = [Quote(market.yes_token, 0.47, 30.0),
+               Quote(market.no_token, 0.50, 30.0)]
+
+    excess_yes = bot._cooldown_recovery_quotes(market, desired, unpaired=12.0)
+    excess_no = bot._cooldown_recovery_quotes(market, desired, unpaired=-12.0)
+    flat = bot._cooldown_recovery_quotes(market, desired, unpaired=0.0)
+
+    assert [(q.token_id, q.size) for q in excess_yes] == [(market.no_token, 12.0)]
+    assert [(q.token_id, q.size) for q in excess_no] == [(market.yes_token, 12.0)]
+    assert flat == []
+    bot.metrics.close()
+
+
 def test_sticky_disabled_returns_plain_top_n(tmp_path):
     bot = _bot(tmp_path)
     bot.cfg["scanner"] = {"top_n_markets": 2, "sticky_swap": False}
@@ -378,3 +395,11 @@ def test_configure_logging_does_not_wait_for_slow_file_io(tmp_path, monkeypatch)
     main.stop_logging()
 
     assert elapsed < 0.05
+
+
+def test_runtime_log_formatter_uses_beijing_time():
+    record = logging.LogRecord("pmbot", logging.INFO, "", 0, "message", (), None)
+    record.created = 0.0
+    formatter = main.BeijingFormatter("%(asctime)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    assert formatter.format(record) == "1970-01-01 08:00:00"

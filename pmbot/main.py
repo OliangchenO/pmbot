@@ -17,7 +17,7 @@ import csv
 import logging
 import queue
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
 from pathlib import Path
 
@@ -37,6 +37,7 @@ from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 console = Console()
 log = logging.getLogger("pmbot")
 _LOG_LISTENER: QueueListener | None = None
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 LOOP_SECONDS = 2.0
 REWARD_SAMPLE_SECONDS = 60.0
@@ -69,6 +70,14 @@ UNFILLED_RESCAN_INTERVAL_SECS = 90.0
 ROTATE_FLAT_USD = 1.0
 
 
+class BeijingFormatter(logging.Formatter):
+    """Format runtime log timestamps explicitly in Asia/Shanghai time."""
+
+    def formatTime(self, record, datefmt=None):  # noqa: N802 - logging API name
+        timestamp = datetime.fromtimestamp(record.created, BEIJING_TZ)
+        return timestamp.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+
 def stop_logging() -> None:
     """Drain and stop the asynchronous runtime-log writer, if configured."""
     global _LOG_LISTENER
@@ -89,7 +98,7 @@ def configure_logging(log_dir: Path | str = "logs") -> logging.Logger:
         directory / "pmbot.log", when="midnight", backupCount=0,
         encoding="utf-8",
     )
-    file_handler.setFormatter(logging.Formatter(
+    file_handler.setFormatter(BeijingFormatter(
         "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
@@ -729,6 +738,15 @@ class Bot:
         return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
                 for q in desired if q.token_id == complement]
 
+    @staticmethod
+    def _cooldown_recovery_quotes(m: gamma.Market,
+                                  desired: list[strategy.Quote],
+                                  unpaired: float) -> list[strategy.Quote]:
+        """Keep only risk-reducing complementary bids during market cooldown."""
+        if abs(unpaired) < MIN_TAKER_SHARES:
+            return []
+        return Bot._inventory_recovery_quotes(m, desired, unpaired)
+
     async def _quote_all(self) -> None:
         r = self.cfg["risk"]
         max_inv = r["max_inventory_usd_per_market"]
@@ -789,11 +807,7 @@ class Bot:
                                 m.question[:45])
                     updates.append((m, []))
                 continue
-            if not self.guards.allow(m.condition_id, now):
-                self.metrics.sample_uptime(m.condition_id, False)
-                if self.broker.open_quotes(m):
-                    updates.append((m, []))
-                continue
+            cooled_down = not self.guards.allow(m.condition_id, now)
             if not self.risk.theme_quoting_ok(m, all_markets, net_exp, self._scale):
                 self.metrics.sample_uptime(m.condition_id, False)
                 if self.broker.open_quotes(m):
@@ -824,9 +838,12 @@ class Bot:
                 markout_avg=markout_avg,
                 size_factor=size_factor,
             )
-            desired = self._inventory_recovery_quotes(
-                m, desired, self.broker.unpaired_shares(m))
-            desired = [q for q in desired if self.guards.allow_side(q.token_id, now)]
+            unpaired = self.broker.unpaired_shares(m)
+            if cooled_down:
+                desired = self._cooldown_recovery_quotes(m, desired, unpaired)
+            else:
+                desired = self._inventory_recovery_quotes(m, desired, unpaired)
+                desired = [q for q in desired if self.guards.allow_side(q.token_id, now)]
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])
