@@ -16,6 +16,8 @@ import csv
 import logging
 import time
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
@@ -62,6 +64,27 @@ UNFILLED_RESCAN_INTERVAL_SECS = 90.0
 # market still holding inventory stays in the set so the normal de-risk/exit
 # path manages it (dropping it would force an immediate liquidation).
 ROTATE_FLAT_USD = 1.0
+
+
+def configure_logging(log_dir: Path | str = "logs") -> logging.Logger:
+    """Configure console and permanent daily-rotated runtime logs."""
+    directory = Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    file_handler = TimedRotatingFileHandler(
+        directory / "pmbot.log", when="midnight", backupCount=0,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[RichHandler(console=console, show_path=False), file_handler],
+        force=True,
+    )
+    return logging.getLogger()
 
 
 def hours_to_end(market: gamma.Market, now: float) -> float | None:
@@ -798,6 +821,11 @@ class Bot:
         exit_h = r["exit_hours_before_end"]
         passive = bool(r.get("passive_exit", True))
 
+        # A confirmed FAK hedge is locally overlaid until the Data API catches
+        # up.  Do not submit another hedge against a stale REST snapshot.
+        if getattr(self.broker, "has_pending_hedge", lambda _cid: False)(cid):
+            return
+
         unpaired = self.broker.unpaired_shares(m)
         if abs(unpaired) < MIN_TAKER_SHARES:
             self._over_since.pop(cid, None)
@@ -985,12 +1013,7 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[RichHandler(console=console, show_path=False)],
-    )
+    configure_logging()
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     cfg = load_config(args.config)

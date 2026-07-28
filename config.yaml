@@ -3,7 +3,7 @@
 mode: live
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 100
+capital_usd: 120
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
@@ -344,7 +344,7 @@ live:
   # Polymarket relayer used for gasless deposit-wallet (type 3) merges.
   relayer_url: https://relayer-v2.polymarket.com
 
-metrics:
+#metrics:
   db_path: data/live_metrics.db
   # Append-only JSONL of every fill — easy to grep, import into pandas, etc.
   trades_log: data/live_trades.jsonl

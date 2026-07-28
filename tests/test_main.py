@@ -1,8 +1,11 @@
 """Tests for Bot event-driven quote pulls (main.py)."""
 
 import asyncio
+import logging
 import time
+from logging.handlers import TimedRotatingFileHandler
 
+from pmbot import main
 from pmbot.books import BookTracker
 from pmbot.brokers import PaperBroker
 from pmbot.gamma import Market
@@ -250,3 +253,23 @@ def test_sticky_disabled_returns_plain_top_n(tmp_path):
         [_scored("a", 3), _scored("b", 2), _scored("c", 1)])
     assert [m.condition_id for m in chosen] == ["a", "b"]
     bot.metrics.close()
+
+
+def test_configure_logging_writes_utf8_daily_rotating_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    root = main.configure_logging()
+    root.info("持久化测试消息")
+    for handler in root.handlers:
+        handler.flush()
+
+    log_file = tmp_path / "logs" / "pmbot.log"
+    assert "持久化测试消息" in log_file.read_text(encoding="utf-8")
+    file_handler = next(
+        h for h in root.handlers if isinstance(h, TimedRotatingFileHandler)
+    )
+    assert file_handler.when == "MIDNIGHT"
+    assert file_handler.backupCount == 0
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
+    logging.shutdown()

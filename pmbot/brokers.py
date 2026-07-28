@@ -98,6 +98,17 @@ class RestingOrder:
 
 
 @dataclass
+class PendingHedge:
+    """A confirmed FAK hedge which the Data API has not observed yet."""
+
+    token_id: str
+    size: float
+    target_token_shares: float
+    created_ts: float
+    ws_observed: float = 0.0
+
+
+@dataclass
 class PaperQuoteState:
     quote: Quote
     queue_ahead: float = 0.0
@@ -576,6 +587,8 @@ class LiveBroker:
         self._markets: dict[str, Market] = {}
         self._positions: dict[str, dict] = {}
         self._token_shares: dict[str, float] = {}
+        self._pending_hedges: dict[str, PendingHedge] = {}
+        self._state_lock = threading.RLock()
         self._collateral: float = float("nan")
         self._synced = False
         self.fills_log: list[dict] = []
@@ -907,6 +920,42 @@ class LiveBroker:
         cur = self._exit_orders.get(market.condition_id)
         return cur.quote if cur else None
 
+    def _register_pending_hedge(self, market: Market, token_id: str, size: float) -> None:
+        """Reserve a taker hedge until a REST snapshot contains the fill."""
+        with self._state_lock:
+            self._pending_hedges[market.condition_id] = PendingHedge(
+                token_id=token_id,
+                size=size,
+                target_token_shares=self._token_shares.get(token_id, 0.0) + size,
+                created_ts=time.time(),
+            )
+
+    def has_pending_hedge(self, condition_id: str) -> bool:
+        with self._state_lock:
+            return condition_id in self._pending_hedges
+
+    def _effective_position(self, market: Market) -> dict:
+        """Return REST position plus the one unconfirmed taker hedge, if any."""
+        with self._state_lock:
+            d = dict(self._positions.get(
+                market.condition_id, {"yes": 0.0, "no": 0.0, "value": 0.0}))
+            pending = self._pending_hedges.get(market.condition_id)
+            if pending is not None:
+                key = "yes" if pending.token_id == market.yes_token else "no"
+                d[key] = d.get(key, 0.0) + pending.size
+            return d
+
+    def _apply_position_snapshot(self, positions: dict[str, dict],
+                                 token_shares: dict[str, float]) -> None:
+        """Atomically replace REST state and retire only observed hedge versions."""
+        with self._state_lock:
+            for cid, pending in list(self._pending_hedges.items()):
+                observed = token_shares.get(pending.token_id, 0.0)
+                if observed >= pending.target_token_shares - 0.01:
+                    self._pending_hedges.pop(cid, None)
+            self._positions = positions
+            self._token_shares = dict(token_shares)
+
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float) -> float:
         from py_clob_client_v2 import (
             AssetType, MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side,
@@ -925,16 +974,19 @@ class LiveBroker:
         if amount <= 0:
             return 0.0
         try:
-            with self._client_lock:
-                signed = self.client.create_market_order(MarketOrderArgs(
-                    token_id=token_id, amount=amount, side=Side.BUY,
-                    price=max_price, order_type=OrderType.FAK,
-                ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
-                resp = self.client.post_order(signed, OrderType.FAK)
+            with self._state_lock:
+                with self._client_lock:
+                    signed = self.client.create_market_order(MarketOrderArgs(
+                        token_id=token_id, amount=amount, side=Side.BUY,
+                        price=max_price, order_type=OrderType.FAK,
+                    ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
+                    resp = self.client.post_order(signed, OrderType.FAK)
+                filled = _parse_fill_amount(resp, size)
+                if filled > 0:
+                    LiveBroker._register_pending_hedge(self, market, token_id, filled)
         except Exception as e:  # noqa: BLE001
             log.error("taker order failed %s @ %.3f: %s", token_id[:12], max_price, e)
             return 0.0
-        filled = _parse_fill_amount(resp, size)
         if filled > 0 and self.metrics:
             self.metrics.record_hedge(market.condition_id, max_price, filled)
         return filled
@@ -970,19 +1022,28 @@ class LiveBroker:
             return
         ts = time.time()
         delta = size if side == "BUY" else -size
-        self._token_shares[token_id] = max(
-            0.0, self._token_shares.get(token_id, 0.0) + delta)
         market = next(
             (m for m in self._markets.values()
              if token_id in (m.yes_token, m.no_token)), None)
         if market is None:
             return
-        with self._ws_deltas_lock:
-            self._ws_deltas.append((ts, token_id, delta, side, price, market.condition_id))
-        d = self._positions.setdefault(
-            market.condition_id, {"yes": 0.0, "no": 0.0, "value": 0.0})
         key = "yes" if token_id == market.yes_token else "no"
-        d[key] = max(0.0, d[key] + delta)
+        with self._state_lock:
+            pending = self._pending_hedges.get(market.condition_id)
+            pending_part = 0.0
+            if pending is not None and side == "BUY" and pending.token_id == token_id:
+                pending_part = min(size, max(0.0, pending.size - pending.ws_observed))
+                pending.ws_observed += pending_part
+            local_delta = delta - pending_part
+            if abs(local_delta) > 1e-9:
+                self._token_shares[token_id] = max(
+                    0.0, self._token_shares.get(token_id, 0.0) + local_delta)
+                with self._ws_deltas_lock:
+                    self._ws_deltas.append(
+                        (ts, token_id, local_delta, side, price, market.condition_id))
+                d = self._positions.setdefault(
+                    market.condition_id, {"yes": 0.0, "no": 0.0, "value": 0.0})
+                d[key] = max(0.0, d[key] + local_delta)
         if not taker:
             self._apply_fill_to_orders(token_id, size, side)
         entry = {
@@ -1125,13 +1186,13 @@ class LiveBroker:
                 key = "yes" if token == m.yes_token else "no"
                 post_poll_cid[(cid, key)] = post_poll_cid.get((cid, key), 0.0) + delta
 
-        self._positions = positions
-        self._token_shares = dict(token_shares)
         for (cid, key), delta in post_poll_cid.items():
-            d = self._positions.setdefault(cid, {"yes": 0.0, "no": 0.0, "value": 0.0})
+            d = positions.setdefault(cid, {"yes": 0.0, "no": 0.0, "value": 0.0})
             d[key] = max(0.0, d[key] + delta)
         for token, delta in post_poll.items():
-            self._token_shares[token] = max(0.0, self._token_shares.get(token, 0.0) + delta)
+            token_shares[token] = max(0.0, token_shares.get(token, 0.0) + delta)
+
+        self._apply_position_snapshot(positions, token_shares)
 
         self._synced = True
 
@@ -1173,7 +1234,9 @@ class LiveBroker:
 
     def position_tokens(self) -> list[str]:
         tokens = []
-        for cid in self._positions:
+        with self._state_lock:
+            cids = set(self._positions) | set(self._pending_hedges)
+        for cid in cids:
             m = self._markets.get(cid)
             if m:
                 tokens.extend((m.yes_token, m.no_token))
@@ -1193,32 +1256,23 @@ class LiveBroker:
         return total
 
     def net_yes_exposure_usd(self, market: Market) -> float:
-        d = self._positions.get(market.condition_id)
-        if d is None:
-            return 0.0
+        d = LiveBroker._effective_position(self, market)
         mid = self._yes_mid(market)
         if mid is None:
             mid = 0.5
         return d["yes"] * mid - d["no"] * (1 - mid)
 
     def unpaired_shares(self, market: Market) -> float:
-        d = self._positions.get(market.condition_id)
-        if d is None:
-            return 0.0
+        d = LiveBroker._effective_position(self, market)
         return d["yes"] - d["no"]
 
     def held_markets(self) -> list[Market]:
-        return [self._markets[cid] for cid in self._positions if cid in self._markets]
+        with self._state_lock:
+            cids = set(self._positions) | set(self._pending_hedges)
+        return [self._markets[cid] for cid in cids if cid in self._markets]
 
     def total_inventory_usd(self) -> float:
-        total = 0.0
-        for cid, d in self._positions.items():
-            m = self._markets.get(cid)
-            mid = self._yes_mid(m) if m else None
-            if mid is None:
-                mid = 0.5
-            total += abs(d["yes"] * mid - d["no"] * (1 - mid))
-        return total
+        return sum(abs(self.net_yes_exposure_usd(m)) for m in self.held_markets())
 
     def merge_pairs(self, min_pairs: float) -> None:
         if self.merger is None or self.merger.disabled or not self._synced:

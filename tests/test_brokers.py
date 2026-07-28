@@ -2,6 +2,7 @@
 
 import time
 import threading
+from collections import deque
 from unittest.mock import MagicMock
 
 from pmbot.books import Book, BookTracker
@@ -454,10 +455,13 @@ def test_live_crossed_book_forces_reconcile_without_blocking():
 def _live_stub(sig_type=3):
     stub = _order_book_stub()
     stub._client_lock = threading.RLock()
+    stub._state_lock = threading.RLock()
     stub.client = MagicMock()
     stub.cfg = {"live": {"signature_type": sig_type}}
     stub._gtd_expiration = lambda: 123
     stub.metrics = None
+    stub._token_shares = {}
+    stub._pending_hedges = {}
     stub.sync_calls = []
     stub._sync_clob_balance = lambda at, tid=None: stub.sync_calls.append((at, tid))
     return stub
@@ -477,9 +481,58 @@ def test_taker_buy_syncs_collateral_first():
     from py_clob_client_v2 import AssetType
     stub = _live_stub()
     stub.client.post_order.return_value = {"takingAmount": "10.0"}
-    filled = LiveBroker.taker_buy(stub, _market(), "tok9", 10.0, 0.6)
+    market = _market()
+    filled = LiveBroker.taker_buy(stub, market, "tok9", 10.0, 0.6)
     assert filled == 10.0
     assert (AssetType.COLLATERAL, None) in stub.sync_calls
+    assert LiveBroker.has_pending_hedge(stub, market.condition_id)
+    assert stub._pending_hedges[market.condition_id].token_id == "tok9"
+
+
+def test_pending_hedge_survives_stale_snapshot_without_double_counting():
+    """A confirmed FAK hedge must freeze a market until REST observes it.
+
+    The Data API can return the pre-fill position after the user WebSocket has
+    delivered the fill. That stale snapshot must neither re-open exposure nor
+    make the eventual snapshot count the hedge twice.
+    """
+    stub = _order_book_stub()
+    market = _market()
+    stub._state_lock = threading.RLock()
+    stub._pending_hedges = {}
+    stub._positions = {market.condition_id: {"yes": 0.0, "no": 31.0, "value": 0.0}}
+    stub._token_shares = {market.no_token: 31.0}
+    stub._markets = {market.condition_id: market}
+    stub._ws_deltas = deque()
+    stub._ws_deltas_lock = threading.Lock()
+    stub._open_orders = {}
+    stub._exit_orders = {}
+    stub.metrics = None
+    stub.fills_log = []
+
+    LiveBroker._register_pending_hedge(stub, market, market.yes_token, 31.0)
+    assert LiveBroker.has_pending_hedge(stub, market.condition_id)
+    assert LiveBroker.unpaired_shares(stub, market) == 0.0
+
+    LiveBroker.record_user_fill(stub, market.yes_token, "BUY", 0.61, 31.0, taker=True)
+    assert stub._positions[market.condition_id]["yes"] == 0.0
+    assert LiveBroker.unpaired_shares(stub, market) == 0.0
+
+    LiveBroker._apply_position_snapshot(
+        stub,
+        {market.condition_id: {"yes": 0.0, "no": 31.0, "value": 0.0}},
+        {market.no_token: 31.0},
+    )
+    assert LiveBroker.has_pending_hedge(stub, market.condition_id)
+    assert LiveBroker.unpaired_shares(stub, market) == 0.0
+
+    LiveBroker._apply_position_snapshot(
+        stub,
+        {market.condition_id: {"yes": 31.0, "no": 31.0, "value": 0.0}},
+        {market.yes_token: 31.0, market.no_token: 31.0},
+    )
+    assert not LiveBroker.has_pending_hedge(stub, market.condition_id)
+    assert LiveBroker.unpaired_shares(stub, market) == 0.0
 
 
 def test_sync_clob_balance_builds_params_and_swallows_errors():
