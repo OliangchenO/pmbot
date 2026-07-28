@@ -143,23 +143,13 @@ def test_refresh_overlap_posts_replacement_before_cancelling_old():
     assert [ro.order_id for ro in stub._open_orders["cid1"]] == ["newid"]
 
 
-def test_live_quote_post_records_order_lifecycle_event():
-    """A confirmed CLOB quote must be appended as an auditable order event."""
-    class CapturingMetrics:
-        def __init__(self):
-            self.events = []
-
-        def record_order_event(self, entry):
-            self.events.append(entry)
-
-        def record_quotes(self, *_args):
-            pass
-
+def test_live_quote_post_logs_order_lifecycle_event(caplog):
+    """A confirmed CLOB quote must be recorded in the runtime log."""
     stub = _order_book_stub()
     stub._client_lock = threading.RLock()
     stub.client = MagicMock()
     stub.refresh_overlap = True
-    stub.metrics = CapturingMetrics()
+    stub.metrics = None
     stub._markets = {}
     stub._logged_post_shape = False
     stub._gtd_expiration = lambda: 1_700_000_240
@@ -168,51 +158,37 @@ def test_live_quote_post_records_order_lifecycle_event():
     stub.client.create_order.return_value = object()
     stub.client.post_orders.return_value = [{"orderID": "newid"}]
 
+    caplog.set_level("INFO", logger="pmbot.broker")
     LiveBroker.set_quotes(stub, _market(), [Quote("yes1", 0.47, 10)])
 
-    assert len(stub.metrics.events) == 1
-    event = stub.metrics.events[0]
-    assert event["event"] == "ORDER_PLACED"
-    assert event["order_id"] == "newid"
-    assert event["cid"] == "cid1"
-    assert event["market"] == "Test?"
-    assert event["token"] == "yes1"
-    assert event["side"] == "BUY"
-    assert event["price"] == 0.47
-    assert event["size"] == 10
+    assert "ORDER event=ORDER_PLACED" in caplog.text
+    assert "order_id=newid" in caplog.text
+    assert "cid=cid1" in caplog.text
+    assert "token=yes1" in caplog.text
+    assert "side=BUY" in caplog.text
 
 
-def test_live_quote_cancel_records_order_lifecycle_event():
-    """A successful CLOB cancellation must retain the original order context."""
+def test_live_quote_cancel_logs_order_lifecycle_event(caplog):
+    """A successful cancellation must retain its original context in the log."""
     from pmbot.brokers import RestingOrder
-
-    class CapturingMetrics:
-        def __init__(self):
-            self.events = []
-
-        def record_order_event(self, entry):
-            self.events.append(entry)
 
     stub = _order_book_stub()
     stub._client_lock = threading.RLock()
     stub.client = MagicMock()
-    stub.metrics = CapturingMetrics()
+    stub.metrics = None
     market = _market()
     stub._markets = {market.condition_id: market}
     stub._open_orders = {
         market.condition_id: [RestingOrder(
             "oldid", Quote("yes1", 0.47, 10), time.time(), 0)]}
 
+    caplog.set_level("INFO", logger="pmbot.broker")
     assert LiveBroker._batch_cancel(stub, ["oldid"]) is True
 
-    assert len(stub.metrics.events) == 1
-    event = stub.metrics.events[0]
-    assert event["event"] == "ORDER_CANCELLED"
-    assert event["order_id"] == "oldid"
-    assert event["cid"] == "cid1"
-    assert event["side"] == "BUY"
-    assert event["price"] == 0.47
-    assert event["size"] == 10
+    assert "ORDER event=ORDER_CANCELLED" in caplog.text
+    assert "order_id=oldid" in caplog.text
+    assert "cid=cid1" in caplog.text
+    assert "side=BUY" in caplog.text
 
 
 def test_parse_fill_amount_from_taking_amount():

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import contextlib
 import csv
 import logging
+import queue
 import time
 from datetime import datetime, timezone
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
 from pathlib import Path
 
 import yaml
@@ -34,6 +36,7 @@ from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
 console = Console()
 log = logging.getLogger("pmbot")
+_LOG_LISTENER: QueueListener | None = None
 
 LOOP_SECONDS = 2.0
 REWARD_SAMPLE_SECONDS = 60.0
@@ -66,8 +69,20 @@ UNFILLED_RESCAN_INTERVAL_SECS = 90.0
 ROTATE_FLAT_USD = 1.0
 
 
+def stop_logging() -> None:
+    """Drain and stop the asynchronous runtime-log writer, if configured."""
+    global _LOG_LISTENER
+    if _LOG_LISTENER is not None:
+        _LOG_LISTENER.stop()
+        for handler in _LOG_LISTENER.handlers:
+            handler.close()
+        _LOG_LISTENER = None
+
+
 def configure_logging(log_dir: Path | str = "logs") -> logging.Logger:
     """Configure console and permanent daily-rotated runtime logs."""
+    global _LOG_LISTENER
+    stop_logging()
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
     file_handler = TimedRotatingFileHandler(
@@ -78,13 +93,19 @@ def configure_logging(log_dir: Path | str = "logs") -> logging.Logger:
         "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
+    log_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    _LOG_LISTENER = QueueListener(log_queue, file_handler)
+    _LOG_LISTENER.start()
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
-        handlers=[RichHandler(console=console, show_path=False), file_handler],
+        handlers=[RichHandler(console=console, show_path=False), QueueHandler(log_queue)],
         force=True,
     )
     return logging.getLogger()
+
+
+atexit.register(stop_logging)
 
 
 def hours_to_end(market: gamma.Market, now: float) -> float | None:

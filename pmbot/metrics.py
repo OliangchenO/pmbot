@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import sqlite3
 import threading
 import time
@@ -21,14 +20,8 @@ class MetricsStore:
         self.path = Path(db_path)
         self.path.parent.mkdir(exist_ok=True)
         self._trades_log = Path(trades_log) if trades_log else None
-        self._trades_queue: queue.Queue[dict | None] | None = None
-        self._trades_writer: threading.Thread | None = None
         if self._trades_log:
             self._trades_log.parent.mkdir(exist_ok=True)
-            self._trades_queue = queue.Queue()
-            self._trades_writer = threading.Thread(
-                target=self._write_trades_log, name="pmbot-trades-log", daemon=True)
-            self._trades_writer.start()
         # Reports reflect bot activity only: drop/refuse anything before this
         # UTC date (earlier rows were manual testing).
         self.inception_date = inception_date or None
@@ -124,28 +117,15 @@ class MetricsStore:
         self._conn.commit()
 
     def _append_trades_log(self, entry: dict) -> None:
-        if self._trades_queue is None:
+        if self._trades_log is None:
             return
-        # Queueing is deliberately non-blocking: order placement, cancellation,
-        # and fill handling must never wait for local disk I/O.
-        self._trades_queue.put_nowait(dict(entry))
-
-    def _write_trades_log(self) -> None:
-        """Serialize append-only JSONL writes off the trading path."""
-        assert self._trades_queue is not None
-        while True:
-            entry = self._trades_queue.get()
-            if entry is None:
-                return
-            try:
-                assert self._trades_log is not None
-                with self._trades_log.open("a") as f:
-                    f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-            except OSError as e:
-                log.warning("could not append trades log: %s", e)
+        try:
+            with self._trades_log.open("a") as f:
+                f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        except OSError as e:
+            log.warning("could not append trades log: %s", e)
 
     def record_fill(self, entry: dict) -> None:
-        entry.setdefault("event", "FILL")
         with self._lock:
             self._conn.execute(
                 "INSERT INTO fills (ts,cid,market,side,token,price,size,taker,exit,merged,fee) "
@@ -157,11 +137,6 @@ class MetricsStore:
                  entry.get("fee", 0)),
             )
             self._conn.commit()
-        self._append_trades_log(entry)
-
-    def record_order_event(self, entry: dict) -> None:
-        """Append a live order lifecycle event to the fill JSONL stream."""
-        entry.setdefault("ts", time.time())
         self._append_trades_log(entry)
 
     def record_markout(self, entry: dict) -> None:
@@ -755,9 +730,4 @@ class MetricsStore:
 
     def close(self) -> None:
         self._flush_uptime(int(time.time()) // 60)
-        if self._trades_queue is not None and self._trades_writer is not None:
-            self._trades_queue.put_nowait(None)
-            self._trades_writer.join(timeout=2.0)
-            if self._trades_writer.is_alive():
-                log.warning("trades-log writer did not drain within 2s; exiting without waiting")
         self._conn.close()

@@ -334,17 +334,47 @@ def test_configure_logging_writes_utf8_daily_rotating_file(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     root = main.configure_logging()
     root.info("持久化测试消息")
-    for handler in root.handlers:
-        handler.flush()
+    listener = main._LOG_LISTENER
+    assert listener is not None
+    file_handler = next(h for h in listener.handlers
+                        if isinstance(h, TimedRotatingFileHandler))
+    main.stop_logging()
 
     log_file = tmp_path / "logs" / "pmbot.log"
     assert "持久化测试消息" in log_file.read_text(encoding="utf-8")
-    file_handler = next(
-        h for h in root.handlers if isinstance(h, TimedRotatingFileHandler)
-    )
     assert file_handler.when == "MIDNIGHT"
     assert file_handler.backupCount == 0
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
     logging.shutdown()
+
+
+def test_configure_logging_does_not_wait_for_slow_file_io(tmp_path, monkeypatch):
+    """Trading-path logging must enqueue instead of waiting for disk writes."""
+    import threading
+    import time
+
+    write_started = threading.Event()
+    release_writer = threading.Event()
+
+    class SlowFileHandler(logging.Handler):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+        def emit(self, _record):
+            write_started.set()
+            release_writer.wait(timeout=1)
+
+    monkeypatch.setattr(main, "TimedRotatingFileHandler", SlowFileHandler)
+    root = main.configure_logging(tmp_path / "logs")
+    timer = threading.Timer(0.15, release_writer.set)
+    timer.start()
+    started = time.perf_counter()
+    root.info("order lifecycle event")
+    elapsed = time.perf_counter() - started
+    assert write_started.wait(timeout=1)
+    timer.join()
+    main.stop_logging()
+
+    assert elapsed < 0.05

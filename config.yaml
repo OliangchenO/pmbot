@@ -344,15 +344,6 @@ live:
   # Polymarket relayer used for gasless deposit-wallet (type 3) merges.
   relayer_url: https://relayer-v2.polymarket.com
 
-#metrics:
-  db_path: data/live_metrics.db
-  # Append-only JSONL of every fill — easy to grep, import into pandas, etc.
-  trades_log: data/live_trades.jsonl
-  # Ignore anything before this UTC date (earlier rows were manual testing, not
-  # bot activity). Pre-inception rows are pruned on startup and reward backfills
-  # never write dates before it, so all reports reflect bot trading only.
-  inception_date: "2026-06-14"
-
 # Self-managing controller: rewrites the knobs below in place from live equity
 # and the rolling markout (post-fill price drift = adverse selection). Two
 # layers:

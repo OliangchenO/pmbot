@@ -673,22 +673,20 @@ class LiveBroker:
                             quote: Quote | None = None, side: str | None = None,
                             order_id: str | None = None,
                             reason: str | None = None) -> None:
-        """Append one live order lifecycle transition to the trade JSONL."""
-        if not getattr(self, "metrics", None):
-            return
-        entry = {"ts": time.time(), "event": event}
+        """Emit one lifecycle record through the asynchronous runtime logger."""
+        fields = [f"event={event}"]
         if market is not None:
-            entry.update({"cid": market.condition_id, "market": market.question})
+            fields.extend((f"cid={market.condition_id}", f"market={market.question!r}"))
         if quote is not None:
-            entry.update({"token": quote.token_id, "price": quote.price,
-                          "size": quote.size})
+            fields.extend((f"token={quote.token_id}", f"price={quote.price:.3f}",
+                           f"size={quote.size:.2f}"))
         if side is not None:
-            entry["side"] = side
+            fields.append(f"side={side}")
         if order_id:
-            entry["order_id"] = order_id
+            fields.append(f"order_id={order_id}")
         if reason:
-            entry["reason"] = reason
-        self.metrics.record_order_event(entry)
+            fields.append(f"reason={reason!r}")
+        log.info("ORDER %s", " ".join(fields))
 
     def _resting_order_context(self, order_id: str) -> tuple[Market | None, Quote | None, str | None]:
         for cid, orders in getattr(self, "_open_orders", {}).items():
