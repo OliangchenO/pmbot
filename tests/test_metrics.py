@@ -1,6 +1,7 @@
 """Tests for metrics store."""
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -45,10 +46,69 @@ def test_recent_fills_and_trades_log(tmp_path):
     assert len(fills) == 2
     assert fills[0]["taker"] is True
     assert fills[1]["taker"] is False
+    store.close()
     lines = log_path.read_text().strip().splitlines()
     assert len(lines) == 2
     assert json.loads(lines[0])["side"] == "YES"
+
+
+def test_order_events_append_to_the_same_trades_log(tmp_path):
+    """A lifecycle event must be queryable beside fills in one JSONL stream."""
+    db = tmp_path / "test.db"
+    log_path = tmp_path / "trades.jsonl"
+    store = MetricsStore(str(db), trades_log=str(log_path))
+
+    store.record_order_event({
+        "ts": 1_700_000_000.0,
+        "event": "ORDER_PLACED",
+        "order_id": "order-1",
+        "cid": "cid1",
+        "market": "Rain tomorrow?",
+        "token": "yes-token",
+        "side": "BUY",
+        "price": 0.45,
+        "size": 20.0,
+    })
+
     store.close()
+    event = json.loads(log_path.read_text().strip())
+    assert event == {
+        "ts": 1_700_000_000.0,
+        "event": "ORDER_PLACED",
+        "order_id": "order-1",
+        "cid": "cid1",
+        "market": "Rain tomorrow?",
+        "token": "yes-token",
+        "side": "BUY",
+        "price": 0.45,
+        "size": 20.0,
+    }
+
+
+def test_order_event_enqueue_does_not_wait_for_slow_disk(tmp_path, monkeypatch):
+    """A slow local filesystem must not delay the order submission path."""
+    db = tmp_path / "test.db"
+    log_path = tmp_path / "trades.jsonl"
+    store = MetricsStore(str(db), trades_log=str(log_path))
+    original_open = type(log_path).open
+    release_writer = threading.Event()
+
+    def delayed_open(path, *args, **kwargs):
+        if path == log_path:
+            release_writer.wait(timeout=1)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(log_path), "open", delayed_open)
+    timer = threading.Timer(0.15, release_writer.set)
+    timer.start()
+    started = time.perf_counter()
+    store.record_order_event({"event": "ORDER_PLACED", "order_id": "order-1"})
+    elapsed = time.perf_counter() - started
+    timer.join()
+    store.close()
+
+    assert elapsed < 0.05
+    assert json.loads(log_path.read_text()) ["order_id"] == "order-1"
 
 
 def test_sum_earnings_parses_clob_total_shape():

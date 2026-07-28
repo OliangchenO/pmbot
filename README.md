@@ -123,7 +123,11 @@ python -m pmbot.main trades       # recent fills from the active DB
 
 For live trading, keep the live paths above so paper results in
 `data/metrics.db` do not mix with real-money fills. The `trades_log` JSONL is
-an append-only fill log alongside the SQLite DB.
+an append-only event stream alongside the SQLite DB: every record has an
+`event` field (`FILL`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_POST_FAILED`,
+`ORDER_CANCEL_FAILED`, or `ORDER_CANCEL_ALL`). Order events include the order
+ID and, when available, market, token, side, price, size, and failure reason,
+so a single file reconstructs each order's lifecycle.
 
 `report` shows spread capture (merged YES+NO pairs), hedge spend, estimated
 vs realized rewards, equity PnL, maker fill count, and in-band uptime.

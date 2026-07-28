@@ -669,6 +669,37 @@ class LiveBroker:
             log.debug("CLOB balance sync failed (%s %s): %s",
                       asset_type, (token_id or "")[:12], e)
 
+    def _record_order_event(self, event: str, market: Market | None = None,
+                            quote: Quote | None = None, side: str | None = None,
+                            order_id: str | None = None,
+                            reason: str | None = None) -> None:
+        """Append one live order lifecycle transition to the trade JSONL."""
+        if not getattr(self, "metrics", None):
+            return
+        entry = {"ts": time.time(), "event": event}
+        if market is not None:
+            entry.update({"cid": market.condition_id, "market": market.question})
+        if quote is not None:
+            entry.update({"token": quote.token_id, "price": quote.price,
+                          "size": quote.size})
+        if side is not None:
+            entry["side"] = side
+        if order_id:
+            entry["order_id"] = order_id
+        if reason:
+            entry["reason"] = reason
+        self.metrics.record_order_event(entry)
+
+    def _resting_order_context(self, order_id: str) -> tuple[Market | None, Quote | None, str | None]:
+        for cid, orders in getattr(self, "_open_orders", {}).items():
+            for ro in orders:
+                if ro.order_id == order_id:
+                    return getattr(self, "_markets", {}).get(cid), ro.quote, "BUY"
+        for cid, ro in getattr(self, "_exit_orders", {}).items():
+            if ro.order_id == order_id:
+                return getattr(self, "_markets", {}).get(cid), ro.quote, "SELL"
+        return None, None, None
+
     @staticmethod
     def _select_collateral(onchain: float | None, clob_cache: float | None) -> float | None:
         """On-chain pUSD is the source of truth for collateral; the CLOB cache
@@ -691,9 +722,12 @@ class LiveBroker:
                 resp = self.client.post_order(signed, OrderType.GTD)
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
-                return RestingOrder(oid, q, time.time(), expiration)
+                ro = RestingOrder(oid, q, time.time(), expiration)
+                self._record_order_event("ORDER_PLACED", quote=q, side="BUY", order_id=oid)
+                return ro
         except Exception as e:  # noqa: BLE001
             log.error("order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+            self._record_order_event("ORDER_POST_FAILED", quote=q, side="BUY", reason=str(e))
         return None
 
     def _place_sell(self, q: Quote) -> RestingOrder | None:
@@ -712,9 +746,14 @@ class LiveBroker:
                 resp = self.client.post_order(signed, OrderType.GTD)
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
-                return RestingOrder(oid, q, time.time(), expiration)
+                ro = RestingOrder(oid, q, time.time(), expiration)
+                market = next((m for m in getattr(self, "_markets", {}).values()
+                               if q.token_id in (m.yes_token, m.no_token)), None)
+                self._record_order_event("ORDER_PLACED", market, q, "SELL", oid)
+                return ro
         except Exception as e:  # noqa: BLE001
             log.error("exit order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+            self._record_order_event("ORDER_POST_FAILED", quote=q, side="SELL", reason=str(e))
         return None
 
     def _batch_cancel(self, order_ids: list[str]) -> bool:
@@ -727,6 +766,9 @@ class LiveBroker:
 
         try:
             _with_retry("batch cancel", _do_cancel)
+            for oid in order_ids:
+                market, quote, side = self._resting_order_context(oid)
+                self._record_order_event("ORDER_CANCELLED", market, quote, side, oid)
             return True
         except Exception as e:  # noqa: BLE001
             from py_clob_client_v2 import OrderPayload
@@ -736,9 +778,14 @@ class LiveBroker:
                 try:
                     with self._client_lock:
                         self.client.cancel_order(OrderPayload(orderID=oid))
-                except Exception:  # noqa: BLE001
+                    market, quote, side = self._resting_order_context(oid)
+                    self._record_order_event("ORDER_CANCELLED", market, quote, side, oid)
+                except Exception as fallback_error:  # noqa: BLE001
                     ok = False
-                    log.warning("cancel failed %s: %s", oid[:16], e)
+                    log.warning("cancel failed %s: %s", oid[:16], fallback_error)
+                    market, quote, side = self._resting_order_context(oid)
+                    self._record_order_event("ORDER_CANCEL_FAILED", market, quote,
+                                             side, oid, str(fallback_error))
             return ok
 
     def set_quotes(self, market: Market, quotes: list[Quote]) -> None:
@@ -792,6 +839,8 @@ class LiveBroker:
                     order_map.append(q)
                 except Exception as e:  # noqa: BLE001
                     log.error("order build failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+                    self._record_order_event("ORDER_POST_FAILED", market, q, "BUY",
+                                             reason=str(e))
             if batch_args:
                 try:
                     # NOT retried: a POST that times out after the order landed
@@ -807,8 +856,9 @@ class LiveBroker:
                         oid = (item.get("orderID") or item.get("orderId")
                                or item.get("id") or "")
                         if oid:
-                            placed.append(RestingOrder(
-                                oid, order_map[i], now, self._gtd_expiration()))
+                            q = order_map[i]
+                            placed.append(RestingOrder(oid, q, now, self._gtd_expiration()))
+                            self._record_order_event("ORDER_PLACED", market, q, "BUY", oid)
                         else:
                             # POST /orders returns a 200 array even for per-order
                             # REJECTIONS: orderID comes back empty with the reason
@@ -820,8 +870,13 @@ class LiveBroker:
                             log.warning("order rejected %s @ %.3f×%.0f in '%s': %s",
                                         q.token_id[:12], q.price, q.size,
                                         market.question[:35], reason)
+                            self._record_order_event("ORDER_POST_FAILED", market, q,
+                                                     "BUY", reason=reason)
                 except Exception as e:  # noqa: BLE001
                     log.error("batch post failed; reconciling instead of retrying blindly: %s", e)
+                    for q in order_map:
+                        self._record_order_event("ORDER_POST_FAILED", market, q,
+                                                 "BUY", reason=str(e))
                     self.reconcile_orders()
                     return
                 if len(placed) < len(batch_args):
@@ -859,7 +914,9 @@ class LiveBroker:
         except Exception as e:  # noqa: BLE001
             ok = False
             log.error("cancel_all failed: %s", e)
+            self._record_order_event("ORDER_CANCEL_ALL", reason=str(e))
         if ok:
+            self._record_order_event("ORDER_CANCEL_ALL")
             self._open_orders.clear()
             self._exit_orders.clear()
         else:
