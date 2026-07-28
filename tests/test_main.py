@@ -7,7 +7,7 @@ from logging.handlers import TimedRotatingFileHandler
 
 from pmbot import main
 from pmbot.books import BookTracker
-from pmbot.brokers import PaperBroker
+from pmbot.brokers import PaperBroker, Position
 from pmbot.gamma import Market
 from pmbot.main import Bot
 from pmbot.strategy import Quote
@@ -243,6 +243,81 @@ def test_rescan_is_sticky_and_swaps_incrementally(tmp_path, monkeypatch):
         bot.metrics.close()
 
     asyncio.run(scenario())
+
+
+def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch):
+    """扫描器不得换出仍有未配对库存的市场。"""
+    from pmbot import gamma as gamma_mod
+    from pmbot.books import BookTracker
+
+    async def fake_start(self):
+        return None
+
+    async def fake_resubscribe(self, token_ids, carry=None):
+        self.books = {t: self.books.get(t) or __import__(
+            "pmbot.books", fromlist=["Book"]).Book(t) for t in token_ids}
+
+    monkeypatch.setattr(BookTracker, "start", fake_start)
+    monkeypatch.setattr(BookTracker, "resubscribe", fake_resubscribe)
+    ranked = {"value": []}
+    monkeypatch.setattr(gamma_mod, "scan",
+                        lambda cfg, exclude=None, full=False: list(ranked["value"]))
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.cfg = dict(bot.cfg)
+        bot.cfg["paper"] = {}
+        bot.cfg["risk"] = {}
+        bot.cfg["quoting"] = {"max_capital_per_market": 50}
+        bot.cfg["scanner"] = {
+            "top_n_markets": 2, "sticky_swap": True, "swap_score_margin": 0.25,
+            "underperform_uptime_pct": 60, "underperform_lookback_minutes": 30,
+            "refresh_minutes": 30,
+        }
+        held, flat, fresh = _scored("held", 3.0), _scored("flat", 2.0), _scored("fresh", 1.0)
+        ranked["value"] = [held, flat, fresh]
+        await bot._rescan(initial=True)
+        bot.broker.state.positions[held.condition_id] = Position(no_shares=20.0)
+
+        ranked["value"] = [flat, fresh]
+        await bot._rescan()
+        assert {m.condition_id for m in bot.markets} == {"held", "flat"}
+
+        bot.broker.state.positions[held.condition_id] = Position()
+        await bot._rescan()
+        assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_inventory_quote_only_buys_complement_and_caps_size(tmp_path):
+    """未配对 NO 时只能买入不超过缺口的 YES。"""
+    bot = _bot(tmp_path)
+    market = _market()
+    desired = [Quote(market.yes_token, 0.47, 30.0),
+               Quote(market.no_token, 0.50, 30.0)]
+
+    quotes = bot._inventory_recovery_quotes(market, desired, unpaired=-20.0)
+
+    assert [(q.token_id, q.size) for q in quotes] == [(market.yes_token, 20.0)]
+    bot.metrics.close()
+
+
+def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_path):
+    """未配对 YES 只补 NO；低于锁定阈值时不改变正常双边报价。"""
+    bot = _bot(tmp_path)
+    market = _market()
+    desired = [Quote(market.yes_token, 0.47, 30.0),
+               Quote(market.no_token, 0.50, 30.0)]
+
+    excess_yes = bot._inventory_recovery_quotes(market, desired, unpaired=12.0)
+    flat = bot._inventory_recovery_quotes(market, desired, unpaired=0.0)
+
+    assert [(q.token_id, q.size) for q in excess_yes] == [(market.no_token, 12.0)]
+    assert [(q.token_id, q.size) for q in flat] == [
+        (market.yes_token, 30.0), (market.no_token, 30.0)]
+    bot.metrics.close()
 
 
 def test_sticky_disabled_returns_plain_top_n(tmp_path):

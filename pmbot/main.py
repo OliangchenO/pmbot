@@ -481,7 +481,15 @@ class Bot:
                 out.add(cid)
         return out
 
-    def _select_markets(self, ranked: list[gamma.Market]) -> list[gamma.Market]:
+    def _locked_inventory_markets(self, markets: list[gamma.Market]) -> list[gamma.Market]:
+        """Return markets whose unpaired inventory must keep a quote slot."""
+        if self.broker is None:
+            return []
+        return [m for m in markets
+                if abs(self.broker.unpaired_shares(m)) >= MIN_TAKER_SHARES]
+
+    def _select_markets(self, ranked: list[gamma.Market],
+                        locked: list[gamma.Market] | None = None) -> list[gamma.Market]:
         """Pick the quote set from the full ranked candidate list, stickily.
 
         For a reward farmer the cost of leaving a market is real (a feed/quote
@@ -498,22 +506,27 @@ class Bot:
         """
         sc = self.cfg["scanner"]
         top_n = int(sc["top_n_markets"])
+        locked = list(locked or [])[:top_n]
+        locked_cids = {m.condition_id for m in locked}
+        slots = top_n - len(locked)
+        if slots <= 0:
+            return locked
         if not bool(sc.get("sticky_swap", True)):
-            return ranked[:top_n]
+            return locked + [m for m in ranked if m.condition_id not in locked_cids][:slots]
         margin = float(sc.get("swap_score_margin", 0.0))
         by_cid = {m.condition_id: m for m in ranked}
-        held = [m.condition_id for m in self.markets]
+        held = [m.condition_id for m in self.markets if m.condition_id not in locked_cids]
         # Currently-quoted markets still eligible this scan, freshest score first.
         survivors = sorted((by_cid[c] for c in held if c in by_cid),
-                           key=lambda m: m.score, reverse=True)[:top_n]
+                           key=lambda m: m.score, reverse=True)[:slots]
         chosen = list(survivors)
         chosen_cids = {m.condition_id for m in chosen}
         survivor_cids = set(chosen_cids)
         # Backfill empty slots with the best candidates we are not already in.
         for m in ranked:
-            if len(chosen) >= top_n:
+            if len(chosen) >= slots:
                 break
-            if m.condition_id not in chosen_cids:
+            if m.condition_id not in chosen_cids and m.condition_id not in locked_cids:
                 chosen.append(m)
                 chosen_cids.add(m.condition_id)
         # A held market may only be evicted on score when it is BOTH (a) beaten
@@ -548,7 +561,7 @@ class Bot:
                 chosen.append(cand)
                 chosen_cids = (chosen_cids - {weak.condition_id}) | {cand.condition_id}
                 survivor_cids.discard(weak.condition_id)
-        return chosen
+        return locked + chosen
 
     async def _rescan(self, initial: bool = False, rotate: bool = False) -> None:
         self._rotate_pending = False
@@ -583,7 +596,8 @@ class Bot:
                                 "keeping current set")
                 self._last_scan = time.time()
                 return
-        markets = self._select_markets(ranked)
+        locked = self._locked_inventory_markets(self.markets)
+        markets = self._select_markets(ranked, locked)
 
         old_markets = list(self.markets)
         new_cids = {m.condition_id for m in markets}
@@ -683,6 +697,17 @@ class Bot:
         if market is not None:
             self.guards.record_trade(market, token_id, side, size, time.time())
 
+    @staticmethod
+    def _inventory_recovery_quotes(m: gamma.Market,
+                                   desired: list[strategy.Quote],
+                                   unpaired: float) -> list[strategy.Quote]:
+        """Keep only a capped complement bid while a market is unpaired."""
+        if abs(unpaired) < MIN_TAKER_SHARES:
+            return desired
+        complement = m.no_token if unpaired > 0 else m.yes_token
+        return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
+                for q in desired if q.token_id == complement]
+
     async def _quote_all(self) -> None:
         r = self.cfg["risk"]
         max_inv = r["max_inventory_usd_per_market"]
@@ -778,6 +803,8 @@ class Bot:
                 markout_avg=markout_avg,
                 size_factor=size_factor,
             )
+            desired = self._inventory_recovery_quotes(
+                m, desired, self.broker.unpaired_shares(m))
             desired = [q for q in desired if self.guards.allow_side(q.token_id, now)]
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
