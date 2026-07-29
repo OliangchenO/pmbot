@@ -2,6 +2,11 @@
 # mode: paper | live
 mode: live
 
+# Optional live-fill DingTalk notifications. Credentials stay in .env.
+notifications:
+  dingtalk:
+    enabled: true
+
 # Total capital the bot is allowed to work with (USD).
 capital_usd: 120
 

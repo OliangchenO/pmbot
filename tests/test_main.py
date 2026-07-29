@@ -42,6 +42,25 @@ BASE_CFG = {
 }
 
 
+def test_build_live_notifier_uses_enabled_dingtalk_environment(monkeypatch):
+    """Removing the live-alert configuration path must disable this behavior."""
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")
+    monkeypatch.setenv("DINGTALK_SECRET", "SEC-test")
+    cfg = {"notifications": {"dingtalk": {"enabled": True}}}
+
+    notifier = main._build_live_notifier(cfg)
+
+    assert notifier.webhook_url == "https://example.test/robot"
+    assert notifier.secret == "SEC-test"
+
+
+def test_build_live_notifier_requires_explicit_enable(monkeypatch):
+    """A configured webhook alone must not make paper or unconfigured runs alert."""
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")
+
+    assert main._build_live_notifier({}) is None
+
+
 def _market() -> Market:
     return Market(
         question="Will it rain tomorrow?", condition_id="cid1",

@@ -16,6 +16,7 @@ import contextlib
 import csv
 import logging
 import math
+import os
 import queue
 import time
 from datetime import datetime, timedelta, timezone
@@ -69,6 +70,19 @@ UNFILLED_RESCAN_INTERVAL_SECS = 90.0
 # market still holding inventory stays in the set so the normal de-risk/exit
 # path manages it (dropping it would force an immediate liquidation).
 ROTATE_FLAT_USD = 1.0
+
+
+def _build_live_notifier(cfg: dict):
+    """Build the optional, asynchronous notifier for live fills only."""
+    settings = (cfg.get("notifications") or {}).get("dingtalk") or {}
+    if not settings.get("enabled", False):
+        return None
+    webhook_url = os.environ.get("DINGTALK_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        log.warning("DingTalk is enabled but DINGTALK_WEBHOOK_URL is unset")
+        return None
+    from .dingtalk import DingTalkNotifier
+    return DingTalkNotifier(webhook_url, os.environ.get("DINGTALK_SECRET") or None)
 
 
 class BeijingFormatter(logging.Formatter):
@@ -441,7 +455,7 @@ class Bot:
         if self.broker is not None:
             return
         self.tracker = BookTracker([])
-        self.broker = LiveBroker(self.cfg, self.tracker)
+        self.broker = LiveBroker(self.cfg, self.tracker, _build_live_notifier(self.cfg))
         await asyncio.to_thread(self.broker.refresh_state)
         self._last_pos_refresh = time.time()
         self.risk = RiskManager(self.cfg, self.broker.equity())
@@ -730,7 +744,8 @@ class Bot:
                         latency_secs=float(p.get("order_latency_ms", 300)) / 1000.0)
                     self.risk = RiskManager(self.cfg, self.cfg["capital_usd"])
                 else:
-                    self.broker = LiveBroker(self.cfg, self.tracker)
+                    self.broker = LiveBroker(
+                        self.cfg, self.tracker, _build_live_notifier(self.cfg))
                     await asyncio.to_thread(self.broker.refresh_state)
                     self._last_pos_refresh = time.time()
                     self.risk = RiskManager(self.cfg, self.broker.equity())

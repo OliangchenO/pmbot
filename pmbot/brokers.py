@@ -541,6 +541,20 @@ class PaperBroker:
             log.warning("could not persist state: %s", e)
 
 
+def _notify_live_fill(notifier, entry: dict, order_side: str) -> None:
+    """Queue a live-fill notification without affecting broker state."""
+    if notifier is None:
+        return
+    try:
+        notifier.send_text(
+            "[PMBot LIVE FILL] "
+            f"{entry['market']} | {order_side} {entry['side']} "
+            f"{entry['size']:.2f} @ {entry['price']:.3f}"
+        )
+    except Exception as exc:  # noqa: BLE001 - notifications are best-effort
+        log.warning("DingTalk fill notification failed: %s", exc)
+
+
 class LiveBroker:
     """Real order placement through py-clob-client-v2 (CLOB V2)."""
 
@@ -548,7 +562,7 @@ class LiveBroker:
     DATA_API = "https://data-api.polymarket.com"
     CHAIN_ID = 137
 
-    def __init__(self, cfg: dict, tracker: BookTracker):
+    def __init__(self, cfg: dict, tracker: BookTracker, notifier=None):
         from py_clob_client_v2 import ClobClient
 
         key = os.environ.get("POLYMARKET_PRIVATE_KEY") or ""
@@ -581,6 +595,7 @@ class LiveBroker:
         self.client = ClobClient(self.HOST, **kwargs)
         self.client.set_api_creds(self.client.create_or_derive_api_key())
         self.tracker = tracker
+        self.notifier = notifier
         self.address = funder or self.client.get_address()
         self._client_lock = threading.RLock()
         self.ws_fills_active = False
@@ -680,14 +695,11 @@ class LiveBroker:
         """Emit one lifecycle record through the asynchronous runtime logger."""
         fields = [f"event={event}"]
         if market is not None:
-            fields.extend((f"cid={market.condition_id}", f"market={market.question!r}"))
+            fields.append(f"market={market.question!r}")
         if quote is not None:
-            fields.extend((f"token={quote.token_id}", f"price={quote.price:.3f}",
-                           f"size={quote.size:.2f}"))
+            fields.extend((f"price={quote.price:.3f}", f"size={quote.size:.2f}"))
         if side is not None:
             fields.append(f"side={side}")
-        if order_id:
-            fields.append(f"order_id={order_id}")
         if reason:
             fields.append(f"reason={reason!r}")
         log.info("ORDER %s", " ".join(fields))
@@ -1121,6 +1133,7 @@ class LiveBroker:
             self.metrics.record_fill(entry)
         log.info("LIVE FILL (ws) %s %s %s %.1f @ %.3f",
                  market.question[:40], side, entry["side"], size, price)
+        _notify_live_fill(getattr(self, "notifier", None), entry, side)
 
     def reconcile_orders(self) -> None:
         """Rebuild local order state from exchange truth."""

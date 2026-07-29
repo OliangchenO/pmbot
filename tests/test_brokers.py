@@ -164,9 +164,9 @@ def test_live_quote_post_logs_order_lifecycle_event(caplog):
     LiveBroker.set_quotes(stub, _market(), [Quote("yes1", 0.47, 10)])
 
     assert "ORDER event=ORDER_PLACED" in caplog.text
-    assert "order_id=newid" in caplog.text
-    assert "cid=cid1" in caplog.text
-    assert "token=yes1" in caplog.text
+    assert "order_id=" not in caplog.text
+    assert "cid=" not in caplog.text
+    assert "token=" not in caplog.text
     assert "side=BUY" in caplog.text
 
 
@@ -188,8 +188,9 @@ def test_live_quote_cancel_logs_order_lifecycle_event(caplog):
     assert LiveBroker._batch_cancel(stub, ["oldid"]) is True
 
     assert "ORDER event=ORDER_CANCELLED" in caplog.text
-    assert "order_id=oldid" in caplog.text
-    assert "cid=cid1" in caplog.text
+    assert "order_id=" not in caplog.text
+    assert "cid=" not in caplog.text
+    assert "token=" not in caplog.text
     assert "side=BUY" in caplog.text
 
 
@@ -390,6 +391,24 @@ def _order_book_stub():
         stub, *args, **kwargs)
     stub._resting_order_context = lambda order_id: LiveBroker._resting_order_context(
         stub, order_id)
+    return stub
+
+
+def _live_fill_stub():
+    """Minimal live broker state for the real fill-receipt path."""
+    stub = _order_book_stub()
+    market = _market()
+    stub._state_lock = threading.RLock()
+    stub._pending_hedges = {}
+    stub._positions = {market.condition_id: {"yes": 0.0, "no": 0.0, "value": 0.0}}
+    stub._token_shares = {}
+    stub._markets = {market.condition_id: market}
+    stub._ws_deltas = deque()
+    stub._ws_deltas_lock = threading.Lock()
+    stub.metrics = None
+    stub.fills_log = []
+    stub._apply_fill_to_orders = lambda token_id, size, side: LiveBroker._apply_fill_to_orders(
+        stub, token_id, size, side)
     return stub
 
 
@@ -666,6 +685,43 @@ def test_pending_hedge_survives_stale_snapshot_without_double_counting():
     )
     assert not LiveBroker.has_pending_hedge(stub, market.condition_id)
     assert LiveBroker.unpaired_shares(stub, market) == 0.0
+
+
+def test_live_fill_sends_dingtalk_notification():
+    """Removing the notification call after a live fill must fail this test."""
+    class RecordingNotifier:
+        def __init__(self):
+            self.messages = []
+
+        def send_text(self, content):
+            self.messages.append(content)
+
+    stub = _live_fill_stub()
+    stub.notifier = RecordingNotifier()
+    market = stub._markets["cid1"]
+
+    LiveBroker.record_user_fill(stub, market.yes_token, "BUY", 0.47, 3.0)
+
+    assert stub.notifier.messages == [
+        "[PMBot LIVE FILL] Test? | BUY YES 3.00 @ 0.470"
+    ]
+
+
+def test_live_fill_keeps_state_when_dingtalk_notification_fails(caplog):
+    """A notification outage must not unwind an already received live fill."""
+    class FailingNotifier:
+        def send_text(self, content):
+            raise RuntimeError("network unavailable")
+
+    stub = _live_fill_stub()
+    stub.notifier = FailingNotifier()
+    market = stub._markets["cid1"]
+
+    LiveBroker.record_user_fill(stub, market.yes_token, "BUY", 0.47, 3.0)
+
+    assert stub.fills_log[-1]["size"] == 3.0
+    assert stub._positions[market.condition_id]["yes"] == 3.0
+    assert "DingTalk fill notification failed" in caplog.text
 
 
 def test_sync_clob_balance_builds_params_and_swallows_errors():
