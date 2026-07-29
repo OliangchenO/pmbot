@@ -363,6 +363,7 @@ class Bot:
         self._merge_task: asyncio.Task | None = None
         self._over_since: dict[str, float] = {}
         self._last_flatten: dict[str, float] = {}
+        self._recovery_skip_logged_at: dict[str, float] = {}
         self._scale = 1.0
         self._was_paused = False
         # Event-driven quote pulls: guards fire these between loop ticks so we
@@ -850,22 +851,69 @@ class Bot:
             pricing["yes_bid_quote"], pricing["no_bid_quote"],
         )
 
+    def _log_inventory_recovery_skip(
+            self, market: gamma.Market, *, unpaired: float, reason: str,
+            basis: float | None = None, yes_book: Book | None = None,
+            no_book: Book | None = None) -> None:
+        """Rate-limit evidence for a held inventory market that cannot quote."""
+        now = time.time()
+        if now - self._recovery_skip_logged_at.get(market.condition_id, 0.0) < 60.0:
+            return
+        self._recovery_skip_logged_at[market.condition_id] = now
+
+        def top(book: Book | None) -> str:
+            if book is None or book.best_bid is None or book.best_ask is None:
+                return "empty"
+            return f"{book.best_bid:.3f}/{book.best_ask:.3f}"
+
+        basis_text = "unknown" if basis is None else f"{basis:.3f}"
+        log.warning(
+            "INVENTORY_RECOVERY_SKIPPED market='%s' reason=%s unpaired=%.0f "
+            "basis=%s yes_book=%s no_book=%s",
+            market.question[:80], reason, unpaired, basis_text,
+            top(yes_book), top(no_book),
+        )
+
     def _inventory_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
                                    unpaired: float) -> list[strategy.Quote]:
         """Keep only a capped complement bid while a market is unpaired."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return desired
+        complement = m.no_token if unpaired > 0 else m.yes_token
+        min_order_size = self._clob_min_order_size(complement)
+        if min_order_size is not None and abs(unpaired) < min_order_size:
+            return []
         basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
         basis = basis_fn(m) if basis_fn else None
         if basis is None:
             return []
         max_price = self._forced_hedge_max_price(m, basis)
-        complement = m.no_token if unpaired > 0 else m.yes_token
         return [strategy.Quote(q.token_id, min(q.price, max_price),
                                min(q.size, abs(unpaired)))
                 for q in desired
                 if q.token_id == complement]
+
+    def _clob_min_order_size(self, token_id: str) -> float | None:
+        """Current CLOB quantity floor, populated from `/book` snapshots."""
+        if self.tracker is None:
+            return None
+        book = self.tracker.books.get(token_id)
+        return book.min_order_size if book is not None else None
+
+    def _quote_cfg_for_inventory_recovery(self, unpaired: float) -> dict:
+        """Allow an existing position's complement up to its unpaired shares."""
+        effective_cap = abs(unpaired)
+        if effective_cap <= 0:
+            return self.cfg
+        scale = max(self._scale, 1e-9)
+        configured_cap = float(self.cfg["quoting"]["max_capital_per_market"])
+        recovery_cap = max(configured_cap, effective_cap / scale)
+        if recovery_cap == configured_cap:
+            return self.cfg
+        return {**self.cfg, "quoting": {
+            **self.cfg["quoting"], "max_capital_per_market": recovery_cap,
+        }}
 
     def _filter_quotes_for_side_guard(self, desired: list[strategy.Quote], *,
                                       unpaired: float, now: float) -> list[strategy.Quote]:
@@ -943,8 +991,13 @@ class Bot:
 
         selected_cids = {m.condition_id for m in self.markets}
         for m in all_markets:
+            unpaired = self.broker.unpaired_shares(m)
+            needs_recovery = abs(unpaired) >= MIN_TAKER_SHARES
             h = hours_to_end(m, now)
             if h is not None and h <= exit_h:
+                if needs_recovery:
+                    self._log_inventory_recovery_skip(
+                        m, unpaired=unpaired, reason="near_resolution")
                 if self.broker.open_quotes(m):
                     log.warning("'%s' resolves in %.1fh — exiting market", m.question[:45], h)
                     updates.append((m, [], None))
@@ -957,6 +1010,10 @@ class Bot:
             book_age = now - min(yes_book.updated_ts, no_book.updated_ts)
             if strategy.book_feed_stale(feed_age, book_age, max_stale):
                 self.metrics.sample_uptime(m.condition_id, False)
+                if needs_recovery:
+                    self._log_inventory_recovery_skip(
+                        m, unpaired=unpaired, reason="stale_book",
+                        yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
                     log.warning("feed/book stale (feed %.0fs, book %.0fs) — "
                                 "pulling quotes from '%s'",
@@ -969,6 +1026,10 @@ class Bot:
             if (not strategy.book_is_quotable(yes_book, band, max_spread_mult)
                     or not strategy.book_is_quotable(no_book, band, max_spread_mult)):
                 self.metrics.sample_uptime(m.condition_id, False)
+                if needs_recovery:
+                    self._log_inventory_recovery_skip(
+                        m, unpaired=unpaired, reason="unquotable_book",
+                        yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
                     log.warning("book not quotable on both sides — pulling '%s'",
                                 m.question[:45])
@@ -977,6 +1038,10 @@ class Bot:
             cooled_down = not self.guards.allow(m.condition_id, now)
             if not self.risk.theme_quoting_ok(m, all_markets, net_exp, self._scale):
                 self.metrics.sample_uptime(m.condition_id, False)
+                if needs_recovery:
+                    self._log_inventory_recovery_skip(
+                        m, unpaired=unpaired, reason="theme_inventory_cap",
+                        yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
                     log.warning("theme inventory cap — not quoting '%s'",
                                 m.question[:45])
@@ -997,8 +1062,10 @@ class Bot:
             markout_avg = self.markouts.market_avg(m.condition_id)
             size_factor = self._size_factors.get(m.condition_id, 1.0)
             pricing: dict[str, float] = {}
+            quote_cfg = (self._quote_cfg_for_inventory_recovery(unpaired)
+                         if needs_recovery else self.cfg)
             desired = strategy.compute_quotes(
-                m, yes_book, exposure, self.cfg, eff_max_inv,
+                m, yes_book, exposure, quote_cfg, eff_max_inv,
                 fade_yes=fade_yes + widen + flow_yes,
                 fade_no=fade_no + widen + flow_no,
                 scale=self._scale,
@@ -1006,8 +1073,9 @@ class Bot:
                 markout_avg=markout_avg,
                 size_factor=size_factor,
                 pricing=pricing,
+                min_quote_size=abs(unpaired) if needs_recovery else None,
             )
-            unpaired = self.broker.unpaired_shares(m)
+            normal_desired = desired
             recovery_path = "normal"
             if m.condition_id not in selected_cids:
                 desired = self._held_market_recovery_quotes(m, desired, unpaired)
@@ -1021,6 +1089,20 @@ class Bot:
                     recovery_path = "inventory_recovery"
                 desired = self._filter_quotes_for_side_guard(
                     desired, unpaired=unpaired, now=now)
+            if needs_recovery and not desired:
+                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                basis = basis_fn(m) if basis_fn else None
+                reason = "unknown_cost_basis" if basis is None else "no_complement_quote"
+                complement = m.no_token if unpaired > 0 else m.yes_token
+                min_order_size = self._clob_min_order_size(complement)
+                if (min_order_size is not None
+                        and abs(unpaired) < min_order_size):
+                    reason = "below_current_clob_min_order_size"
+                elif not normal_desired:
+                    reason = "strategy_no_quote"
+                self._log_inventory_recovery_skip(
+                    m, unpaired=unpaired, reason=reason, basis=basis,
+                    yes_book=yes_book, no_book=no_book)
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])

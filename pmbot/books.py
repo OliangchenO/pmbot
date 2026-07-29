@@ -35,6 +35,8 @@ class Book:
         self.last_trade_price: float | None = None
         self.last_trade_ts: float = 0.0
         self.updated_ts: float = 0.0
+        # CLOB's current hard order-quantity floor (`min_order_size`).
+        self.min_order_size: float | None = None
 
     @property
     def best_bid(self) -> float | None:
@@ -51,9 +53,15 @@ class Book:
             return (bb + ba) / 2
         return self.last_trade_price
 
-    def snapshot(self, bids: list[dict], asks: list[dict]) -> None:
+    def snapshot(self, bids: list[dict], asks: list[dict],
+                 min_order_size: str | float | None = None) -> None:
         self.bids = {float(l["price"]): float(l["size"]) for l in bids if float(l["size"]) > 0}
         self.asks = {float(l["price"]): float(l["size"]) for l in asks if float(l["size"]) > 0}
+        if min_order_size is not None:
+            try:
+                self.min_order_size = float(min_order_size)
+            except (TypeError, ValueError):
+                pass
         self.updated_ts = time.time()
 
     def apply_change(self, side: str, price: float, size: float) -> None:
@@ -196,7 +204,7 @@ class BookTracker:
             if etype == "book":
                 bids = ev.get("bids") or ev.get("buys") or []
                 asks = ev.get("asks") or ev.get("sells") or []
-                book.snapshot(bids, asks)
+                book.snapshot(bids, asks, ev.get("min_order_size"))
             elif etype == "price_change":
                 for ch in ev.get("changes") or [ev]:
                     try:
@@ -245,6 +253,9 @@ class BookTracker:
                     resp = await client.get(f"{CLOB_URL}/book", params={"token_id": token})
                     resp.raise_for_status()
                     data = resp.json()
-                    self.books[token].snapshot(data.get("bids") or [], data.get("asks") or [])
+                    self.books[token].snapshot(
+                        data.get("bids") or [], data.get("asks") or [],
+                        data.get("min_order_size"),
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.debug("REST book fetch failed for %s…: %s", token[:12], e)

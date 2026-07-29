@@ -2,7 +2,17 @@
 
 import asyncio
 
-from pmbot.books import BookTracker
+from pmbot.books import Book, BookTracker
+
+
+def test_book_snapshot_retains_clob_minimum_order_size():
+    book = Book("t1")
+
+    book.snapshot([{"price": "0.45", "size": "10"}],
+                  [{"price": "0.46", "size": "10"}],
+                  min_order_size="100")
+
+    assert book.min_order_size == 100.0
 
 
 def test_resubscribe_keeps_survivors_and_primes_only_new(monkeypatch):

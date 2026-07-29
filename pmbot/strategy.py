@@ -98,6 +98,7 @@ def compute_quotes(
     markout_avg: float | None = None,
     size_factor: float = 1.0,
     pricing: dict[str, float] | None = None,
+    min_quote_size: float | None = None,
 ) -> list[Quote]:
     """Desired quotes for one market given current book + inventory."""
     q = cfg["quoting"]
@@ -127,7 +128,9 @@ def compute_quotes(
     # quotes cost nothing per fill. Widening here would only push us out of the
     # reward band and forfeit rewards. Fees apply solely on taker merges/exits.
 
-    base_size = max(market.min_size * q["size_mult_of_min"] * scale, market.min_size)
+    quote_min_size = (market.min_size if min_quote_size is None
+                      else min(market.min_size, min_quote_size))
+    base_size = max(quote_min_size * q["size_mult_of_min"] * scale, quote_min_size)
     size = float(int(base_size * max(0.5, min(2.0, size_factor))))
 
     # Clamp size to the per-market capital cap (size in shares ≈ USD committed
@@ -137,11 +140,10 @@ def compute_quotes(
     # fit (the scanner already filters those, but a tier drop can shrink the cap
     # under a held market's min size).
     max_cap = q["max_capital_per_market"] * scale
-    if market.min_size > max_cap + 1e-9:
+    if quote_min_size > max_cap + 1e-9:
         return []
     size = min(size, float(int(max_cap)))
-    # Below min_incentive_size the order scores zero rewards — never go under.
-    size = max(size, float(math.ceil(market.min_size)))
+    size = max(size, float(math.ceil(quote_min_size)))
 
     skew_frac = max(-1.0, min(1.0, net_yes_exposure_usd / max(max_inventory_usd, 1e-9)))
     skew = skew_frac * q["skew_strength"] * offset

@@ -838,7 +838,8 @@ class LiveBroker:
             self._record_order_event("ORDER_POST_FAILED", quote=q, side="SELL", reason=str(e))
         return None
 
-    def _batch_cancel(self, order_ids: list[str]) -> bool:
+    def _batch_cancel(self, order_ids: list[str], *, reason: str | None = None,
+                      audit_contexts: dict[str, dict] | None = None) -> bool:
         if not order_ids:
             return True
 
@@ -850,7 +851,9 @@ class LiveBroker:
             _with_retry("batch cancel", _do_cancel)
             for oid in order_ids:
                 market, quote, side = self._resting_order_context(oid)
-                self._record_order_event("ORDER_CANCELLED", market, quote, side, oid)
+                self._record_order_event(
+                    "ORDER_CANCELLED", market, quote, side, oid, reason=reason,
+                    audit=(audit_contexts or {}).get(oid))
             return True
         except Exception as e:  # noqa: BLE001
             from py_clob_client_v2 import OrderPayload
@@ -861,7 +864,9 @@ class LiveBroker:
                     with self._client_lock:
                         self.client.cancel_order(OrderPayload(orderID=oid))
                     market, quote, side = self._resting_order_context(oid)
-                    self._record_order_event("ORDER_CANCELLED", market, quote, side, oid)
+                    self._record_order_event(
+                        "ORDER_CANCELLED", market, quote, side, oid, reason=reason,
+                        audit=(audit_contexts or {}).get(oid))
                 except Exception as fallback_error:  # noqa: BLE001
                     ok = False
                     log.warning("cancel failed %s: %s", oid[:16], fallback_error)
@@ -882,6 +887,7 @@ class LiveBroker:
         kept: list[RestingOrder] = []
         cancel_now: list[str] = []     # price/size changed or no longer wanted
         cancel_after: list[str] = []   # pure expiry refresh — cancel after repost
+        refresh_audits: dict[str, dict] = {}
 
         for ro in self._open_orders.get(market.condition_id, []):
             d = desired.get(ro.quote.token_id)
@@ -896,6 +902,8 @@ class LiveBroker:
                 # replacement posts first, then cancel the old order below. No
                 # off-book gap, so the reward sampler always sees this side.
                 cancel_after.append(ro.order_id)
+                refresh_audits[ro.order_id] = (
+                    (audit_context or {}).get(ro.quote.token_id, ro.audit))
             else:
                 cancel_now.append(ro.order_id)
 
@@ -982,7 +990,8 @@ class LiveBroker:
         # Replacements are now resting; close the overlap by cancelling the
         # expiring originals. Deferred to here (after a successful post) so a
         # failed post never leaves a side off the book — the old order stays.
-        if cancel_after and not self._batch_cancel(cancel_after):
+        if cancel_after and not self._batch_cancel(
+                cancel_after, reason="expiry_refresh", audit_contexts=refresh_audits):
             log.warning("refresh overlap: stale-order cancel failed in '%s' — "
                         "reconciling", market.question[:45])
             self.reconcile_orders()

@@ -122,7 +122,7 @@ def test_refresh_overlap_posts_replacement_before_cancelling_old():
 
     calls = []
 
-    def fake_cancel(ids):
+    def fake_cancel(ids, **_kwargs):
         if ids:
             calls.append(("cancel", tuple(ids)))
         return True
@@ -219,6 +219,44 @@ def test_order_cancellation_audit_keeps_order_id_and_pair_economics(tmp_path):
     assert row["path"] == "inventory_recovery"
     assert row["unpaired_cost"] == 0.669
     assert row["pair_cap"] == 0.329
+
+
+def test_refresh_cancellation_inherits_recovery_audit_context(tmp_path):
+    """A rehydrated expiring quote must not be recorded as a normal cancel."""
+    from pmbot.audit import AuditLogger
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.refresh_overlap = True
+    stub.metrics = None
+    stub._logged_post_shape = False
+    stub.reconcile_orders = MagicMock()
+    stub._gtd_expiration = lambda: 1_700_000_240
+    stub._batch_cancel = LiveBroker._batch_cancel.__get__(stub, LiveBroker)
+    stub.audit = AuditLogger(str(tmp_path / "audit.jsonl"))
+    market = _market()
+    stub._markets = {market.condition_id: market}
+    old = Quote(market.no_token, 0.34, 15)
+    stub._open_orders = {market.condition_id: [RestingOrder(
+        "old-recovery", old, time.time(), time.time() + GTD_REFRESH_MARGIN_SECS - 1,
+    )]}
+    stub.client.create_order.return_value = object()
+    stub.client.post_orders.return_value = [{"orderID": "new-recovery"}]
+    recovery_audit = {
+        "path": "inventory_recovery", "unpaired_cost": 0.65,
+        "pair_cap": 0.34, "expected_pair_pnl": 0.001,
+    }
+
+    LiveBroker.set_quotes(stub, market, [old], {market.no_token: recovery_audit})
+
+    rows = [json.loads(line) for line in
+            (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    cancelled = next(row for row in rows if row["event"] == "order_cancelled")
+    assert cancelled["path"] == "inventory_recovery"
+    assert cancelled["reason"] == "expiry_refresh"
+    assert cancelled["pair_cap"] == 0.34
 
 
 def test_parse_fill_amount_from_taking_amount():

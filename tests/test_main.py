@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pmbot import main
+from pmbot import main, strategy
 from pmbot.books import Book, BookTracker
 from pmbot.brokers import PaperBroker, Position
 from pmbot.gamma import Market
@@ -83,6 +83,21 @@ class _RecoveryBasisBroker:
 
     def unpaired_cost_basis(self, _market: Market) -> float | None:
         return self.basis
+
+
+def test_inventory_recovery_skip_log_includes_reason_and_state(tmp_path, caplog):
+    """A held market skipped before quote submission must expose its gate."""
+    bot = _bot(tmp_path)
+    market = _market()
+    caplog.set_level(logging.WARNING, logger="pmbot")
+
+    bot._log_inventory_recovery_skip(
+        market, unpaired=15.0, reason="unknown_cost_basis", basis=None)
+
+    assert "INVENTORY_RECOVERY_SKIPPED" in caplog.text
+    assert "reason=unknown_cost_basis" in caplog.text
+    assert "unpaired=15" in caplog.text
+    bot.metrics.close()
 
 
 def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
@@ -536,6 +551,54 @@ def test_inventory_recovery_clamps_quote_above_pair_cost_cap(tmp_path):
 
     assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
     assert capped == [Quote(market.yes_token, 0.330, 50.0)]
+    bot.metrics.close()
+
+
+def test_inventory_recovery_raises_quote_cap_to_existing_unpaired_shares(tmp_path):
+    """A tier drop must not suppress the passive complement for held inventory."""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.65)
+    bot._scale = 0.5
+    bot.cfg["scanner"] = {"mid_range": [0.25, 0.75]}
+    bot.cfg["quoting"] = {
+        "offset_frac_of_max_spread": 0.35,
+        "size_mult_of_min": 1.0,
+        "max_capital_per_market": 10,
+        "skew_strength": 0.6,
+    }
+    market = _market()
+    market.min_size = 100
+    yes_book = Book(market.yes_token)
+    yes_book.bids = {0.64: 100.0}
+    yes_book.asks = {0.65: 100.0}
+
+    normal = strategy.compute_quotes(
+        market, yes_book, 0.0, bot.cfg, 30.0, scale=bot._scale)
+    recovery_cfg = bot._quote_cfg_for_inventory_recovery(unpaired=15.0)
+    recovery = strategy.compute_quotes(
+        market, yes_book, 0.0, recovery_cfg, 30.0, scale=bot._scale,
+        min_quote_size=15.0)
+    quotes = bot._inventory_recovery_quotes(market, recovery, unpaired=15.0)
+
+    assert normal == []
+    assert bot.cfg["quoting"]["max_capital_per_market"] == 10
+    assert [(q.token_id, q.size) for q in quotes] == [(market.no_token, 15.0)]
+    assert quotes[0].price <= 0.34
+    bot.metrics.close()
+
+
+def test_inventory_recovery_uses_current_clob_minimum_order_size(tmp_path):
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.65)
+    market = _market()
+    tracker = BookTracker([market.yes_token, market.no_token])
+    tracker.books[market.no_token].min_order_size = 100.0
+    bot.tracker = tracker
+
+    quotes = bot._inventory_recovery_quotes(
+        market, [Quote(market.no_token, 0.34, 100.0)], unpaired=15.0)
+
+    assert quotes == []
     bot.metrics.close()
 
 
