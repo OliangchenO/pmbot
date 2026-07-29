@@ -5,6 +5,8 @@ import threading
 from collections import deque
 from unittest.mock import MagicMock
 
+import pytest
+
 from pmbot.books import Book, BookTracker
 from pmbot.brokers import (
     LiveBroker,
@@ -607,3 +609,40 @@ def test_select_collateral_prefers_onchain_over_stale_cache():
     # falls back to the cache only when the on-chain read is unavailable
     assert LiveBroker._select_collateral(None, 100.0) == 100.0
     assert LiveBroker._select_collateral(None, None) is None
+
+
+def test_held_position_is_hydrated_and_included_in_inventory(monkeypatch):
+    """A position outside the active quote set must enter normal management."""
+    from pmbot import brokers
+
+    market = _market()
+    stub = _live_stub()
+    stub._markets = {}
+    stub._positions = {market.condition_id: {"yes": 20.0, "no": 9.0, "value": 13.048}}
+    stub.tracker = BookTracker([market.yes_token, market.no_token])
+    stub.tracker.books[market.yes_token].last_trade_price = 0.4
+    monkeypatch.setattr(brokers.gamma, "fetch_market", lambda cid: market)
+
+    # Until Gamma responds, the position is conservatively visible rather than
+    # disappearing from the inventory total.
+    assert LiveBroker.total_inventory_usd(stub) == pytest.approx(13.048)
+    added = LiveBroker._hydrate_held_markets(stub, {market.condition_id})
+
+    assert added == [market]
+    assert LiveBroker.held_markets(stub) == [market]
+    assert LiveBroker.unpaired_shares(stub, market) == 11.0
+    assert LiveBroker.total_inventory_usd(stub) == pytest.approx(2.6)
+
+
+def test_live_unpaired_cost_basis_uses_exchange_average_price():
+    market = _market()
+    stub = _live_stub()
+    stub._positions = {
+        market.condition_id: {"yes": 20.0, "no": 9.0, "value": 0.0,
+                              "yes_cost": 7.96, "yes_cost_shares": 20.0,
+                              "no_cost": 5.74, "no_cost_shares": 9.0},
+    }
+    stub._pending_hedges = {}
+    stub._state_lock = threading.RLock()
+
+    assert LiveBroker.unpaired_cost_basis(stub, market) == pytest.approx(0.398)

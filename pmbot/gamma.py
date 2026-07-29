@@ -16,6 +16,7 @@ GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_URL = "https://clob.polymarket.com"
 SCAN_PAGES = 20
 TIMEOUT = httpx.Timeout(15.0)
+GAMMA_FETCH_ATTEMPTS = 3
 
 
 @dataclass
@@ -50,10 +51,10 @@ class Market:
         return self.last_trade if self.last_trade is not None else 0.5
 
 
-def _parse_market(m: dict) -> Market | None:
+def _parse_market(m: dict, require_rewards: bool = True) -> Market | None:
     rewards = m.get("clobRewards") or []
     daily_pool = sum(float(r.get("rewardsDailyRate") or 0) for r in rewards)
-    if daily_pool <= 0:
+    if require_rewards and daily_pool <= 0:
         return None
     try:
         token_ids = json.loads(m.get("clobTokenIds") or "[]")
@@ -103,6 +104,27 @@ def _parse_market(m: dict) -> Market | None:
     )
 
 
+def fetch_market(condition_id: str) -> Market | None:
+    """Load one market by condition id, including non-reward held positions."""
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.get(GAMMA_URL, params={"condition_ids": condition_id})
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("held-market lookup failed for %s…: %s", condition_id[:12], e)
+        return None
+
+    rows = payload if isinstance(payload, list) else [payload]
+    for raw in rows:
+        if isinstance(raw, dict):
+            parsed = _parse_market(raw, require_rewards=False)
+            if parsed and parsed.condition_id == condition_id:
+                return parsed
+    log.warning("held-market lookup returned no usable market for %s…", condition_id[:12])
+    return None
+
+
 def _fetch_market_fees(
     condition_id: str, cache: dict[str, tuple[int, float] | None],
     attempts: int = 2, backoff: float = 0.5,
@@ -148,6 +170,56 @@ def _fetch_market_fees(
     cache[condition_id] = result
     return result
 
+
+# def fetch_reward_markets() -> list[Market]:
+#     """Fetch active markets with a nonzero daily reward pool."""
+#     seen: set[str] = set()
+#     markets: list[Market] = []
+#     # Gamma rejects ``rewards_min_size`` combined with ``order=rewardsDailyRate``
+#     # (HTTP 422). We rank locally in ``scan``, so one un-ordered, reward-only
+#     # pagination pass is both sufficient and compatible with the live API.
+#     orderings = [None]
+#     with httpx.Client(timeout=TIMEOUT) as client:
+#         for order in orderings:
+#             for page in range(SCAN_PAGES):
+#                 batch = None
+#                 for attempt in range(GAMMA_FETCH_ATTEMPTS):
+#                     try:
+#                         resp = client.get(
+#                             GAMMA_URL,
+#                             params={
+#                                 "active": "true",
+#                                 "closed": "false",
+#                                 "limit": 100,
+#                                 "offset": page * 100,
+#                                 "order": order
+#                             },
+#                         )
+#                         resp.raise_for_status()
+#                         batch = resp.json()
+#                         break
+#                     except Exception as e:  # noqa: BLE001
+#                         if attempt + 1 < GAMMA_FETCH_ATTEMPTS:
+#                             log.warning(
+#                                 "gamma fetch transient error (order=%s page=%d): %s; retry %d/%d",
+#                                 "default", page, e, attempt + 1, GAMMA_FETCH_ATTEMPTS - 1,
+#                             )
+#                             time.sleep(0.3 * (attempt + 1))
+#                         else:
+#                             log.warning(
+#                                 "gamma fetch failed (order=%s page=%d) after %d attempts: %s",
+#                                 "default", page, GAMMA_FETCH_ATTEMPTS, e,
+#                             )
+#                 if batch is None:
+#                     break
+#                 if not batch:
+#                     break
+#                 for raw in batch:
+#                     parsed = _parse_market(raw)
+#                     if parsed and parsed.condition_id not in seen:
+#                         seen.add(parsed.condition_id)
+#                         markets.append(parsed)
+#     return markets
 
 def fetch_reward_markets() -> list[Market]:
     """Fetch active markets with a nonzero daily reward pool."""

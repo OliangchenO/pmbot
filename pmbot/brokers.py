@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import gamma
 from .books import BookTracker
 from .gamma import Market
 from .strategy import Quote
@@ -585,6 +586,7 @@ class LiveBroker:
         self._open_orders: dict[str, list[RestingOrder]] = {}
         self._exit_orders: dict[str, RestingOrder] = {}
         self._markets: dict[str, Market] = {}
+        self._unmanaged_position_cids: set[str] = set()
         self._positions: dict[str, dict] = {}
         self._token_shares: dict[str, float] = {}
         self._pending_hedges: dict[str, PendingHedge] = {}
@@ -1192,10 +1194,22 @@ class LiveBroker:
                 continue
             m = self._markets.get(cid)
             is_yes = (token == m.yes_token) if m else (outcome_index == 0)
-            d = positions.setdefault(cid, {"yes": 0.0, "no": 0.0, "value": 0.0})
-            d["yes" if is_yes else "no"] += size
+            d = positions.setdefault(cid, {"yes": 0.0, "no": 0.0, "value": 0.0,
+                                           "yes_cost": 0.0, "no_cost": 0.0,
+                                           "yes_cost_shares": 0.0, "no_cost_shares": 0.0})
+            key = "yes" if is_yes else "no"
+            d[key] += size
+            try:
+                avg = float(r.get("avgPrice"))
+            except (TypeError, ValueError):
+                avg = None
+            if avg is not None and avg > 0:
+                d[f"{key}_cost"] += size * avg
+                d[f"{key}_cost_shares"] += size
             d["value"] += size * cur
             token_shares[token] = token_shares.get(token, 0.0) + size
+
+        self._hydrate_held_markets(set(positions))
 
         if self._synced and not self.ws_fills_active:
             now = time.time()
@@ -1297,6 +1311,24 @@ class LiveBroker:
                 tokens.extend((m.yes_token, m.no_token))
         return tokens
 
+    def _hydrate_held_markets(self, condition_ids: set[str]) -> list[Market]:
+        """Resolve held markets so the usual inventory controls can manage them."""
+        added: list[Market] = []
+        unresolved: set[str] = set()
+        for cid in condition_ids:
+            if cid in self._markets:
+                continue
+            market = gamma.fetch_market(cid)
+            if market is None:
+                unresolved.add(cid)
+                continue
+            self._markets[cid] = market
+            added.append(market)
+            log.warning("adopting held position market '%s' into inventory management",
+                        market.question[:60])
+        self._unmanaged_position_cids = unresolved
+        return added
+
     def equity(self) -> float:
         if self._collateral != self._collateral or not self._synced:
             return float("nan")
@@ -1312,7 +1344,7 @@ class LiveBroker:
 
     def net_yes_exposure_usd(self, market: Market) -> float:
         d = LiveBroker._effective_position(self, market)
-        mid = self._yes_mid(market)
+        mid = LiveBroker._yes_mid(self, market)
         if mid is None:
             mid = 0.5
         return d["yes"] * mid - d["no"] * (1 - mid)
@@ -1321,13 +1353,31 @@ class LiveBroker:
         d = LiveBroker._effective_position(self, market)
         return d["yes"] - d["no"]
 
+    def unpaired_cost_basis(self, market: Market) -> float | None:
+        """Average entry price of the excess leg, if supplied by the Data API."""
+        d = LiveBroker._effective_position(self, market)
+        key = "yes" if d["yes"] > d["no"] else "no"
+        shares = float(d.get(f"{key}_cost_shares") or 0.0)
+        if shares <= 0:
+            return None
+        return float(d.get(f"{key}_cost") or 0.0) / shares
+
     def held_markets(self) -> list[Market]:
         with self._state_lock:
             cids = set(self._positions) | set(self._pending_hedges)
         return [self._markets[cid] for cid in cids if cid in self._markets]
 
     def total_inventory_usd(self) -> float:
-        return sum(abs(self.net_yes_exposure_usd(m)) for m in self.held_markets())
+        managed = LiveBroker.held_markets(self)
+        managed_cids = {m.condition_id for m in managed}
+        with self._state_lock:
+            unmanaged_value = sum(
+                abs(float(d.get("value") or 0.0))
+                for cid, d in self._positions.items()
+                if cid not in managed_cids
+            )
+        return (sum(abs(LiveBroker.net_yes_exposure_usd(self, m)) for m in managed)
+                + unmanaged_value)
 
     def merge_pairs(self, min_pairs: float) -> None:
         if self.merger is None or self.merger.disabled or not self._synced:

@@ -15,6 +15,7 @@ import atexit
 import contextlib
 import csv
 import logging
+import math
 import queue
 import time
 from datetime import datetime, timedelta, timezone
@@ -332,10 +333,20 @@ class Bot:
         self.guards.on_side_block = self._schedule_side_pull
 
     async def run(self) -> None:
+        if not self.paper:
+            await self._bootstrap_live_broker()
         while True:
             await self._rescan(initial=True)
             if self.markets:
                 break
+            # A scanner drought must never leave an already-held market
+            # unmanaged. It may still need a complement quote, passive exit,
+            # or forced hedge even though no new reward market is eligible.
+            if not self.paper:
+                await asyncio.to_thread(self.broker.refresh_state)
+                self._last_pos_refresh = time.time()
+                await self._ensure_held_market_books()
+            await self._manage_inventory(time.time())
             log.warning("scanner found no eligible markets — retrying in %.0fs "
                         "(loosen config filters to match more markets)",
                         SCAN_RETRY_SECONDS)
@@ -363,6 +374,7 @@ class Bot:
                 if not self.paper and now - self._last_pos_refresh >= POSITION_REFRESH_SECONDS:
                     await asyncio.to_thread(self.broker.refresh_state)
                     self._last_pos_refresh = now
+                    await self._ensure_held_market_books()
                 if not self.paper and now - self._last_merge_check >= MERGE_CHECK_SECONDS:
                     self._last_merge_check = now
                     if self._merge_task is None or self._merge_task.done():
@@ -423,6 +435,39 @@ class Bot:
                 await self.tracker.stop()
             self._print_status()
             self.metrics.close()
+
+    async def _bootstrap_live_broker(self) -> None:
+        """Authenticate and reconcile inventory before the first market scan."""
+        if self.broker is not None:
+            return
+        self.tracker = BookTracker([])
+        self.broker = LiveBroker(self.cfg, self.tracker)
+        await asyncio.to_thread(self.broker.refresh_state)
+        self._last_pos_refresh = time.time()
+        self.risk = RiskManager(self.cfg, self.broker.equity())
+        from .userfeed import UserFeed
+        self.userfeed = UserFeed(self.broker)
+        self.userfeed.start()
+        self.broker.metrics = self.metrics
+        self.tracker.on_trade(self._on_market_trade)
+        await self.tracker.start()
+        await self._ensure_held_market_books()
+
+    async def _ensure_held_market_books(self) -> None:
+        """Subscribe position-only markets before routing them to inventory logic."""
+        if self.paper or self.broker is None or self.tracker is None:
+            return
+        held = self.broker.held_markets()
+        for market in held:
+            self._token_market[market.yes_token] = market
+            self._token_market[market.no_token] = market
+        missing = [token for token in self.broker.position_tokens()
+                   if token not in self.tracker.books]
+        if not missing:
+            return
+        log.warning("subscribing %d held-position token(s) for inventory management",
+                    len(missing))
+        await self.tracker.resubscribe([*self.tracker.books, *missing])
 
     async def _broker_call(self, fn, *args):
         """Dispatch broker order ops off the event loop in live mode."""
@@ -675,7 +720,7 @@ class Bot:
                     if t not in token_ids:
                         token_ids.append(t)
 
-        if initial or self.tracker is None:
+        if self.tracker is None:
             self.tracker = BookTracker(token_ids, carry=carry_books)
             if initial:
                 if self.paper:
@@ -708,6 +753,8 @@ class Bot:
             self.broker.metrics = self.metrics
 
         self._last_scan = time.time()
+        if not self.paper:
+            await self._ensure_held_market_books()
         self._compute_size_factors()
 
     def _compute_size_factors(self) -> None:
@@ -747,6 +794,38 @@ class Bot:
             return []
         return Bot._inventory_recovery_quotes(m, desired, unpaired)
 
+    @staticmethod
+    def _held_market_recovery_quotes(m: gamma.Market, desired: list[strategy.Quote],
+                                     unpaired: float) -> list[strategy.Quote]:
+        """Held-only markets may only quote the inventory-reducing complement."""
+        if abs(unpaired) < MIN_TAKER_SHARES:
+            return []
+        return Bot._inventory_recovery_quotes(m, desired, unpaired)
+
+    def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
+                              exposure_usd: float, threshold_usd: float,
+                              risk_since: float, now: float, wait_secs: float,
+                              basis: float | None, ask: float) -> bool:
+        """Permit a taker hedge only after escalation and within pair-cost cap."""
+        if basis is None:
+            return False
+        escalated = (urgent or abs(exposure_usd) >= threshold_usd
+                     or now - risk_since >= wait_secs)
+        return escalated and ask <= self._forced_hedge_max_price(market, basis) + 1e-9
+
+    @staticmethod
+    def _forced_hedge_max_price(market: gamma.Market, basis: float) -> float:
+        """Highest tick price that keeps a paired share break-even after fee."""
+        tick = market.tick
+        price = min(1.0 - tick, math.floor((1.0 - basis) / tick + 1e-9) * tick)
+        fee_rate = market.fee_bps / 10_000.0
+        while price > 0:
+            fee = fee_rate * (price * (1.0 - price)) ** market.fee_exponent
+            if basis + price + fee <= 1.0 + 1e-9:
+                return round(price, 6)
+            price = round(price - tick, 6)
+        return 0.0
+
     async def _quote_all(self) -> None:
         r = self.cfg["risk"]
         max_inv = r["max_inventory_usd_per_market"]
@@ -775,7 +854,8 @@ class Bot:
         # earlier ones complete their REST round trips.
         updates: list[tuple[gamma.Market, list[strategy.Quote]]] = []
 
-        for m in self.markets:
+        selected_cids = {m.condition_id for m in self.markets}
+        for m in all_markets:
             h = hours_to_end(m, now)
             if h is not None and h <= exit_h:
                 if self.broker.open_quotes(m):
@@ -839,7 +919,9 @@ class Bot:
                 size_factor=size_factor,
             )
             unpaired = self.broker.unpaired_shares(m)
-            if cooled_down:
+            if m.condition_id not in selected_cids:
+                desired = self._held_market_recovery_quotes(m, desired, unpaired)
+            elif cooled_down:
                 desired = self._cooldown_recovery_quotes(m, desired, unpaired)
             else:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired)
@@ -898,23 +980,16 @@ class Bot:
             return
         exposure = self.broker.net_yes_exposure_usd(m)
         h = hours_to_end(m, now)
-        urgent = cid not in quoted or (h is not None and h <= exit_h)
+        urgent = h is not None and h <= exit_h
         if not urgent:
             theme_markets = list(managed.values())
             if self.risk.theme_at_cap(m, theme_markets,
                                       self.broker.net_yes_exposure_usd,
                                       self._scale):
                 urgent = True
-        if not urgent:
-            if abs(exposure) < threshold:
-                self._over_since.pop(cid, None)
-                await self._broker_call(self.broker.set_exit, m, None)
-                return
-            start = self._over_since.setdefault(cid, now)
-            if passive:
-                await self._update_exit_sell(m, unpaired)
-            if now - start < wait:
-                return
+        start = self._over_since.setdefault(cid, now)
+        if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
+            await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:
             return
         self._last_flatten[cid] = now
@@ -929,8 +1004,16 @@ class Bot:
             log.warning("forced hedge needed in '%s' but complement book is "
                         "wide/empty — retrying shortly", m.question[:45])
             return
+        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+        basis = basis_fn(m) if basis_fn else None
+        if not self._forced_hedge_allowed(
+                m, urgent=urgent, exposure_usd=exposure, threshold_usd=threshold,
+                risk_since=start, now=now, wait_secs=wait, basis=basis, ask=ask):
+            log.warning("forced hedge deferred in '%s': awaiting escalation or pair-cost cap",
+                        m.question[:45])
+            return
         await self._broker_call(self.broker.set_exit, m, None)
-        price = strategy._round_tick(min(ask, 1 - m.tick), m.tick)
+        price = self._forced_hedge_max_price(m, basis)
         if self.paper:
             filled = self.broker.taker_buy(m, token, abs(unpaired), price)
         else:

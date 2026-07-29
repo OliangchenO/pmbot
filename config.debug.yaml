@@ -1,0 +1,428 @@
+# Polymarket market-making bot configuration.
+# mode: paper | live
+mode: paper
+
+# Total capital the bot is allowed to work with (USD).
+capital_usd: 120
+
+paper:
+  # Simulated order placement/cancel latency. New quotes only become fillable
+  # after this delay; replaced quotes stay fillable (pick-off risk) until the
+  # simulated cancel lands. Matches a typical CLOB HTTP round trip.
+  order_latency_ms: 300
+  # Discount on estimated reward accrual: the estimator only sees displayed
+  # competition and assumes full queue/eligibility, so it overstates share.
+  # Calibrate against realized rewards once live.
+  reward_haircut: 0.7
+
+scanner:
+  # How many markets to quote simultaneously. Keep this small relative to
+  # capital_usd: a two-sided quote locks ~`size` dollars of collateral per
+  # market (a filled YES+NO pair is worth $1), so N markets need ~N×size of
+  # free balance at once. At $100 capital, 1–2 markets is realistic; raise
+  # this only as you add capital.
+  top_n_markets: 2
+  # Ignore markets whose daily reward pool is below this (USD/day). Raised
+  # from 75: a thin pool (e.g. an $82/day box-office bracket) earns only cents
+  # of reward share at our size while still carrying full pick-off/forced-hedge
+  # risk — a losing trade. Better to quote one strong market than backfill the
+  # second slot with a toxic low-pool one. Lower only if the scanner starves.
+  min_pool_per_day: 120
+  # Absolute book-liquidity floor (USD). The reward-density ranking below
+  # (pool ÷ liquidity) structurally favors THIN books, which then trip the
+  # volatility / book-not-quotable guards and tank in-band uptime (e.g. a $431
+  # book quoting two-sided). This drops books too shallow to make on safely.
+  # 0 disables. Tune against `scan` output — too high starves the scanner.
+  min_liquidity: 5000
+  # Ignore markets requiring quotes bigger than this (shares) — keeps
+  # per-market capital small.
+  max_min_size_shares: 100
+  # Minimum reward-pool-to-book-liquidity ratio. Higher = less crowded
+  # reward dollars. 0.01 means $1/day of rewards per $100 of book liquidity.
+  # Lowered from 0.01: at 0.01 this gate fought min_liquidity:5000 (deep-book
+  # floor) and left only thin books eligible — so the deep, low-toxicity
+  # political primaries the strategy prefers were all rejected for density just
+  # under the cut, while the one thin book that cleared it kept picking us off.
+  # 0.005 admits those deep primaries (we capture less reward per share there —
+  # smaller fish in a deeper pool — but the slot was otherwise empty, and the
+  # safety/uptime gain is the real PnL driver per REPORT_reward_selection.md).
+  min_pool_to_liquidity: 0.005
+  # Market-selection ranking (Option C). These only re-order markets that
+  # already pass the filters above (eligibility uses raw reward density), so
+  # they can never starve the scanner — set both to 0 for the old ranking.
+  #   toxicity_turnover_penalty: down-weight markets whose 24h volume is large
+  #     relative to resting liquidity (fast/informed flow that picks off makers).
+  #     score *= 1 / (1 + w * volume24h/liquidity).
+  #   band_room_bonus: prefer wider reward bands (more room to quote inside and
+  #     still merge pairs near $1.00). score *= 1 + w * (max_spread_cents - 1).
+  toxicity_turnover_penalty: 0.15
+  band_room_bonus: 0.10
+  # Hard cap on market fee rate (basis points), as reported by the CLOB
+  # /fee-rate endpoint. On Polymarket makers are NEVER charged fees, so our
+  # resting reward quotes pay nothing regardless of this value — the only fee
+  # cost is when we cross the spread to merge/exit (taker_buy). This cap is
+  # therefore just a guard against pathological markets; keep it high so we
+  # don't needlessly skip fee-enabled markets we can still make on profitably.
+  max_fee_bps: 1000
+  # Mildly down-rank fee-enabled markets in scoring to reflect that taker
+  # merges/exits there cost more (0.5 = halve the penalty term at 100bps).
+  # Only relevant for markets that pass max_fee_bps.
+  fee_penalty_mult: 0.5
+  # Only quote markets whose midpoint is inside this range. Outside it,
+  # rewards require two-sided depth anyway and tail risk is worse. Narrowed
+  # from [0.15, 0.85]: at a low/high mid a few-tick move is a large *cent*
+  # swing, so extreme-priced books trip the 3c volatility guard constantly.
+  mid_range: [0.25, 0.75]
+  # Skip markets resolving sooner than this many hours. Keep this at or above
+  # risk.derisk_hours_before_end so freshly scanned markets aren't entered
+  # already inside the de-risk/exit window (which would quote them at a shrunk
+  # cap and widened spread for only a couple of hours before forced exit).
+  min_hours_to_end: 14
+  # Re-run the scanner this often to rotate into fresh markets.
+  refresh_minutes: 30
+  # Sticky selection (reward-farmer friendly). When true, markets we are
+  # already quoting are KEPT across rescans as long as they stay eligible —
+  # we don't churn the set just because the pool÷liquidity ranking reshuffled.
+  # Leaving a market costs a feed/quote gap and lost queue position, so for a
+  # reward farmer stickiness beats chasing a marginally higher-ranked market.
+  # Guard trips (toxicity/markout/volatility/flow) still rotate a market out
+  # via the normal risk path; this only suppresses score-churn swaps.
+  sticky_swap: true
+  # A fresh candidate only displaces a market we already hold if its score
+  # beats the weakest held market's score by at least this fraction (0.25 =
+  # 25% better) AND that held market is underperforming (see below). Higher =
+  # stickier (≈ "only swap on risk or a much better market"); 0 = never
+  # displace a held market on score alone.
+  swap_score_margin: 0.25
+  # A held market is only eligible for score-based displacement if its recent
+  # in-band uptime is below this percentage — i.e. it isn't actually farming
+  # the rewards its rank implies. A market quoting well above this is protected
+  # from churn no matter how the ranking reshuffles. Markets with too little
+  # history (just entered) are treated as performing and protected.
+  underperform_uptime_pct: 60
+  underperform_lookback_minutes: 30
+  # When a market trips its guard (e.g. 45-min volatility cooldown), don't leave
+  # the quoting slot idle until the next refresh — immediately rescan and rotate
+  # into the next-best eligible market. Only flat tripped markets are rotated
+  # out; ones still holding inventory stay so the exit path manages them.
+  # Debounced by ROTATE_MIN_INTERVAL_SECS to avoid book-feed churn.
+  rotate_on_trip: true
+  # Skip markets whose question contains any of these (case-insensitive).
+  # Event-driven / observation-driven books: guards trip constantly and
+  # inventory stacks across correlated markets (Iran dates, Seoul temps, etc.).
+  exclude_keywords:
+    - iran
+    - airspace
+    - israel
+    - gaza
+    - ukraine
+    - ceasefire
+    - temperature
+    - highest temp
+    - lowest temp
+    - "°c"
+    - "°f"
+    - spx
+    - s&p
+    - nasdaq
+    - up or down
+    - gold
+    - xauusd
+    # Commodity & crypto price-tracking books: the mid follows a live external
+    # price feed, so maker quotes get picked off faster than they can be pulled
+    # — same risk profile as the spx/gold entries above. Surfaced by the scan
+    # (WTI crude, natural gas) once fee-enabled markets became eligible.
+    - crude
+    - wti
+    - brent
+    - natural gas
+    - nat gas
+    - bitcoin
+    - btc
+    - ethereum
+    - solana
+    # Valuation-tracking books (e.g. "SpaceX market cap between $2.5T and $3T")
+    # jump on discrete funding/IPO news that picks off resting quotes.
+    - market cap
+    # IPO-timing books resolve on discrete funding/listing announcements — the
+    # same headline pick-off as market-cap books (Anthropic IPO cost −$5.75).
+    - ipo
+    # Box-office bracket books: the mid tracks an external observation (opening-
+    # weekend gross) that informed traders price faster than we can pull quotes.
+    # This was the single LARGEST loss source (Toy Story 5, −$49.61 across three
+    # brackets) yet was never keyword-excluded — see scripts/backtest.py.
+    - box office
+    - toy story
+    # Price-touch / barrier books phrased "... hit (LOW)/(HIGH) $X": a continuous
+    # external price crossing a fixed level is pure adverse selection for a maker.
+    - "hit (low)"
+    - "hit (high)"
+    # Event / announcement-driven books: a single headline moves the mid faster
+    # than quotes can be pulled, so maker fills get picked off and the forced
+    # hedge pays up. These produced ~75% of live trading losses (see session
+    # review). Re-enable only with much larger capital and wider quotes.
+    - trump
+    - elon
+    - musk
+    - announce
+    - blockade
+    - starmer
+
+quoting:
+  # Where to place quotes inside the reward band, as a fraction of
+  # max_incentive_spread. 0.35 = 35% of the band away from the midpoint.
+  # Lower = tighter to mid = higher reward score but more fills.
+  offset_frac_of_max_spread: 0.35
+  # Per-side keep tolerance: a resting quote is kept (preserving its queue
+  # priority) until its desired price drifts at least this many cents or its
+  # size drifts more than 10%. Only the changed side is replaced.
+  requote_move_cents: 0.4
+  # Quote size as a multiple of the market's min_incentive_size.
+  size_mult_of_min: 1.0
+  # Hard cap on capital committed to any single market (USD). Two constraints:
+  #   - the scanner drops any market whose min quote size (shares) exceeds this,
+  #     so it must be >= the min_incentive_size of markets you want (~50 shares),
+  #   - keep max_capital_per_market × top_n_markets <= capital_usd so busy
+  #     markets can't oversubscribe the wallet.
+  # At $100 capital with 50-share markets, 50 is the sweet spot (50 × 2 = 100).
+  max_capital_per_market: 50
+  # How aggressively to skew quotes against accumulated inventory (0..1).
+  skew_strength: 0.6
+  # GTD order lifetime (seconds). Orders self-expire on crash; the requote loop
+  # refreshes them well before expiry. Longer TTL = fewer cancel/repost cycles
+  # (each cycle is a network round trip that can stall on a flaky link and a
+  # brief reward-scoring gap), at the cost of more standing exposure if the bot
+  # crashes (orders rest up to ttl+60s before self-expiring). 180s is a good
+  # balance for a small book; the dead-man switch still fires quickly enough.
+  order_ttl_secs: 180
+  # Close the per-refresh reward gap: when a resting quote is only expiring
+  # (same price/size), post its replacement BEFORE cancelling the old order so
+  # the side is never off the book when Polymarket samples the book for reward
+  # scoring. Costs a sub-second double-size overlap until the cancel lands —
+  # which a reward farmer prefers to a scoring gap. Price/size changes still
+  # cancel-first. Set false to revert to plain cancel-then-repost.
+  refresh_overlap: true
+  # Don't quote unless book spread <= this multiple of the reward band.
+  max_book_spread_mult_of_band: 3.0
+  # Max quote-center drift from signed flow imbalance (cents).
+  flow_drift_max_cents: 1.0
+  # Per-market adaptive offset from markout data.
+  adaptive_markout_gain: 1.0
+  adaptive_tighten_max_cents: 0.5
+  adaptive_widen_max_cents: 2.0
+  # Risk-adjusted depth allocation (compute_size_factors). The per-market size
+  # multiplier discounts a market's reward-per-capital by its toxicity, so the
+  # capital tiers commit MORE size to deep/slow markets and LESS to thin/fast
+  # ones rather than sizing up equally everywhere. Penalty:
+  #   penalty = size_turnover_penalty·(volume24h/liquidity)
+  #           + size_markout_penalty·max(0, -markout_cents)
+  # and factor = 1/(1+penalty), normalized to mean 1.0 across held markets and
+  # clamped to [0.5, 2.0]. Set both to 0 to revert to reward-only allocation.
+  # turnover penalty mirrors the scanner's toxicity_turnover_penalty (0.15);
+  # markout penalty is per cent of adverse post-fill drift (0.5 = a sustained
+  # -2c markout roughly halves a market's allocated depth vs a benign peer).
+  size_turnover_penalty: 0.15
+  size_markout_penalty: 0.5
+
+guards:
+  # Pull quotes from a market when its mid moves this many cents within the
+  # window — a one-way move usually means informed flow (e.g. a daily weather
+  # market resolving in real time).
+  vol_window_secs: 60
+  vol_max_move_cents: 3.0
+  # Stop quoting a market after this many same-side fills inside the window —
+  # someone is repeatedly unloading into our skewing quotes.
+  max_same_side_fills: 3
+  same_side_window_minutes: 15
+  # How long a tripped market stays unquoted.
+  market_cooldown_minutes: 45
+  # Trade velocity breaker: pull the whole market when this many trades print
+  # within the window (news being traded).
+  velocity_window_secs: 10
+  velocity_max_trades: 8
+  # Directional flow: this many consecutive same-direction taker trades on a
+  # token pulls the endangered bid only (asymmetric defense).
+  directional_consecutive: 5
+  side_cooldown_minutes: 10
+  # Quote fading: each of our fills within the window pushes that side's next
+  # bid this much further from the mid (escalating, capped).
+  fade_cents_per_fill: 0.5
+  fade_window_minutes: 5
+  fade_max_cents: 2.0
+  # Latency kill: never quote on a book older than this — pull instead.
+  max_book_staleness_secs: 25
+  # Markouts: post-fill price drift at these horizons measures adverse
+  # selection directly. If a market's average markout at the longest horizon
+  # drops to/below the trip level (cents, negative = we got picked off) over
+  # at least min_samples fills in the window, the market is tripped into the
+  # standard cooldown.
+  markout_horizons_secs: [30, 300]
+  markout_window_minutes: 120
+  markout_min_samples: 5
+  markout_trip_cents: -1.5
+  # Flow imbalance (VPIN-lite): signed taker volume over a rolling window,
+  # in YES-equivalent shares. Above the widen threshold the endangered bid
+  # fades out progressively (up to flow_widen_max_cents); above the pull
+  # threshold it is pulled for side_cooldown_minutes. Ignored below the
+  # minimum volume (thin flow is noise).
+  flow_window_secs: 300
+  flow_min_volume_shares: 200
+  flow_widen_threshold: 0.6
+  flow_pull_threshold: 0.85
+  flow_widen_max_cents: 2.0
+
+risk:
+  # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
+  # hedge threshold all scale by (current equity / capital_usd). Deposit more
+  # and the bot sizes up automatically; draw down and it sizes down. Clamped
+  # so a bad mark or a single losing day can't whipsaw sizing. The dollar
+  # values below are calibrated at capital_usd. Loss limits stay absolute.
+  scale_with_equity: false
+  scale_min: 0.5
+  scale_max: 10.0
+  # Stop adding inventory in a market beyond this (USD at current prices).
+  max_inventory_usd_per_market: 60
+  # Stop quoting everywhere beyond this total inventory (USD).
+  max_total_inventory_usd: 250
+  # Pause quoting for the rest of the UTC day if equity drops this much.
+  daily_loss_limit_usd: 25
+  # Cancel everything and exit the process if equity drops this much.
+  hard_kill_loss_usd: 50
+  # Forced hedging: if unpaired exposure stays above the threshold for this
+  # long (skewed quotes failed to mean-revert it), cross the spread on the
+  # complement book to complete YES+NO pairs — a small known loss instead of
+  # open-ended binary risk.
+  flatten_threshold_usd: 15
+  flatten_after_secs: 90
+  # Cap combined |net exposure| across markets that share a theme keyword
+  # (e.g. three Iran date markets stacking to $40 while each stays under the
+  # per-market flatten threshold). Scales with equity like other USD limits.
+  theme_max_inventory_usd: 25
+  theme_groups:
+    iran: [iran, airspace]
+    weather: [temperature, highest temp, lowest temp, "°c", "°f"]
+    equities: [s&p, spx, nasdaq, "up or down"]
+    gold: [gold, xauusd]
+  # Passive exit: while waiting out flatten_after_secs (and whenever the
+  # complement book is too wide to hedge into), rest a reduce-only SELL on
+  # the excess token joined to its ask — a maker exit that pays nothing.
+  # The forced hedge above stays as the escalation if it doesn't fill.
+  passive_exit: true
+  # Don't cross a complement book wider than this (avoid dumping into a void);
+  # retry until the spread tightens.
+  flatten_max_spread_cents: 4.0
+  # Resolution-aware de-risking: inside this window, shrink the inventory cap
+  # and widen quotes progressively (event risk rises sharply near the end).
+  derisk_hours_before_end: 12
+  derisk_widen_cents: 2.0
+  # Inside this window: stop quoting and force-flatten unpaired inventory.
+  exit_hours_before_end: 2
+
+live:
+  # 0 = plain EOA wallet, 1 = email/Magic proxy, 2 = browser-wallet (Gnosis
+  # Safe), 3 = POLY_1271 deposit wallet (new in CLOB V2). Types 1/2/3 hold
+  # funds in a separate wallet and require POLYMARKET_FUNDER. The V2 backend
+  # rejects the maker address with "please use the deposit wallet flow" unless
+  # this matches how the funder wallet was actually deployed — confirmed type 3
+  # for this account via scripts/sigtype_probe.py.
+  signature_type: 3
+  # On-chain merging of YES+NO pairs back to $1 pUSD (recycles locked capital).
+  #   types 0/1 (EOA, proxy): self-submitted tx; the signing wallet needs a
+  #     little POL for gas (~fractions of a cent per merge).
+  #   type 3 (deposit wallet): GASLESS via the Polymarket relayer — requires
+  #     builder API-key creds in .env (POLYMARKET_BUILDER_API_KEY/_SECRET/
+  #     _PASSPHRASE, from the Builders page on polymarket.com). Without them,
+  #     type-3 merging auto-disables and pairs redeem at resolution.
+  #   type 2 (Gnosis Safe): auto-disables; pairs redeem at resolution.
+  merge_enabled: true
+  # Only merge once at least this many pairs have accumulated in a market.
+  # Lower recycles capital sooner (each merge is a gasless relayer round trip);
+  # 10 suits a small ~$100 book.
+  merge_min_pairs: 10
+  # Any public Polygon RPC endpoint works (must support eth_call/eth_sendRawTransaction).
+  rpc_url: https://polygon-bor-rpc.publicnode.com
+  # Polymarket relayer used for gasless deposit-wallet (type 3) merges.
+  relayer_url: https://relayer-v2.polymarket.com
+
+# Self-managing controller: rewrites the knobs below in place from live equity
+# and the rolling markout (post-fill price drift = adverse selection). Two
+# layers:
+#   1. Capital tiers — structural caps that match wallet size. The active tier
+#      is the highest whose min_equity_usd <= current equity.
+#   2. Toxicity response — interpolates quoting/hedge knobs between the `calm`
+#      and `toxic` anchors based on how badly recent fills got picked off.
+# Every value the controller writes is bounded by the anchors here, so it can
+# only move within operator-defined limits. Changes apply on the next loop tick
+# (no restart needed). Set enabled: false to pin config to the static values.
+controller:
+  enabled: true
+  # How often to re-evaluate (first evaluation runs at startup). Shortened from
+  # 10: with a 10-min cadence the controller stayed on the calm anchors through
+  # an entire pick-off episode (seen live quoting tight at offset 0.30 into a
+  # -12c markout). 5 min lets it widen/extend hedging while flow is still toxic;
+  # `smoothing` still keeps each step gradual.
+  interval_minutes: 5
+  # Fraction of the gap to a knob's target applied each evaluation (0..1).
+  # Lower = smoother/slower adaptation; 1.0 = jump straight to target.
+  smoothing: 0.5
+  # Rolling long-horizon markout (cents) anchors. At/above calm we use the
+  # `calm` knobs; at/below toxic we use the `toxic` knobs; linear in between.
+  markout_calm_cents: 0.0
+  markout_toxic_cents: -3.0
+  # Ignore the markout signal until at least this many fills are in the window.
+  # Lowered from 4: a toxic burst is often only a handful of fills, and waiting
+  # for 4 left the controller reading "toxicity 0%" while it was already being
+  # picked off at -12c (n=2). 2 reacts on the early evidence; `smoothing` and
+  # the per-market markout guard still damp any overreaction.
+  min_markout_samples: 2
+  # Calm flow: quote tight, hedge fast, capture reward share.
+  calm:
+    offset_frac_of_max_spread: 0.30
+    flatten_after_secs: 120
+    flatten_max_spread_cents: 4.0
+    markout_trip_cents: -1.5
+    markout_min_samples: 5
+  # Toxic flow: quote wide, wait out passive exits, drop toxic markets fast.
+  toxic:
+    offset_frac_of_max_spread: 0.60
+    flatten_after_secs: 360
+    flatten_max_spread_cents: 2.0
+    markout_trip_cents: -0.8
+    markout_min_samples: 2
+  # Capital tiers (ascending). Bigger wallet -> larger positions FIRST, more
+  # markets only later (depth-first, per REPORT_reward_selection.md §4-5: reward
+  # is ~linear in our size while every extra market feeds the adverse-selection
+  # tail, so we scale size_mult_of_min + max_capital_per_market ahead of
+  # top_n_markets, and never quote fewer than 2 markets for diversification).
+  # A drawdown drops to a lower tier automatically and tightens everything.
+  #   size_mult_of_min     -> quote size as a multiple of each market's min size
+  #   max_capital_per_market -> hard per-market cap (shares ≈ USD); size clamps to it
+  capital_tiers:
+    - min_equity_usd: 0
+      top_n_markets: 2
+      size_mult_of_min: 1.0
+      max_capital_per_market: 50
+      max_inventory_usd_per_market: 30
+      daily_loss_limit_usd: 8
+      hard_kill_loss_usd: 20
+    - min_equity_usd: 250
+      top_n_markets: 2
+      size_mult_of_min: 2.0
+      max_capital_per_market: 100
+      max_inventory_usd_per_market: 60
+      daily_loss_limit_usd: 20
+      hard_kill_loss_usd: 50
+    - min_equity_usd: 750
+      top_n_markets: 3
+      size_mult_of_min: 3.5
+      max_capital_per_market: 175
+      max_inventory_usd_per_market: 120
+      daily_loss_limit_usd: 50
+      hard_kill_loss_usd: 120
+    - min_equity_usd: 2000
+      top_n_markets: 3
+      size_mult_of_min: 6.0
+      max_capital_per_market: 300
+      max_inventory_usd_per_market: 250
+      daily_loss_limit_usd: 120
+      hard_kill_loss_usd: 300

@@ -4,6 +4,9 @@ import asyncio
 import logging
 import time
 from logging.handlers import TimedRotatingFileHandler
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from pmbot import main
 from pmbot.books import BookTracker
@@ -318,6 +321,101 @@ def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_p
     assert [(q.token_id, q.size) for q in flat] == [
         (market.yes_token, 30.0), (market.no_token, 30.0)]
     bot.metrics.close()
+
+
+def test_unselected_held_market_keeps_only_complement_bid(tmp_path):
+    """A held market outside the scanner must never resume two-sided quoting."""
+    bot = _bot(tmp_path)
+    market = _market()
+    desired = [Quote(market.yes_token, 0.35, 20.0),
+               Quote(market.no_token, 0.64, 20.0)]
+
+    assert [(q.token_id, q.size) for q in bot._held_market_recovery_quotes(
+        market, desired, unpaired=11.0)] == [(market.no_token, 11.0)]
+    assert bot._held_market_recovery_quotes(market, desired, unpaired=0.0) == []
+    bot.metrics.close()
+
+
+def test_forced_hedge_requires_escalation_and_pair_cost_cap(tmp_path):
+    """An unselected small position waits; a costly pair is never crossed."""
+    bot = _bot(tmp_path)
+    market = _market()
+    now = 1_000.0
+
+    assert not bot._forced_hedge_allowed(
+        market, urgent=False, exposure_usd=1.0, threshold_usd=15.0,
+        risk_since=now, now=now + 30, wait_secs=90,
+        basis=0.398, ask=0.648,
+    )
+    assert bot._forced_hedge_allowed(
+        market, urgent=False, exposure_usd=1.0, threshold_usd=15.0,
+        risk_since=now, now=now + 90, wait_secs=90,
+        basis=0.398, ask=0.60,
+    )
+    assert not bot._forced_hedge_allowed(
+        market, urgent=True, exposure_usd=20.0, threshold_usd=15.0,
+        risk_since=now, now=now, wait_secs=90,
+        basis=0.398, ask=0.648,
+    )
+    assert not bot._forced_hedge_allowed(
+        market, urgent=True, exposure_usd=20.0, threshold_usd=15.0,
+        risk_since=now, now=now, wait_secs=90,
+        basis=None, ask=0.60,
+    )
+    assert bot._forced_hedge_max_price(market, 0.398) == pytest.approx(0.60)
+    bot.metrics.close()
+
+
+def test_held_market_tokens_are_subscribed_for_inventory_management(tmp_path):
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.paper = False
+        market = _market()
+        bot.broker = MagicMock()
+        bot.broker.held_markets.return_value = [market]
+        bot.broker.position_tokens.return_value = [market.yes_token, market.no_token]
+        bot.tracker = BookTracker([])
+        calls = []
+
+        async def resubscribe(token_ids, carry=None):
+            calls.append(token_ids)
+
+        bot.tracker.resubscribe = resubscribe
+        await bot._ensure_held_market_books()
+
+        assert calls == [[market.yes_token, market.no_token]]
+        assert bot._token_market == {market.yes_token: market, market.no_token: market}
+        bot.metrics.close()
+    asyncio.run(scenario())
+
+
+def test_live_startup_manages_inventory_when_scan_finds_no_market(tmp_path, monkeypatch):
+    """A scan drought must not bypass inventory checks for an existing position."""
+    class StopRun(Exception):
+        pass
+
+    async def stop_after_first_retry(_seconds):
+        raise StopRun
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.paper = False
+        bot._bootstrap_live_broker = AsyncMock()
+        bot._rescan = AsyncMock()
+        bot._manage_inventory = AsyncMock()
+        bot._ensure_held_market_books = AsyncMock()
+        bot.broker = MagicMock()
+        monkeypatch.setattr(main.asyncio, "sleep", stop_after_first_retry)
+
+        with pytest.raises(StopRun):
+            await bot.run()
+
+        bot._bootstrap_live_broker.assert_awaited_once()
+        assert bot.broker.refresh_state.called
+        bot._ensure_held_market_books.assert_awaited_once()
+        bot._manage_inventory.assert_awaited_once()
+        bot.metrics.close()
+    asyncio.run(scenario())
 
 
 def test_cooldown_recovery_only_keeps_complement_for_meaningful_inventory(tmp_path):

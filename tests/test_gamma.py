@@ -84,6 +84,113 @@ def test_scan_full_returns_all_ranked_not_just_top_n(monkeypatch):
     assert [m.condition_id for m in gamma.scan(cfg, full=True)] == ["a", "b", "c"]
 
 
+def test_fetch_market_loads_held_market_without_rewards(monkeypatch):
+    """A held position must be manageable even after its reward pool ends."""
+    raw = {
+        "question": "held market", "conditionId": "held-cid",
+        "clobTokenIds": '["yes-held", "no-held"]',
+        "rewardsMinSize": 0, "rewardsMaxSpread": 0,
+        "liquidityNum": 12, "volume24hr": 3,
+        "orderPriceMinTickSize": 0.01, "negRisk": False,
+    }
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [raw]
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            calls.append(kwargs["params"])
+            return FakeResp()
+
+    monkeypatch.setattr(gamma.httpx, "Client", FakeClient)
+
+    market = gamma.fetch_market("held-cid")
+
+    assert market is not None
+    assert market.condition_id == "held-cid"
+    assert market.yes_token == "yes-held"
+    assert market.no_token == "no-held"
+    assert calls == [{"condition_ids": "held-cid"}]
+
+
+def test_fetch_reward_markets_requests_reward_bearing_books(monkeypatch):
+    """The scanner must not depend on Gamma's unstable default pagination."""
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            calls.append(kwargs["params"])
+            return FakeResp()
+
+    monkeypatch.setattr(gamma.httpx, "Client", FakeClient)
+
+    assert gamma.fetch_reward_markets() == []
+    assert calls[0]["rewards_min_size"] == "1"
+
+
+def test_fetch_reward_markets_retries_transient_page_failure(monkeypatch):
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            calls.append(kwargs["params"])
+            if len(calls) == 1:
+                raise RuntimeError("temporary Gamma failure")
+            return FakeResp()
+
+    monkeypatch.setattr(gamma.httpx, "Client", FakeClient)
+    monkeypatch.setattr(gamma.time, "sleep", lambda _: None)
+
+    assert gamma.fetch_reward_markets() == []
+    assert len(calls) == 2  # first page retries, then the successful empty page
+
+
 def test_band_room_bonus_prefers_wider_band(monkeypatch):
     narrow = _mk("narrow", pool=100, liquidity=5000, volume_24h=5000, band=1.0)
     wide = _mk("wide", pool=100, liquidity=5000, volume_24h=5000, band=4.0)
