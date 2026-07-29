@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+import pytest
+
 from pmbot.books import Book
 from pmbot.gamma import Market
 from pmbot.strategy import (
@@ -112,6 +114,39 @@ def test_compute_quotes_returns_two_sides():
     assert len(quotes) == 2
     tokens = {q.token_id for q in quotes}
     assert tokens == {"yes_tok", "no_tok"}
+
+
+def test_compute_quotes_exposes_reproducible_pricing_snapshot():
+    """Recovery-quote logs need the inputs required to reproduce its price."""
+    pricing = {}
+    quotes = compute_quotes(
+        _market(), _book(bid=0.48, ask=0.52, bid_sz=80, ask_sz=120),
+        net_yes_exposure_usd=-20.0, cfg=CFG, max_inventory_usd=60.0,
+        fade_yes=0.01, fade_no=0.02, flow_imbalance=-0.5,
+        markout_avg=-0.003, size_factor=1.25, pricing=pricing,
+    )
+
+    assert quotes
+    assert pricing == pytest.approx({
+        "yes_bid": 0.48,
+        "yes_bid_size": 80.0,
+        "yes_ask": 0.52,
+        "yes_ask_size": 120.0,
+        "yes_microprice": 0.496,
+        "flow_imbalance": -0.5,
+        "flow_drift": -0.005,
+        "fair": 0.491,
+        "base_offset": 0.0105,
+        "adaptive_offset": 0.003,
+        "offset": 0.0135,
+        "net_yes_exposure_usd": -20.0,
+        "max_inventory_usd": 60.0,
+        "skew": -0.0027,
+        "fade_yes": 0.01,
+        "fade_no": 0.02,
+        "yes_bid_quote": 0.47,
+        "no_bid_quote": 0.47,
+    })
 
 
 def test_compute_quotes_skew_drops_side_at_cap():

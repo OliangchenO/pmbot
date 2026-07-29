@@ -30,7 +30,7 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from . import gamma, strategy
-from .books import BookTracker
+from .books import Book, BookTracker
 from .brokers import LiveBroker, PaperBroker
 from .controller import AdaptiveController
 from .metrics import MetricsStore
@@ -790,6 +790,30 @@ class Bot:
             self.guards.record_trade(market, token_id, side, size, time.time())
 
     @staticmethod
+    def _log_inventory_recovery_quote(
+            market: gamma.Market, *, unpaired: float, quote: strategy.Quote,
+            yes_book: Book, no_book: Book, pricing: dict[str, float]) -> None:
+        """Log the quote inputs needed to reconstruct a complement bid."""
+        held = "YES" if unpaired > 0 else "NO"
+        quote_token = "YES" if quote.token_id == market.yes_token else "NO"
+        log.info(
+            "INVENTORY_RECOVERY_QUOTE market='%s' held=%s %.0f quote=BUY %s %.0f @ %.3f "
+            "yes_book=%.3fx%.0f/%.3fx%.0f no_book=%.3fx%.0f/%.3fx%.0f "
+            "micro=%.3f flow=%.3f drift=%+.4f fair=%.3f base_offset=%.4f "
+            "adaptive_offset=%+.4f offset=%.4f skew=%+.4f fade_yes=%.4f fade_no=%.4f "
+            "normal_quotes=yes@%.3f,no@%.3f",
+            market.question[:80], held, abs(unpaired), quote_token, quote.size, quote.price,
+            yes_book.best_bid, yes_book.bids.get(yes_book.best_bid, 0.0),
+            yes_book.best_ask, yes_book.asks.get(yes_book.best_ask, 0.0),
+            no_book.best_bid, no_book.bids.get(no_book.best_bid, 0.0),
+            no_book.best_ask, no_book.asks.get(no_book.best_ask, 0.0),
+            pricing["yes_microprice"], pricing["flow_imbalance"], pricing["flow_drift"],
+            pricing["fair"], pricing["base_offset"], pricing["adaptive_offset"],
+            pricing["offset"], pricing["skew"], pricing["fade_yes"], pricing["fade_no"],
+            pricing["yes_bid_quote"], pricing["no_bid_quote"],
+        )
+
+    @staticmethod
     def _inventory_recovery_quotes(m: gamma.Market,
                                    desired: list[strategy.Quote],
                                    unpaired: float) -> list[strategy.Quote]:
@@ -924,6 +948,7 @@ class Bot:
             flow_imb = self.guards.flow_imbalance(m, now)
             markout_avg = self.markouts.market_avg(m.condition_id)
             size_factor = self._size_factors.get(m.condition_id, 1.0)
+            pricing: dict[str, float] = {}
             desired = strategy.compute_quotes(
                 m, yes_book, exposure, self.cfg, eff_max_inv,
                 fade_yes=fade_yes + widen + flow_yes,
@@ -932,6 +957,7 @@ class Bot:
                 flow_imbalance=flow_imb,
                 markout_avg=markout_avg,
                 size_factor=size_factor,
+                pricing=pricing,
             )
             unpaired = self.broker.unpaired_shares(m)
             if m.condition_id not in selected_cids:
@@ -954,6 +980,13 @@ class Bot:
             # book and leaves a gap until the next reconcile notices it's gone.
             changed = {q.key() for q in final} != {q.key() for q in current}
             if changed or (final and self.broker.due_for_refresh(m)):
+                if abs(unpaired) >= MIN_TAKER_SHARES:
+                    complement = m.no_token if unpaired > 0 else m.yes_token
+                    recovery_quote = next((q for q in final if q.token_id == complement), None)
+                    if recovery_quote is not None:
+                        self._log_inventory_recovery_quote(
+                            m, unpaired=unpaired, quote=recovery_quote,
+                            yes_book=yes_book, no_book=no_book, pricing=pricing)
                 updates.append((m, final))
 
         if updates:

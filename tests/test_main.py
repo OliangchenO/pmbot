@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pmbot import main
-from pmbot.books import BookTracker
+from pmbot.books import Book, BookTracker
 from pmbot.brokers import PaperBroker, Position
 from pmbot.gamma import Market
 from pmbot.main import Bot
@@ -324,6 +324,39 @@ def test_inventory_quote_only_buys_complement_and_caps_size(tmp_path):
 
     assert [(q.token_id, q.size) for q in quotes] == [(market.yes_token, 20.0)]
     bot.metrics.close()
+
+
+def test_inventory_recovery_quote_log_includes_pricing_and_book_snapshot(caplog):
+    """A recovery bid must leave enough evidence to reproduce its price."""
+    market = _market()
+    yes_book = Book(market.yes_token)
+    yes_book.bids = {0.48: 80.0}
+    yes_book.asks = {0.52: 120.0}
+    no_book = Book(market.no_token)
+    no_book.bids = {0.47: 90.0}
+    no_book.asks = {0.53: 70.0}
+    pricing = {
+        "yes_microprice": 0.496, "fair": 0.491, "base_offset": 0.0105,
+        "adaptive_offset": 0.003, "offset": 0.0135,
+        "skew": -0.0027, "fade_yes": 0.01, "fade_no": 0.02,
+        "flow_imbalance": -0.5, "flow_drift": -0.005,
+        "yes_bid_quote": 0.47, "no_bid_quote": 0.47,
+    }
+
+    with caplog.at_level(logging.INFO, logger="pmbot"):
+        Bot._log_inventory_recovery_quote(
+            market, unpaired=-20.0, quote=Quote(market.yes_token, 0.47, 20.0),
+            yes_book=yes_book, no_book=no_book, pricing=pricing,
+        )
+
+    message = caplog.messages[-1]
+    assert "INVENTORY_RECOVERY_QUOTE" in message
+    assert "held=NO 20" in message
+    assert "quote=BUY YES 20 @ 0.470" in message
+    assert "yes_book=0.480x80/0.520x120" in message
+    assert "no_book=0.470x90/0.530x70" in message
+    assert "fair=0.491" in message
+    assert "offset=0.0135 skew=-0.0027" in message
 
 
 def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_path):

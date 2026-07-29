@@ -97,6 +97,7 @@ def compute_quotes(
     flow_imbalance: float = 0.0,
     markout_avg: float | None = None,
     size_factor: float = 1.0,
+    pricing: dict[str, float] | None = None,
 ) -> list[Quote]:
     """Desired quotes for one market given current book + inventory."""
     q = cfg["quoting"]
@@ -113,12 +114,15 @@ def compute_quotes(
     if not (lo <= mid <= hi):
         return []
 
-    fair = microprice(yes_book) or mid
+    yes_microprice = microprice(yes_book)
+    fair = yes_microprice or mid
     drift_max = float(q.get("flow_drift_max_cents", 1.0)) / 100.0
-    fair += flow_imbalance * drift_max
+    flow_drift = flow_imbalance * drift_max
+    fair += flow_drift
 
-    offset = max(band * q["offset_frac_of_max_spread"], market.tick)
-    offset += adaptive_offset(markout_avg, cfg)
+    base_offset = max(band * q["offset_frac_of_max_spread"], market.tick)
+    adaptive = adaptive_offset(markout_avg, cfg)
+    offset = base_offset + adaptive
     # No fee widening: on Polymarket makers are never charged fees, so resting
     # quotes cost nothing per fill. Widening here would only push us out of the
     # reward band and forfeit rewards. Fees apply solely on taker merges/exits.
@@ -146,6 +150,28 @@ def compute_quotes(
     no_mid = 1.0 - mid
     no_fair = 1.0 - fair
     no_bid = _round_tick(no_fair - offset + skew - fade_no, market.tick)
+
+    if pricing is not None:
+        pricing.update({
+            "yes_bid": yes_book.best_bid,
+            "yes_bid_size": yes_book.bids.get(yes_book.best_bid, 0.0),
+            "yes_ask": yes_book.best_ask,
+            "yes_ask_size": yes_book.asks.get(yes_book.best_ask, 0.0),
+            "yes_microprice": yes_microprice if yes_microprice is not None else mid,
+            "flow_imbalance": flow_imbalance,
+            "flow_drift": flow_drift,
+            "fair": fair,
+            "base_offset": base_offset,
+            "adaptive_offset": adaptive,
+            "offset": offset,
+            "net_yes_exposure_usd": net_yes_exposure_usd,
+            "max_inventory_usd": max_inventory_usd,
+            "skew": skew,
+            "fade_yes": fade_yes,
+            "fade_no": fade_no,
+            "yes_bid_quote": yes_bid,
+            "no_bid_quote": no_bid,
+        })
 
     quotes = []
     if 0 < yes_bid and skew_frac < 1.0 and (mid - yes_bid) <= band + 1e-9:
