@@ -159,6 +159,21 @@ def test_relayer_non_confirmation_fails_and_counts(patch_relayer):
     assert m._failures == 1
 
 
+def test_relayer_merge_audit_closes_submitted_and_confirmed_states(patch_relayer):
+    """A relayer success must leave two durable audit facts, not one wait log."""
+    events = []
+    m = Merger("http://rpc", 3, PK, FUNDER, relayer_url=RELAYER,
+               builder_creds=CREDS, audit_event=events.append)
+    m._eth_call = lambda to, data: "0x" + "0" * 63 + "1"
+
+    assert m.merge(CID, neg_risk=False, pairs=50) is True
+
+    assert [e["event"] for e in events] == ["merge_submitted", "merge_confirmed"]
+    assert events[0]["transaction_id"] == "tx-1"
+    assert events[1]["redeemed_usd"] is None
+    assert "no receipt" in events[1]["redemption_reason"]
+
+
 def test_bad_condition_id_rejected(patch_relayer):
     m = _merger(builder_creds=CREDS)
     assert m.merge("0xdeadbeef", neg_risk=False, pairs=10) is False

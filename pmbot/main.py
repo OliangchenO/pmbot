@@ -496,11 +496,12 @@ class Bot:
         return lock
 
     async def _set_quotes_locked(self, market: gamma.Market,
-                                 quotes: list[strategy.Quote]) -> None:
+                                 quotes: list[strategy.Quote],
+                                 audit_context: dict[str, dict] | None = None) -> None:
         """Serialize quote ops per market so an event-driven pull cannot race
         a concurrent replace from the main loop."""
         async with self._market_lock(market.condition_id):
-            await self._broker_call(self.broker.set_quotes, market, quotes)
+            await self._broker_call(self.broker.set_quotes, market, quotes, audit_context)
 
     def _spawn_pull(self, coro) -> None:
         try:
@@ -813,33 +814,36 @@ class Bot:
             pricing["yes_bid_quote"], pricing["no_bid_quote"],
         )
 
-    @staticmethod
-    def _inventory_recovery_quotes(m: gamma.Market,
+    def _inventory_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
                                    unpaired: float) -> list[strategy.Quote]:
         """Keep only a capped complement bid while a market is unpaired."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return desired
+        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+        basis = basis_fn(m) if basis_fn else None
+        if basis is None:
+            return []
+        max_price = self._forced_hedge_max_price(m, basis)
         complement = m.no_token if unpaired > 0 else m.yes_token
         return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
-                for q in desired if q.token_id == complement]
+                for q in desired
+                if q.token_id == complement and q.price <= max_price + 1e-9]
 
-    @staticmethod
-    def _cooldown_recovery_quotes(m: gamma.Market,
-                                  desired: list[strategy.Quote],
-                                  unpaired: float) -> list[strategy.Quote]:
+    def _cooldown_recovery_quotes(self, m: gamma.Market,
+                                   desired: list[strategy.Quote],
+                                   unpaired: float) -> list[strategy.Quote]:
         """Keep only risk-reducing complementary bids during market cooldown."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        return Bot._inventory_recovery_quotes(m, desired, unpaired)
+        return self._inventory_recovery_quotes(m, desired, unpaired)
 
-    @staticmethod
-    def _held_market_recovery_quotes(m: gamma.Market, desired: list[strategy.Quote],
+    def _held_market_recovery_quotes(self, m: gamma.Market, desired: list[strategy.Quote],
                                      unpaired: float) -> list[strategy.Quote]:
         """Held-only markets may only quote the inventory-reducing complement."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        return Bot._inventory_recovery_quotes(m, desired, unpaired)
+        return self._inventory_recovery_quotes(m, desired, unpaired)
 
     def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
                               exposure_usd: float, threshold_usd: float,
@@ -891,7 +895,7 @@ class Bot:
         # Decide all markets first, then dispatch order ops concurrently so
         # markets late in the iteration aren't quoted on stale books while
         # earlier ones complete their REST round trips.
-        updates: list[tuple[gamma.Market, list[strategy.Quote]]] = []
+        updates: list[tuple[gamma.Market, list[strategy.Quote], dict[str, dict] | None]] = []
 
         selected_cids = {m.condition_id for m in self.markets}
         for m in all_markets:
@@ -899,7 +903,7 @@ class Bot:
             if h is not None and h <= exit_h:
                 if self.broker.open_quotes(m):
                     log.warning("'%s' resolves in %.1fh — exiting market", m.question[:45], h)
-                    updates.append((m, []))
+                    updates.append((m, [], None))
                 continue
             yes_book = self.tracker.books[m.yes_token]
             no_book = self.tracker.books[m.no_token]
@@ -913,7 +917,7 @@ class Bot:
                     log.warning("feed/book stale (feed %.0fs, book %.0fs) — "
                                 "pulling quotes from '%s'",
                                 feed_age, book_age, m.question[:45])
-                    updates.append((m, []))
+                    updates.append((m, [], None))
                 continue
             band = m.max_spread_cents / 100.0
             max_spread_mult = float(
@@ -924,7 +928,7 @@ class Bot:
                 if self.broker.open_quotes(m):
                     log.warning("book not quotable on both sides — pulling '%s'",
                                 m.question[:45])
-                    updates.append((m, []))
+                    updates.append((m, [], None))
                 continue
             cooled_down = not self.guards.allow(m.condition_id, now)
             if not self.risk.theme_quoting_ok(m, all_markets, net_exp, self._scale):
@@ -932,7 +936,7 @@ class Bot:
                 if self.broker.open_quotes(m):
                     log.warning("theme inventory cap — not quoting '%s'",
                                 m.question[:45])
-                    updates.append((m, []))
+                    updates.append((m, [], None))
                 continue
             derisk_frac = 1.0
             if h is not None and h <= derisk_h:
@@ -960,12 +964,17 @@ class Bot:
                 pricing=pricing,
             )
             unpaired = self.broker.unpaired_shares(m)
+            recovery_path = "normal"
             if m.condition_id not in selected_cids:
                 desired = self._held_market_recovery_quotes(m, desired, unpaired)
+                recovery_path = "inventory_recovery"
             elif cooled_down:
                 desired = self._cooldown_recovery_quotes(m, desired, unpaired)
+                recovery_path = "cooldown_recovery"
             else:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired)
+                if abs(unpaired) >= MIN_TAKER_SHARES:
+                    recovery_path = "inventory_recovery"
                 desired = [q for q in desired if self.guards.allow_side(q.token_id, now)]
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
@@ -987,11 +996,23 @@ class Bot:
                         self._log_inventory_recovery_quote(
                             m, unpaired=unpaired, quote=recovery_quote,
                             yes_book=yes_book, no_book=no_book, pricing=pricing)
-                updates.append((m, final))
+                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                basis = basis_fn(m) if abs(unpaired) >= MIN_TAKER_SHARES and basis_fn else None
+                cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
+                audit_context = {}
+                for q in final:
+                    fee = m.fee_bps / 10_000.0 * (q.price * (1.0 - q.price)) ** m.fee_exponent
+                    audit_context[q.token_id] = {
+                        "path": recovery_path,
+                        "unpaired_cost": basis,
+                        "pair_cap": cap,
+                        "expected_pair_pnl": 1.0 - basis - q.price - fee if basis is not None else None,
+                    }
+                updates.append((m, final, audit_context))
 
         if updates:
             await asyncio.gather(
-                *(self._set_quotes_locked(m, q) for m, q in updates))
+                *(self._set_quotes_locked(m, q, audit) for m, q, audit in updates))
 
     async def _manage_inventory(self, now: float) -> None:
         quoted = {m.condition_id for m in self.markets}
@@ -1065,8 +1086,14 @@ class Bot:
         if self.paper:
             filled = self.broker.taker_buy(m, token, abs(unpaired), price)
         else:
+            fee = m.fee_bps / 10_000.0 * (price * (1.0 - price)) ** m.fee_exponent
+            audit_context = {
+                "path": "forced_hedge", "unpaired_cost": basis,
+                "pair_cap": price,
+                "expected_pair_pnl": 1.0 - basis - price - fee,
+            }
             filled = await asyncio.to_thread(
-                self.broker.taker_buy, m, token, abs(unpaired), price)
+                self.broker.taker_buy, m, token, abs(unpaired), price, audit_context)
         if filled > 0:
             self._over_since.pop(cid, None)
             log.warning("FORCED HEDGE '%s': bought %.0f %s @ %.3f to pair off "

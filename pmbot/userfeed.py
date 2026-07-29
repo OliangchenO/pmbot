@@ -113,7 +113,11 @@ class UserFeed:
                 # same direction, each on their own token.
                 side = taker_side
             if token and size > 0:
-                self.broker.record_user_fill(token, side, price, size, taker=False)
+                self.broker.record_user_fill(
+                    token, side, price, size, taker=False,
+                    order_id=str(mo.get("order_id") or mo.get("id") or "") or None,
+                    fill_id=str(ev.get("id") or ev.get("trade_id") or "") or None,
+                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None)
         if not we_are_maker:
             # None of the maker orders are ours, so this event is about our
             # own taker order (e.g. a forced hedge crossing the spread).
@@ -121,4 +125,8 @@ class UserFeed:
             price = float(ev.get("price") or 0)
             size = float(ev.get("size") or 0)
             if token and size > 0:
-                self.broker.record_user_fill(token, taker_side, price, size, taker=True)
+                self.broker.record_user_fill(
+                    token, taker_side, price, size, taker=True,
+                    order_id=str(ev.get("order_id") or ev.get("orderID") or "") or None,
+                    fill_id=str(ev.get("id") or ev.get("trade_id") or "") or None,
+                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None)

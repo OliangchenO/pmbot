@@ -76,6 +76,16 @@ def _bot(tmp_path) -> Bot:
     return Bot(cfg)
 
 
+class _RecoveryBasisBroker:
+    """Minimal broker boundary needed to exercise recovery quote economics."""
+
+    def __init__(self, basis: float | None):
+        self.basis = basis
+
+    def unpaired_cost_basis(self, _market: Market) -> float | None:
+        return self.basis
+
+
 def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     tracker = BookTracker([market.yes_token, market.no_token])
     broker = PaperBroker(500.0, tracker, data_dir=str(tmp_path))
@@ -316,6 +326,7 @@ def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch
 def test_inventory_quote_only_buys_complement_and_caps_size(tmp_path):
     """未配对 NO 时只能买入不超过缺口的 YES。"""
     bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.45)
     market = _market()
     desired = [Quote(market.yes_token, 0.47, 30.0),
                Quote(market.no_token, 0.50, 30.0)]
@@ -362,6 +373,7 @@ def test_inventory_recovery_quote_log_includes_pricing_and_book_snapshot(caplog)
 def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_path):
     """未配对 YES 只补 NO；低于锁定阈值时不改变正常双边报价。"""
     bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.45)
     market = _market()
     desired = [Quote(market.yes_token, 0.47, 30.0),
                Quote(market.no_token, 0.50, 30.0)]
@@ -378,6 +390,7 @@ def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_p
 def test_unselected_held_market_keeps_only_complement_bid(tmp_path):
     """A held market outside the scanner must never resume two-sided quoting."""
     bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.30)
     market = _market()
     desired = [Quote(market.yes_token, 0.35, 20.0),
                Quote(market.no_token, 0.64, 20.0)]
@@ -473,6 +486,7 @@ def test_live_startup_manages_inventory_when_scan_finds_no_market(tmp_path, monk
 def test_cooldown_recovery_only_keeps_complement_for_meaningful_inventory(tmp_path):
     """冷却期只能保留降低裸仓的互补买单，平仓市场仍完全撤单。"""
     bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.45)
     market = _market()
     desired = [Quote(market.yes_token, 0.47, 30.0),
                Quote(market.no_token, 0.50, 30.0)]
@@ -484,6 +498,67 @@ def test_cooldown_recovery_only_keeps_complement_for_meaningful_inventory(tmp_pa
     assert [(q.token_id, q.size) for q in excess_yes] == [(market.no_token, 12.0)]
     assert [(q.token_id, q.size) for q in excess_no] == [(market.yes_token, 12.0)]
     assert flat == []
+    bot.metrics.close()
+
+
+def test_inventory_recovery_rejects_quote_above_pair_cost_cap(tmp_path):
+    """Removing the recovery cost cap would allow a known-loss pair to rest."""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.669)
+    market = _market()
+
+    allowed = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.329, 50.0)], unpaired=-50.0)
+    rejected = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.340, 50.0)], unpaired=-50.0)
+
+    assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
+    assert rejected == []
+    bot.metrics.close()
+
+
+def test_cooldown_recovery_rejects_quote_above_pair_cost_cap(tmp_path):
+    """Cooldown must not bypass the economic ceiling on a complement bid."""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.669)
+    market = _market()
+
+    quotes = bot._cooldown_recovery_quotes(
+        market, [Quote(market.yes_token, 0.372, 50.0)], unpaired=-50.0)
+
+    assert quotes == []
+    bot.metrics.close()
+
+
+def test_inventory_recovery_requires_known_cost_basis(tmp_path):
+    """Unknown inventory basis must fail closed instead of guessing a safe bid."""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(None)
+    market = _market()
+
+    quotes = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.329, 50.0)], unpaired=-50.0)
+
+    assert quotes == []
+    bot.metrics.close()
+
+
+def test_paper_inventory_recovery_uses_same_pair_cost_cap(tmp_path):
+    """Paper runs must exercise the live recovery ceiling with real inventory."""
+    bot = _bot(tmp_path)
+    market = _market()
+    broker = _setup(bot, tmp_path, market)
+    broker._fill(market, Quote(market.no_token, 0.669, 50.0), 50.0)
+
+    allowed = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.329, 50.0)],
+        unpaired=broker.unpaired_shares(market))
+    rejected = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.340, 50.0)],
+        unpaired=broker.unpaired_shares(market))
+
+    assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
+    assert rejected == []
     bot.metrics.close()
 
 

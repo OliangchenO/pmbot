@@ -1,5 +1,6 @@
 """Tests for broker fill models and live order diff."""
 
+import json
 import time
 import threading
 from collections import deque
@@ -164,7 +165,7 @@ def test_live_quote_post_logs_order_lifecycle_event(caplog):
     LiveBroker.set_quotes(stub, _market(), [Quote("yes1", 0.47, 10)])
 
     assert "ORDER event=ORDER_PLACED" in caplog.text
-    assert "order_id=" not in caplog.text
+    assert "order_id=newid" in caplog.text
     assert "cid=" not in caplog.text
     assert "token=" not in caplog.text
     assert "side=BUY" in caplog.text
@@ -188,10 +189,36 @@ def test_live_quote_cancel_logs_order_lifecycle_event(caplog):
     assert LiveBroker._batch_cancel(stub, ["oldid"]) is True
 
     assert "ORDER event=ORDER_CANCELLED" in caplog.text
-    assert "order_id=" not in caplog.text
+    assert "order_id=oldid" in caplog.text
     assert "cid=" not in caplog.text
     assert "token=" not in caplog.text
     assert "side=BUY" in caplog.text
+
+
+def test_order_cancellation_audit_keeps_order_id_and_pair_economics(tmp_path):
+    """Cancellation evidence must retain the economics captured at submission."""
+    from pmbot.audit import AuditLogger
+    from pmbot.brokers import RestingOrder
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    market = _market()
+    stub._markets = {market.condition_id: market}
+    stub.audit = AuditLogger(str(tmp_path / "audit.jsonl"))
+    stub._open_orders = {market.condition_id: [RestingOrder(
+        "order-9", Quote(market.yes_token, 0.329, 50), time.time(), 0,
+        {"path": "inventory_recovery", "unpaired_cost": 0.669,
+         "pair_cap": 0.329, "expected_pair_pnl": 0.002})]}
+
+    assert LiveBroker._batch_cancel(stub, ["order-9"])
+
+    row = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
+    assert row["event"] == "order_cancelled"
+    assert row["order_id"] == "order-9"
+    assert row["path"] == "inventory_recovery"
+    assert row["unpaired_cost"] == 0.669
+    assert row["pair_cap"] == 0.329
 
 
 def test_parse_fill_amount_from_taking_amount():
@@ -280,6 +307,20 @@ def test_paper_taker_buy_respects_displayed_depth():
     m = _market()
     filled = broker.taker_buy(m, "no1", 10.0, max_price=0.51)
     assert filled == 5.0  # only the 0.50 level is inside the price cap
+
+
+def test_paper_unpaired_cost_basis_survives_pair_merge_and_exit():
+    """Paper recovery must use the average cost of the still-unpaired leg."""
+    tracker = BookTracker(["yes1", "no1"])
+    broker = PaperBroker(500.0, tracker)
+    m = _market()
+
+    broker._fill(m, Quote("no1", 0.669, 50), 50)
+    broker._fill(m, Quote("yes1", 0.300, 10), 10)
+    broker._fill_exit(m, Quote("no1", 0.700, 10), 10)
+
+    assert broker.unpaired_shares(m) == -30.0
+    assert broker.unpaired_cost_basis(m) == pytest.approx(0.669)
 
 
 def test_paper_maker_fill_charges_no_fee():
@@ -410,6 +451,26 @@ def _live_fill_stub():
     stub._apply_fill_to_orders = lambda token_id, size, side: LiveBroker._apply_fill_to_orders(
         stub, token_id, size, side)
     return stub
+
+
+def test_ws_fill_audit_retains_exchange_identifiers_and_hedge_path(tmp_path):
+    """A user-feed receipt must preserve its external IDs and audit path."""
+    from pmbot.audit import AuditLogger
+
+    stub = _live_fill_stub()
+    stub.audit = AuditLogger(str(tmp_path / "audit.jsonl"))
+    market = stub._markets["cid1"]
+
+    LiveBroker.record_user_fill(
+        stub, market.yes_token, "BUY", 0.372, 50.0, taker=True,
+        order_id="order-7", fill_id="fill-8", trade_hash="0xabc")
+
+    row = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
+    assert row["event"] == "ws_fill"
+    assert row["order_id"] == "order-7"
+    assert row["fill_id"] == "fill-8"
+    assert row["trade_hash"] == "0xabc"
+    assert row["path"] == "forced_hedge"
 
 
 def test_due_for_refresh_flags_near_expiry_orders():

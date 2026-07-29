@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gamma
+from .audit import AuditLogger
 from .books import BookTracker
 from .gamma import Market
 from .strategy import Quote
@@ -69,12 +70,16 @@ USDC_DECIMALS = 1_000_000
 class Position:
     yes_shares: float = 0.0
     no_shares: float = 0.0
+    yes_cost: float = 0.0
+    no_cost: float = 0.0
     merged_usd: float = 0.0
     fills: int = 0
 
     def merge(self) -> float:
         pairs = min(self.yes_shares, self.no_shares)
         if pairs > 0:
+            self.yes_cost *= (self.yes_shares - pairs) / self.yes_shares
+            self.no_cost *= (self.no_shares - pairs) / self.no_shares
             self.yes_shares -= pairs
             self.no_shares -= pairs
             self.merged_usd += pairs
@@ -96,6 +101,7 @@ class RestingOrder:
     quote: Quote
     placed_ts: float
     expiration: int = 0
+    audit: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -180,7 +186,8 @@ class PaperBroker:
         if now >= st.active_at and self.latency > 0:
             self._dying.setdefault(cid, []).append((st.quote, now + self.latency))
 
-    def set_quotes(self, market: Market, quotes: list[Quote]) -> None:
+    def set_quotes(self, market: Market, quotes: list[Quote],
+                   audit_context: dict[str, dict] | None = None) -> None:
         self._markets[market.condition_id] = market
         self._token_to_market[market.yes_token] = market
         self._token_to_market[market.no_token] = market
@@ -366,9 +373,11 @@ class PaperBroker:
         self.state.cash -= cost
         if q.token_id == market.yes_token:
             pos.yes_shares += size
+            pos.yes_cost += cost
             side = "YES"
         else:
             pos.no_shares += size
+            pos.no_cost += cost
             side = "NO"
         pos.fills += 1
         merged = pos.merge()
@@ -392,10 +401,14 @@ class PaperBroker:
         pos = self.state.positions.setdefault(market.condition_id, Position())
         if q.token_id == market.yes_token:
             size = min(fill_sz, pos.yes_shares)
+            if size > 0:
+                pos.yes_cost *= (pos.yes_shares - size) / pos.yes_shares
             pos.yes_shares -= size
             side = "YES"
         else:
             size = min(fill_sz, pos.no_shares)
+            if size > 0:
+                pos.no_cost *= (pos.no_shares - size) / pos.no_shares
             pos.no_shares -= size
             side = "NO"
         if size <= 0:
@@ -438,9 +451,11 @@ class PaperBroker:
         self.state.cash -= cost + fee
         if token_id == market.yes_token:
             pos.yes_shares += filled
+            pos.yes_cost += cost + fee
             side = "YES"
         else:
             pos.no_shares += filled
+            pos.no_cost += cost + fee
             side = "NO"
         pos.fills += 1
         merged = pos.merge()
@@ -513,6 +528,17 @@ class PaperBroker:
             return 0.0
         return pos.yes_shares - pos.no_shares
 
+    def unpaired_cost_basis(self, market: Market) -> float | None:
+        """Average all-in cost of the currently unpaired paper position."""
+        pos = self.state.positions.get(market.condition_id)
+        if pos is None:
+            return None
+        if pos.yes_shares > pos.no_shares and pos.yes_shares > 0:
+            return pos.yes_cost / pos.yes_shares
+        if pos.no_shares > pos.yes_shares and pos.no_shares > 0:
+            return pos.no_cost / pos.no_shares
+        return None
+
     def held_markets(self) -> list[Market]:
         return [
             self._markets[cid]
@@ -573,6 +599,8 @@ class LiveBroker:
                 "(and POLYMARKET_FUNDER for email/browser-wallet accounts)"
             )
         self.cfg = cfg
+        metrics_cfg = cfg.get("metrics") or {}
+        self.audit = AuditLogger(metrics_cfg.get("audit_log", "data/audit.jsonl"))
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
         self.exit_order_ttl = int(cfg["risk"].get("exit_order_ttl_secs", 600))
         # Refresh resting quotes by posting the replacement BEFORE cancelling
@@ -634,7 +662,8 @@ class LiveBroker:
                 self.merger = Merger(
                     cfg["live"]["rpc_url"], sig_type, key, funder,
                     relayer_url=cfg["live"].get("relayer_url"),
-                    builder_creds=builder_creds)
+                    builder_creds=builder_creds,
+                    audit_event=self.audit.record)
             except Exception as e:  # noqa: BLE001
                 log.warning("on-chain merger unavailable: %s", e)
         log.info("live client ready (signature_type=%d, address=%s)", sig_type, self.address)
@@ -691,7 +720,8 @@ class LiveBroker:
     def _record_order_event(self, event: str, market: Market | None = None,
                             quote: Quote | None = None, side: str | None = None,
                             order_id: str | None = None,
-                            reason: str | None = None) -> None:
+                            reason: str | None = None,
+                            audit: dict | None = None) -> None:
         """Emit one lifecycle record through the asynchronous runtime logger."""
         fields = [f"event={event}"]
         if market is not None:
@@ -700,9 +730,36 @@ class LiveBroker:
             fields.extend((f"price={quote.price:.3f}", f"size={quote.size:.2f}"))
         if side is not None:
             fields.append(f"side={side}")
+        if order_id:
+            fields.append(f"order_id={order_id}")
         if reason:
             fields.append(f"reason={reason!r}")
         log.info("ORDER %s", " ".join(fields))
+        if audit is None and order_id:
+            audit = LiveBroker._order_audit_context(self, order_id)
+        row = {
+            "event": event.lower(), "cid": market.condition_id if market else None,
+            "market": market.question if market else None,
+            "order_id": order_id, "fill_id": None, "trade_hash": None,
+            "side": side, "token": quote.token_id if quote else None,
+            "price": quote.price if quote else None, "size": quote.size if quote else None,
+            "path": (audit or {}).get("path", "normal"),
+            "unpaired_cost": (audit or {}).get("unpaired_cost"),
+            "pair_cap": (audit or {}).get("pair_cap"),
+            "expected_pair_pnl": (audit or {}).get("expected_pair_pnl"),
+            "reason": reason,
+        }
+        getattr(self, "audit", AuditLogger(None)).record(row)
+
+    def _order_audit_context(self, order_id: str) -> dict:
+        for orders in getattr(self, "_open_orders", {}).values():
+            for ro in orders:
+                if ro.order_id == order_id:
+                    return ro.audit
+        for ro in getattr(self, "_exit_orders", {}).values():
+            if ro.order_id == order_id:
+                return ro.audit
+        return {}
 
     def _resting_order_context(self, order_id: str) -> tuple[Market | None, Quote | None, str | None]:
         for cid, orders in getattr(self, "_open_orders", {}).items():
@@ -802,7 +859,8 @@ class LiveBroker:
                                              side, oid, str(fallback_error))
             return ok
 
-    def set_quotes(self, market: Market, quotes: list[Quote]) -> None:
+    def set_quotes(self, market: Market, quotes: list[Quote],
+                   audit_context: dict[str, dict] | None = None) -> None:
         from py_clob_client_v2 import (
             OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersV2Args, Side,
         )
@@ -871,8 +929,11 @@ class LiveBroker:
                                or item.get("id") or "")
                         if oid:
                             q = order_map[i]
-                            placed.append(RestingOrder(oid, q, now, self._gtd_expiration()))
-                            self._record_order_event("ORDER_PLACED", market, q, "BUY", oid)
+                            context = (audit_context or {}).get(q.token_id, {})
+                            placed.append(RestingOrder(
+                                oid, q, now, self._gtd_expiration(), context))
+                            self._record_order_event("ORDER_PLACED", market, q, "BUY", oid,
+                                                     audit=context)
                         else:
                             # POST /orders returns a 200 array even for per-order
                             # REJECTIONS: orderID comes back empty with the reason
@@ -1027,7 +1088,8 @@ class LiveBroker:
             self._positions = positions
             self._token_shares = dict(token_shares)
 
-    def taker_buy(self, market: Market, token_id: str, size: float, max_price: float) -> float:
+    def taker_buy(self, market: Market, token_id: str, size: float, max_price: float,
+                  audit_context: dict | None = None) -> float:
         from py_clob_client_v2 import (
             AssetType, MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side,
         )
@@ -1053,6 +1115,19 @@ class LiveBroker:
                     ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
                     resp = self.client.post_order(signed, OrderType.FAK)
                 filled = _parse_fill_amount(resp, size)
+                order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")
+                            or "") if isinstance(resp, dict) else ""
+                context = {"path": "forced_hedge", **(audit_context or {})}
+                getattr(self, "audit", AuditLogger(None)).record({
+                    "event": "order_placed", "cid": market.condition_id,
+                    "market": market.question, "order_id": order_id or None,
+                    "fill_id": None, "trade_hash": None, "side": "BUY",
+                    "token": token_id, "price": max_price, "size": size,
+                    "path": context["path"],
+                    "unpaired_cost": context.get("unpaired_cost"),
+                    "pair_cap": context.get("pair_cap"),
+                    "expected_pair_pnl": context.get("expected_pair_pnl"),
+                })
                 if filled > 0:
                     LiveBroker._register_pending_hedge(self, market, token_id, filled)
         except Exception as e:  # noqa: BLE001
@@ -1088,7 +1163,8 @@ class LiveBroker:
                         ro.quote = Quote(token_id, ro.quote.price, remaining)
 
     def record_user_fill(self, token_id: str, side: str, price: float,
-                         size: float, taker: bool = False) -> None:
+                         size: float, taker: bool = False, order_id: str | None = None,
+                         fill_id: str | None = None, trade_hash: str | None = None) -> None:
         if size <= 0:
             return
         ts = time.time()
@@ -1133,6 +1209,18 @@ class LiveBroker:
             self.metrics.record_fill(entry)
         log.info("LIVE FILL (ws) %s %s %s %.1f @ %.3f",
                  market.question[:40], side, entry["side"], size, price)
+        context = LiveBroker._order_audit_context(self, order_id) if order_id else {}
+        if taker and not context:
+            context = {"path": "forced_hedge"}
+        getattr(self, "audit", AuditLogger(None)).record({
+            "event": "ws_fill", "cid": market.condition_id, "market": market.question,
+            "order_id": order_id, "fill_id": fill_id, "trade_hash": trade_hash,
+            "side": side, "token": token_id, "price": price, "size": size,
+            "path": context.get("path", "unknown"),
+            "unpaired_cost": context.get("unpaired_cost"),
+            "pair_cap": context.get("pair_cap"),
+            "expected_pair_pnl": context.get("expected_pair_pnl"),
+        })
         _notify_live_fill(getattr(self, "notifier", None), entry, side)
 
     def reconcile_orders(self) -> None:
@@ -1406,7 +1494,8 @@ class LiveBroker:
                 continue
             log.info("merging %.0f pairs in '%s' (recovers $%.0f)",
                      pairs, m.question[:40], pairs)
-            if self.merger.merge(m.condition_id, m.neg_risk, pairs):
+            if self.merger.merge(m.condition_id, m.neg_risk, pairs,
+                                 audit_context={"market": m.question}):
                 d["yes"] -= pairs
                 d["no"] -= pairs
                 self._token_shares[m.yes_token] = max(

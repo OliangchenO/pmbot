@@ -76,7 +76,7 @@ class Merger:
 
     def __init__(self, rpc_url: str, signature_type: int, private_key: str,
                  funder: str | None, relayer_url: str | None = None,
-                 builder_creds: dict | None = None):
+                 builder_creds: dict | None = None, audit_event=None):
         self.rpc_url = rpc_url
         self.sig_type = signature_type
         self._private_key = private_key
@@ -88,6 +88,8 @@ class Merger:
         self._failures = 0
         self._http = httpx.Client(timeout=20.0, verify=certifi.where())
         self._relayer = None  # set for signature_type 3 when creds are present
+        self._audit_event = audit_event
+        self._audit_base: dict = {}
         if self.sig_type in (0, 1):
             pass  # self-submitted JSON-RPC path (gas paid by the EOA)
         elif self.sig_type == 3:
@@ -143,6 +145,8 @@ class Merger:
         raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
         tx_hash = self._rpc("eth_sendRawTransaction", ["0x" + raw.hex().removeprefix("0x")])
         log.info("merge tx sent: %s", tx_hash)
+        self._audit("merge_submitted", merge_id=tx_hash, tx_hash=tx_hash,
+                    redeemed_usd=None, redemption_reason="awaiting receipt")
         deadline = time.time() + RECEIPT_TIMEOUT_SECS
         while time.time() < deadline:
             receipt = self._rpc("eth_getTransactionReceipt", [tx_hash])
@@ -150,6 +154,11 @@ class Merger:
                 ok = int(receipt["status"], 16) == 1
                 if not ok:
                     raise RuntimeError(f"tx reverted on-chain: {tx_hash}")
+                redeemed = self._redeemed_from_receipt(receipt)
+                self._audit("merge_confirmed", merge_id=tx_hash, tx_hash=tx_hash,
+                            redeemed_usd=redeemed,
+                            redemption_reason=None if redeemed is not None else
+                            "receipt confirms success but contains no pUSD transfer to wallet")
                 return True
             time.sleep(RECEIPT_POLL_SECS)
         raise RuntimeError(f"timed out waiting for receipt: {tx_hash}")
@@ -231,15 +240,52 @@ class Merger:
             dw_calls, self.wallet, str(nonce), deadline)
         log.info("relayer batch submitted (txID=%s); awaiting confirmation…",
                  resp.transaction_id)
+        self._audit("merge_submitted", merge_id=resp.transaction_id,
+                    transaction_id=resp.transaction_id, tx_hash=None,
+                    redeemed_usd=None, redemption_reason="awaiting relayer confirmation")
         confirmed = resp.wait()
         if confirmed is None:
             raise RuntimeError("relayer batch did not confirm (failed or timed out)")
+        tx_hash = (confirmed.get("transactionHash") or confirmed.get("txHash")
+                   or confirmed.get("transaction_hash")) if isinstance(confirmed, dict) else None
+        receipt = self._rpc("eth_getTransactionReceipt", [tx_hash]) if tx_hash else None
+        redeemed = self._redeemed_from_receipt(receipt) if receipt else None
+        self._audit("merge_confirmed", merge_id=resp.transaction_id,
+                    transaction_id=resp.transaction_id, tx_hash=tx_hash,
+                    redeemed_usd=redeemed,
+                    redemption_reason=None if redeemed is not None else
+                    "relayer confirmation has no receipt with a verified pUSD transfer")
         return True
 
-    def merge(self, condition_id: str, neg_risk: bool, pairs: float) -> bool:
+    def _redeemed_from_receipt(self, receipt: dict | None) -> float | None:
+        """Exact pUSD Transfers to the token-holding wallet in one merge receipt."""
+        if not receipt:
+            return None
+        transfer = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+        wallet = self.wallet.lower().removeprefix("0x")
+        total = 0
+        found = False
+        for item in receipt.get("logs") or []:
+            topics = item.get("topics") or []
+            if (str(item.get("address") or "").lower() != PUSD.lower()
+                    or len(topics) < 3 or str(topics[0]).lower() != transfer.lower()
+                    or not str(topics[2]).lower().endswith(wallet)):
+                continue
+            total += int(str(item.get("data") or "0x0"), 16) / USDC_DECIMALS
+            found = True
+        return total if found else None
+
+    def _audit(self, event: str, **fields) -> None:
+        if self._audit_event:
+            self._audit_event({"event": event, **self._audit_base, **fields})
+
+    def merge(self, condition_id: str, neg_risk: bool, pairs: float,
+              audit_context: dict | None = None) -> bool:
         """Merge `pairs` YES+NO pairs back into pUSD. Returns True on success."""
         if self.disabled:
             return False
+        self._audit_base = {"cid": condition_id, "pairs": pairs,
+                            "expected_redeem_usd": pairs, **(audit_context or {})}
         cid = bytes.fromhex(condition_id.removeprefix("0x"))
         if len(cid) != 32:
             log.error("bad condition id %s", condition_id)
@@ -262,6 +308,7 @@ class Merger:
             calls = self._ensure_approval(adapter) + [(adapter, merge_call)]
             ok = self._execute(calls)
         except Exception as e:  # noqa: BLE001
+            self._audit("merge_failed", reason=str(e), redeemed_usd=None)
             self._failures += 1
             log.error("on-chain merge failed (%d/%d): %s",
                       self._failures, MAX_FAILURES, e)
