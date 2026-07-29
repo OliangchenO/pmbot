@@ -19,8 +19,8 @@ import math
 import os
 import queue
 import time
-from datetime import datetime, timedelta, timezone
-from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
+from datetime import date, datetime, timedelta, timezone
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 
 import yaml
@@ -93,6 +93,35 @@ class BeijingFormatter(logging.Formatter):
         return timestamp.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
 
 
+class DailyFileHandler(logging.FileHandler):
+    """Append each record to its date-named log without renaming an open file.
+
+    Windows cannot rename a file while another bot process has it open.  Unlike
+    TimedRotatingFileHandler, this handler switches directly to a new daily
+    filename, so independent pmbot instances can share a log directory.
+    """
+
+    def __init__(self, directory: Path, *, encoding: str = "utf-8") -> None:
+        self.directory = directory.resolve()
+        now = datetime.now(BEIJING_TZ)
+        self._day: date = now.date()
+        super().__init__(self._filename_for(now), encoding=encoding)
+
+    def _filename_for(self, timestamp: datetime) -> Path:
+        return self.directory / f"pmbot.{timestamp:%Y-%m-%d}.log"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        timestamp = datetime.fromtimestamp(record.created, BEIJING_TZ)
+        if timestamp.date() != self._day:
+            if self.stream is not None:
+                self.stream.flush()
+                self.stream.close()
+            self.baseFilename = os.fspath(self._filename_for(timestamp))
+            self.stream = self._open()
+            self._day = timestamp.date()
+        super().emit(record)
+
+
 def stop_logging() -> None:
     """Drain and stop the asynchronous runtime-log writer, if configured."""
     global _LOG_LISTENER
@@ -109,10 +138,7 @@ def configure_logging(log_dir: Path | str = "logs") -> logging.Logger:
     stop_logging()
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    file_handler = TimedRotatingFileHandler(
-        directory / "pmbot.log", when="midnight", backupCount=0,
-        encoding="utf-8",
-    )
+    file_handler = DailyFileHandler(directory, encoding="utf-8")
     file_handler.setFormatter(BeijingFormatter(
         "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -596,13 +622,23 @@ class Bot:
         """
         sc = self.cfg["scanner"]
         top_n = int(sc["top_n_markets"])
-        locked = list(locked or [])[:top_n]
-        locked_cids = {m.condition_id for m in locked}
-        slots = top_n - len(locked)
+        locked = list(locked or [])
+        # A small, still-manageable residual cannot earn rewards until it reaches
+        # this market's rewardsMinSize. Keep it on the recovery path without
+        # spending a normal scan slot; once it reaches min_size it occupies one.
+        occupying = [
+            m for m in locked
+            if abs(self.broker.unpaired_shares(m)) >= m.min_size
+        ][:top_n]
+        occupying_cids = {m.condition_id for m in occupying}
+        free_locked = [m for m in locked if m.condition_id not in occupying_cids]
+        locked_cids = occupying_cids | {m.condition_id for m in free_locked}
+        slots = top_n - len(occupying)
         if slots <= 0:
-            return locked
+            return occupying + free_locked
         if not bool(sc.get("sticky_swap", True)):
-            return locked + [m for m in ranked if m.condition_id not in locked_cids][:slots]
+            return (occupying + free_locked
+                    + [m for m in ranked if m.condition_id not in locked_cids][:slots])
         margin = float(sc.get("swap_score_margin", 0.0))
         by_cid = {m.condition_id: m for m in ranked}
         held = [m.condition_id for m in self.markets if m.condition_id not in locked_cids]
@@ -651,7 +687,7 @@ class Bot:
                 chosen.append(cand)
                 chosen_cids = (chosen_cids - {weak.condition_id}) | {cand.condition_id}
                 survivor_cids.discard(weak.condition_id)
-        return locked + chosen
+        return occupying + free_locked + chosen
 
     async def _rescan(self, initial: bool = False, rotate: bool = False) -> None:
         self._rotate_pending = False

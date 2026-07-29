@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-from logging.handlers import TimedRotatingFileHandler
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -307,11 +306,19 @@ def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch
             "refresh_minutes": 30,
         }
         held, flat, fresh = _scored("held", 3.0), _scored("flat", 2.0), _scored("fresh", 1.0)
+        held.min_size = 10.0
         ranked["value"] = [held, flat, fresh]
         await bot._rescan(initial=True)
-        bot.broker.state.positions[held.condition_id] = Position(no_shares=20.0)
+        # A manageable 5-share NO position is below rewardsMinSize (10), so
+        # it stays managed without consuming either of the two scan slots.
+        bot.broker.state.positions[held.condition_id] = Position(no_shares=5.0)
 
         ranked["value"] = [flat, fresh]
+        await bot._rescan()
+        assert {m.condition_id for m in bot.markets} == {"held", "flat", "fresh"}
+
+        # At exactly rewardsMinSize the position consumes one scan slot.
+        bot.broker.state.positions[held.condition_id] = Position(no_shares=10.0)
         await bot._rescan()
         assert {m.condition_id for m in bot.markets} == {"held", "flat"}
 
@@ -587,20 +594,22 @@ def test_sticky_disabled_returns_plain_top_n(tmp_path):
     bot.metrics.close()
 
 
-def test_configure_logging_writes_utf8_daily_rotating_file(tmp_path, monkeypatch):
+def test_configure_logging_writes_utf8_date_named_file_without_renaming_active_log(
+        tmp_path, monkeypatch):
+    """Daily files avoid Windows rename failures when another bot is writing."""
     monkeypatch.chdir(tmp_path)
     root = main.configure_logging()
     root.info("持久化测试消息")
     listener = main._LOG_LISTENER
     assert listener is not None
     file_handler = next(h for h in listener.handlers
-                        if isinstance(h, TimedRotatingFileHandler))
+                        if isinstance(h, main.DailyFileHandler))
     main.stop_logging()
 
-    log_file = tmp_path / "logs" / "pmbot.log"
+    log_file = tmp_path / "logs" / f"pmbot.{main.datetime.now(main.BEIJING_TZ):%Y-%m-%d}.log"
     assert "持久化测试消息" in log_file.read_text(encoding="utf-8")
-    assert file_handler.when == "MIDNIGHT"
-    assert file_handler.backupCount == 0
+    assert file_handler.baseFilename == str(log_file)
+    assert not (tmp_path / "logs" / "pmbot.log").exists()
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
@@ -623,7 +632,7 @@ def test_configure_logging_does_not_wait_for_slow_file_io(tmp_path, monkeypatch)
             write_started.set()
             release_writer.wait(timeout=1)
 
-    monkeypatch.setattr(main, "TimedRotatingFileHandler", SlowFileHandler)
+    monkeypatch.setattr(main, "DailyFileHandler", SlowFileHandler)
     root = main.configure_logging(tmp_path / "logs")
     timer = threading.Timer(0.15, release_writer.set)
     timer.start()
