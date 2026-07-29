@@ -523,24 +523,24 @@ def test_cooldown_recovery_only_keeps_complement_for_meaningful_inventory(tmp_pa
     bot.metrics.close()
 
 
-def test_inventory_recovery_rejects_quote_above_pair_cost_cap(tmp_path):
-    """Removing the recovery cost cap would allow a known-loss pair to rest."""
+def test_inventory_recovery_clamps_quote_above_pair_cost_cap(tmp_path):
+    """A changed theoretical bid must retain a safe passive complement price."""
     bot = _bot(tmp_path)
     bot.broker = _RecoveryBasisBroker(0.669)
     market = _market()
 
     allowed = bot._inventory_recovery_quotes(
         market, [Quote(market.yes_token, 0.329, 50.0)], unpaired=-50.0)
-    rejected = bot._inventory_recovery_quotes(
+    capped = bot._inventory_recovery_quotes(
         market, [Quote(market.yes_token, 0.340, 50.0)], unpaired=-50.0)
 
     assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
-    assert rejected == []
+    assert capped == [Quote(market.yes_token, 0.330, 50.0)]
     bot.metrics.close()
 
 
-def test_cooldown_recovery_rejects_quote_above_pair_cost_cap(tmp_path):
-    """Cooldown must not bypass the economic ceiling on a complement bid."""
+def test_cooldown_recovery_clamps_quote_above_pair_cost_cap(tmp_path):
+    """Cooldown recovery must retain a complement bid at the economic ceiling."""
     bot = _bot(tmp_path)
     bot.broker = _RecoveryBasisBroker(0.669)
     market = _market()
@@ -548,7 +548,7 @@ def test_cooldown_recovery_rejects_quote_above_pair_cost_cap(tmp_path):
     quotes = bot._cooldown_recovery_quotes(
         market, [Quote(market.yes_token, 0.372, 50.0)], unpaired=-50.0)
 
-    assert quotes == []
+    assert quotes == [Quote(market.yes_token, 0.330, 50.0)]
     bot.metrics.close()
 
 
@@ -575,12 +575,12 @@ def test_paper_inventory_recovery_uses_same_pair_cost_cap(tmp_path):
     allowed = bot._inventory_recovery_quotes(
         market, [Quote(market.yes_token, 0.329, 50.0)],
         unpaired=broker.unpaired_shares(market))
-    rejected = bot._inventory_recovery_quotes(
+    capped = bot._inventory_recovery_quotes(
         market, [Quote(market.yes_token, 0.340, 50.0)],
         unpaired=broker.unpaired_shares(market))
 
     assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
-    assert rejected == []
+    assert capped == [Quote(market.yes_token, 0.330, 50.0)]
     bot.metrics.close()
 
 

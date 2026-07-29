@@ -862,9 +862,10 @@ class Bot:
             return []
         max_price = self._forced_hedge_max_price(m, basis)
         complement = m.no_token if unpaired > 0 else m.yes_token
-        return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
+        return [strategy.Quote(q.token_id, min(q.price, max_price),
+                               min(q.size, abs(unpaired)))
                 for q in desired
-                if q.token_id == complement and q.price <= max_price + 1e-9]
+                if q.token_id == complement]
 
     def _filter_quotes_for_side_guard(self, desired: list[strategy.Quote], *,
                                       unpaired: float, now: float) -> list[strategy.Quote]:

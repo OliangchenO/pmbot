@@ -601,6 +601,7 @@ class LiveBroker:
         self.cfg = cfg
         metrics_cfg = cfg.get("metrics") or {}
         self.audit = AuditLogger(metrics_cfg.get("audit_log", "data/audit.jsonl"))
+        self._recovery_basis_cache = self.audit.recovery_bases()
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
         self.exit_order_ttl = int(cfg["risk"].get("exit_order_ttl_secs", 600))
         # Refresh resting quotes by posting the replacement BEFORE cancelling
@@ -750,6 +751,16 @@ class LiveBroker:
             "reason": reason,
         }
         getattr(self, "audit", AuditLogger(None)).record(row)
+        if (event == "ORDER_PLACED" and market is not None and quote is not None
+                and row["path"] == "inventory_recovery"
+                and row["unpaired_cost"] is not None):
+            try:
+                basis = float(row["unpaired_cost"])
+                if 0.0 < basis < 1.0:
+                    getattr(self, "_recovery_basis_cache", {})[market.condition_id] = (
+                        basis, quote.size)
+            except (TypeError, ValueError):
+                pass
 
     def _order_audit_context(self, order_id: str) -> dict:
         for orders in getattr(self, "_open_orders", {}).values():
@@ -1461,9 +1472,13 @@ class LiveBroker:
         d = LiveBroker._effective_position(self, market)
         key = "yes" if d["yes"] > d["no"] else "no"
         shares = float(d.get(f"{key}_cost_shares") or 0.0)
-        if shares <= 0:
-            return None
-        return float(d.get(f"{key}_cost") or 0.0) / shares
+        if shares > 0:
+            return float(d.get(f"{key}_cost") or 0.0) / shares
+        cached = getattr(self, "_recovery_basis_cache", {}).get(market.condition_id)
+        unpaired = abs(float(d.get("yes") or 0.0) - float(d.get("no") or 0.0))
+        if cached is not None and abs(cached[1] - unpaired) <= 1e-9:
+            return cached[0]
+        return None
 
     def held_markets(self) -> list[Market]:
         with self._state_lock:

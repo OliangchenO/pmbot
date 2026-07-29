@@ -842,3 +842,17 @@ def test_live_unpaired_cost_basis_uses_exchange_average_price():
     stub._state_lock = threading.RLock()
 
     assert LiveBroker.unpaired_cost_basis(stub, market) == pytest.approx(0.398)
+
+
+def test_live_unpaired_cost_basis_falls_back_to_matching_audit_when_average_missing():
+    """A restart without Data API avgPrice retains a verified matching basis."""
+    market = _market()
+    stub = _live_stub()
+    stub._positions = {market.condition_id: {"yes": 15.0, "no": 0.0, "value": 0.0,
+                                              "yes_cost": 0.0, "no_cost": 0.0,
+                                              "yes_cost_shares": 0.0, "no_cost_shares": 0.0}}
+    stub._pending_hedges = {}
+    stub._state_lock = threading.RLock()
+    stub._recovery_basis_cache = {market.condition_id: (0.65, 15.0)}
+
+    assert LiveBroker.unpaired_cost_basis(stub, market) == pytest.approx(0.65)
