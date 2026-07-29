@@ -512,8 +512,10 @@ def _live_stub(sig_type=3):
     stub._state_lock = threading.RLock()
     stub.client = MagicMock()
     stub.cfg = {"live": {"signature_type": sig_type}}
-    stub._gtd_expiration = lambda: 123
+    stub._gtd_expiration = lambda _ttl=None: 123
+    stub.exit_order_ttl = 600
     stub.metrics = None
+    stub._markets = {}
     stub._token_shares = {}
     stub._pending_hedges = {}
     stub.sync_calls = []
@@ -529,6 +531,83 @@ def test_place_sell_syncs_conditional_balance_first():
     assert ro is not None and ro.order_id == "oidS"
     # the conditional token was synced for exactly the token being sold
     assert stub.sync_calls == [(AssetType.CONDITIONAL, "tok9")]
+
+
+def test_live_place_sell_uses_exit_order_ttl(monkeypatch):
+    from pmbot.brokers import GTD_SECURITY_THRESHOLD_SECS
+
+    stub = _live_stub()
+    stub.order_ttl = 180
+    stub.exit_order_ttl = 600
+    now = 1_700_000_000
+    monkeypatch.setattr("pmbot.brokers.time.time", lambda: now)
+    stub._gtd_expiration = LiveBroker._gtd_expiration.__get__(stub, LiveBroker)
+    stub.client.post_order.return_value = {"orderID": "exit-1"}
+
+    LiveBroker._place_sell(stub, Quote("yes1", 0.53, 10))
+
+    args = stub.client.create_order.call_args.args[0]
+    assert args.expiration == now + 600 + GTD_SECURITY_THRESHOLD_SECS
+
+
+def test_live_exit_keeps_unchanged_order_before_refresh(monkeypatch):
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _live_stub()
+    quote = Quote("yes1", 0.53, 10)
+    now = 1_700_000_000
+    monkeypatch.setattr("pmbot.brokers.time.time", lambda: now)
+    stub._exit_orders["cid1"] = RestingOrder(
+        "exit-old", quote, now - 60, now + GTD_REFRESH_MARGIN_SECS + 1,
+    )
+    stub._batch_cancel = MagicMock(return_value=True)
+    stub._place_sell = MagicMock()
+
+    LiveBroker.set_exit(stub, _market(), quote)
+
+    stub._batch_cancel.assert_not_called()
+    stub._place_sell.assert_not_called()
+
+
+def test_live_exit_replaces_at_refresh_after_cancel(monkeypatch):
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _live_stub()
+    quote = Quote("yes1", 0.53, 10)
+    now = 1_700_000_000
+    monkeypatch.setattr("pmbot.brokers.time.time", lambda: now)
+    stub._exit_orders["cid1"] = RestingOrder(
+        "exit-old", quote, now - 590, now + GTD_REFRESH_MARGIN_SECS - 1,
+    )
+    calls = []
+    stub._batch_cancel = lambda ids: calls.append(("cancel", ids)) or True
+    stub._place_sell = lambda q: calls.append(("post", q)) or RestingOrder(
+        "exit-new", q, now, now + 600,
+    )
+
+    LiveBroker.set_exit(stub, _market(), quote)
+
+    assert calls == [("cancel", ["exit-old"]), ("post", quote)]
+
+
+def test_live_exit_quantity_change_cancels_before_replacement(monkeypatch):
+    from pmbot.brokers import RestingOrder
+
+    stub = _live_stub()
+    now = 1_700_000_000
+    monkeypatch.setattr("pmbot.brokers.time.time", lambda: now)
+    old = Quote("yes1", 0.53, 10)
+    new = Quote("yes1", 0.53, 5)
+    stub._exit_orders["cid1"] = RestingOrder("exit-old", old, now - 1, now + 600)
+    calls = []
+    stub._batch_cancel = lambda ids: calls.append(("cancel", ids)) or True
+    stub._place_sell = lambda q: calls.append(("post", q)) or RestingOrder(
+        "exit-new", q, now, now + 600,
+    )
+
+    LiveBroker.set_exit(stub, _market(), new)
+
+    assert calls == [("cancel", ["exit-old"]), ("post", new)]
 
 
 def test_taker_buy_syncs_collateral_first():

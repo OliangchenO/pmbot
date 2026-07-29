@@ -308,6 +308,9 @@ risk:
   # the excess token joined to its ask — a maker exit that pays nothing.
   # The forced hedge above stays as the escalation if it doesn't fill.
   passive_exit: true
+  # Keep an unchanged passive exit in the queue longer than normal quotes;
+  # GTD expiry still clears it after a crash. Never use an unbounded/GTC exit.
+  exit_order_ttl_secs: 600
   # Don't cross a complement book wider than this (avoid dumping into a void);
   # retry until the spread tightens.
   flatten_max_spread_cents: 4.0

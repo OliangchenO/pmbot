@@ -560,6 +560,7 @@ class LiveBroker:
             )
         self.cfg = cfg
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
+        self.exit_order_ttl = int(cfg["risk"].get("exit_order_ttl_secs", 600))
         # Refresh resting quotes by posting the replacement BEFORE cancelling
         # the expiring order, so a pure GTD refresh never leaves the side off
         # the book (a momentary double-size overlap until the cancel lands,
@@ -623,8 +624,9 @@ class LiveBroker:
                 log.warning("on-chain merger unavailable: %s", e)
         log.info("live client ready (signature_type=%d, address=%s)", sig_type, self.address)
 
-    def _gtd_expiration(self) -> int:
-        return int(time.time()) + self.order_ttl + GTD_SECURITY_THRESHOLD_SECS
+    def _gtd_expiration(self, ttl_secs: int | None = None) -> int:
+        ttl = self.order_ttl if ttl_secs is None else ttl_secs
+        return int(time.time()) + ttl + GTD_SECURITY_THRESHOLD_SECS
 
     def _erc20_balance(self, token_address: str, owner: str) -> float:
         import httpx
@@ -738,7 +740,7 @@ class LiveBroker:
         self._sync_clob_balance(AssetType.CONDITIONAL, q.token_id)
         try:
             with self._client_lock:
-                expiration = self._gtd_expiration()
+                expiration = self._gtd_expiration(self.exit_order_ttl)
                 signed = self.client.create_order(OrderArgs(
                     price=q.price, size=q.size, side=Side.SELL, token_id=q.token_id,
                     expiration=expiration,
