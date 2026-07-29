@@ -830,6 +830,13 @@ class Bot:
                 for q in desired
                 if q.token_id == complement and q.price <= max_price + 1e-9]
 
+    def _filter_quotes_for_side_guard(self, desired: list[strategy.Quote], *,
+                                      unpaired: float, now: float) -> list[strategy.Quote]:
+        """Keep a pair-capped recovery bid even if its normal quote side is paused."""
+        if abs(unpaired) >= MIN_TAKER_SHARES:
+            return desired
+        return [q for q in desired if self.guards.allow_side(q.token_id, now)]
+
     def _cooldown_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
                                    unpaired: float) -> list[strategy.Quote]:
@@ -975,7 +982,8 @@ class Bot:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     recovery_path = "inventory_recovery"
-                desired = [q for q in desired if self.guards.allow_side(q.token_id, now)]
+                desired = self._filter_quotes_for_side_guard(
+                    desired, unpaired=unpaired, now=now)
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])

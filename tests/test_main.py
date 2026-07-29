@@ -337,6 +337,21 @@ def test_inventory_quote_only_buys_complement_and_caps_size(tmp_path):
     bot.metrics.close()
 
 
+def test_unpaired_no_keeps_capped_yes_recovery_bid_when_yes_side_is_blocked(tmp_path):
+    """普通单边流量防护不得撤掉配平裸 NO 的 YES 买单。"""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.62)
+    market = _market()
+    bot.guards.allow_side = MagicMock(return_value=False)
+
+    recovery = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.38, 20.0)], unpaired=-9.67)
+    quotes = bot._filter_quotes_for_side_guard(recovery, unpaired=-9.67, now=time.time())
+
+    assert quotes == [Quote(market.yes_token, 0.38, 9.67)]
+    bot.metrics.close()
+
+
 def test_inventory_recovery_quote_log_includes_pricing_and_book_snapshot(caplog):
     """A recovery bid must leave enough evidence to reproduce its price."""
     market = _market()
