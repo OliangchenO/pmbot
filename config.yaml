@@ -8,7 +8,7 @@ notifications:
     enabled: true
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 120
+capital_usd: 340
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
