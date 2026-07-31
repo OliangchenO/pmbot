@@ -1356,7 +1356,7 @@ class LiveBroker:
                     "ts": now, "cid": market.condition_id,
                     "market": market.question[:50],
                     "side": "YES" if token == market.yes_token else "NO",
-                    "token": token, "size": gained,
+                    "token": token, "size": gained, "inferred": True,
                 }
                 for ro in self._open_orders.get(market.condition_id, []):
                     if ro.quote.token_id == token:
@@ -1503,9 +1503,13 @@ class LiveBroker:
         return [self._markets[cid] for cid in cids if cid in self._markets]
 
     def last_fill_ts(self, cid: str) -> float | None:
-        """Timestamp of the most recent fill for this market, if any."""
+        """Timestamp of the most recent fill for this market, if any.
+
+        Only returns timestamps from confirmed fills (entries with a price),
+        not from Data API inferred position changes.
+        """
         for entry in reversed(self.fills_log):
-            if entry.get("cid") == cid:
+            if entry.get("cid") == cid and "price" in entry:
                 return float(entry["ts"])
         return None
 
