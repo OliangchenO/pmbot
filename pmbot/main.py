@@ -996,9 +996,11 @@ class Bot:
     def _escalated_recovery_quotes(self, m: gamma.Market,
                                     desired: list[strategy.Quote],
                                     unpaired: float) -> list[strategy.Quote]:
-        """Phase 2: complement side at normal fair-price, no opposite side."""
+        """Phase 2: complement side at normal fair-price, size capped to unpaired shares."""
         complement = m.no_token if unpaired > 0 else m.yes_token
-        return [q for q in desired if q.token_id == complement]
+        return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
+                for q in desired
+                if q.token_id == complement]
 
     def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
                               exposure_usd: float, threshold_usd: float,
