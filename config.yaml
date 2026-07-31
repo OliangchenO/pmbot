@@ -112,6 +112,7 @@ scanner:
   # out; ones still holding inventory stay so the exit path manages them.
   # Debounced by ROTATE_MIN_INTERVAL_SECS to avoid book-feed churn.
   rotate_on_trip: true
+
   # Skip markets whose question contains any of these (case-insensitive).
   # Event-driven / observation-driven books: guards trip constantly and
   # inventory stacks across correlated markets (Iran dates, Seoul temps, etc.).
@@ -172,6 +173,16 @@ scanner:
     - announce
     - blockade
     - starmer
+
+# P1 市场质量仅作中文影子诊断：不影响市场选择、报价价格或下单尺寸。
+# 连续观察至少两个 UTC 日结周期后，再由操作者决定是否进入后续扩仓阶段。
+market_quality:
+  shadow_enabled: true
+  observation_minutes: 120
+  min_samples: 30
+  green_uptime_pct: 95
+  red_uptime_pct: 85
+  red_markout_cents: -0.8
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of

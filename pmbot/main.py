@@ -33,6 +33,7 @@ from . import gamma, strategy
 from .books import Book, BookTracker
 from .brokers import LiveBroker, PaperBroker
 from .controller import AdaptiveController
+from .market_quality import classify_market_quality
 from .metrics import MetricsStore
 from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
@@ -43,6 +44,7 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 LOOP_SECONDS = 2.0
 REWARD_SAMPLE_SECONDS = 60.0
+REWARD_ELIGIBILITY_SAMPLE_SECONDS = 60.0
 STATUS_SECONDS = 30.0
 MINUTES_PER_DAY = 1440.0
 POSITION_REFRESH_SECONDS = 12.0
@@ -356,6 +358,7 @@ class Bot:
         self._last_rotate = 0.0
         self._rotate_pending = False
         self._last_reward_sample = 0.0
+        self._last_reward_eligibility_sample = 0.0
         self._last_status = 0.0
         self._last_pos_refresh = 0.0
         self._last_merge_check = 0.0
@@ -364,6 +367,7 @@ class Bot:
         self._over_since: dict[str, float] = {}
         self._last_flatten: dict[str, float] = {}
         self._recovery_skip_logged_at: dict[str, float] = {}
+        self._intended_reward_quotes: dict[str, list[strategy.Quote]] = {}
         self._scale = 1.0
         self._was_paused = False
         # Event-driven quote pulls: guards fire these between loop ticks so we
@@ -457,6 +461,9 @@ class Bot:
                 if now - self._last_reward_sample >= REWARD_SAMPLE_SECONDS:
                     self._sample_rewards()
                     self._last_reward_sample = now
+                if now - self._last_reward_eligibility_sample >= REWARD_ELIGIBILITY_SAMPLE_SECONDS:
+                    self._sample_reward_eligibility()
+                    self._last_reward_eligibility_sample = now
                 if now - self._last_status >= STATUS_SECONDS:
                     self._print_status()
                     self._last_status = now
@@ -560,6 +567,7 @@ class Bot:
             if not self.broker.open_quotes(m):
                 return
             log.warning("guard trip — pulling quotes from '%s' now", m.question[:45])
+            self._intended_reward_quotes[m.condition_id] = []
             self.metrics.sample_uptime(cid, False)
             await self._broker_call(self.broker.set_quotes, m, [])
 
@@ -578,6 +586,7 @@ class Bot:
             log.warning("side block — pulling %s bid in '%s' now",
                         "YES" if token_id == m.yes_token else "NO",
                         m.question[:45])
+            self._intended_reward_quotes[m.condition_id] = list(remaining)
             await self._broker_call(self.broker.set_quotes, m, remaining)
 
     def _rotatable_tripped_cids(self) -> set[str]:
@@ -809,6 +818,7 @@ class Bot:
         if not self.paper:
             await self._ensure_held_market_books()
         self._compute_size_factors()
+        self._log_market_quality_shadow()
 
     def _compute_size_factors(self) -> None:
         if not self.tracker:
@@ -1106,6 +1116,7 @@ class Bot:
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])
+            self._intended_reward_quotes[m.condition_id] = list(final)
             in_band = (len(final) == 2
                        and any(q.token_id == m.yes_token for q in final)
                        and any(q.token_id == m.no_token for q in final))
@@ -1282,6 +1293,89 @@ class Bot:
             usd = m.daily_pool * share * haircut / MINUTES_PER_DAY
             self.broker.accrue_rewards(usd)
             self.metrics.record_reward_sample(m.condition_id, usd)
+
+    def _reward_eligibility_reason(self, market: gamma.Market,
+                                   quotes: list[strategy.Quote]) -> str | None:
+        """Return a Chinese reason when a quote pair misses the local reward gates."""
+        if self.tracker is None:
+            return "盘口数据不可用"
+        yes_book = self.tracker.books.get(market.yes_token)
+        mid = yes_book.mid if yes_book else None
+        if mid is None:
+            return "盘口中点不可用"
+        band = market.max_spread_cents / 100.0
+        for token, center, label in (
+            (market.yes_token, mid, "YES"),
+            (market.no_token, 1.0 - mid, "NO"),
+        ):
+            side_quotes = [q for q in quotes if q.token_id == token]
+            if not side_quotes:
+                return f"缺少{label}奖励报价"
+            if not any(q.size >= market.min_size for q in side_quotes):
+                return f"{label}报价尺寸低于奖励门槛"
+            if not any(q.size >= market.min_size and abs(q.price - center) <= band + 1e-9
+                       for q in side_quotes):
+                return f"{label}报价超出奖励价差"
+        return None
+
+    def _sample_reward_eligibility(self) -> None:
+        """P0: record intent separately from a fresh exchange-side order snapshot."""
+        if self.broker is None:
+            return
+        confirmed_fn = getattr(self.broker, "confirmed_open_quotes", None)
+        for market in self.markets:
+            intended_reason = self._reward_eligibility_reason(
+                market, self._intended_reward_quotes.get(market.condition_id, []))
+            intended = intended_reason is None
+            if not intended:
+                confirmed = False
+                reason = intended_reason
+            else:
+                confirmed_quotes = (confirmed_fn(market) if callable(confirmed_fn)
+                                    else self.broker.open_quotes(market))
+                if confirmed_quotes is None:
+                    confirmed = False
+                    reason = "交易所订单快照未确认"
+                else:
+                    reason = self._reward_eligibility_reason(market, confirmed_quotes)
+                    confirmed = reason is None
+            self.metrics.record_reward_eligibility(
+                market.condition_id, intended=intended, confirmed=confirmed, reason=reason)
+            log.info("奖励资格观测 市场='%s' 意图=%s 交易所确认=%s 原因=%s",
+                     market.question[:45], "合格" if intended else "不合格",
+                     "合格" if confirmed else "不合格", reason or "无")
+
+    def _log_market_quality_shadow(self) -> None:
+        """P1: log Chinese quality recommendations without changing live selection."""
+        settings = self.cfg.get("market_quality") or {}
+        if not settings.get("shadow_enabled", True):
+            return
+        lookback = int(settings.get("observation_minutes", 120))
+        since_minute = int((time.time() - lookback * 60) // 60)
+        by_cid = self.metrics.market_quality_stats(since_minute)
+        names = {market.condition_id: market.question for market in self.markets}
+        for cid, stats in by_cid.items():
+            quality = classify_market_quality(
+                samples=int(stats["samples"]),
+                confirmed_eligible_uptime_pct=float(stats["confirmed_eligible_uptime_pct"]),
+                markout_cents=stats["markout_cents"],
+                markout_samples=int(stats["markout_samples"]),
+                forced_hedges=int(stats["forced_hedges"]),
+                post_failures=int(stats["post_failures"]),
+                min_samples=int(settings.get("min_samples", 30)),
+                green_uptime_pct=float(settings.get("green_uptime_pct", 95.0)),
+                red_uptime_pct=float(settings.get("red_uptime_pct", 85.0)),
+                red_markout_cents=float(settings.get("red_markout_cents", -0.8)),
+            )
+            advice = ("暂停扩仓并继续观察" if quality.level == "红色"
+                      else "维持当前报价并继续观察" if quality.level == "黄色"
+                      else "维持当前尺寸，暂不自动扩仓")
+            logger = log.warning if quality.level == "红色" else log.info
+            logger("市场质量影子评估 市场='%s' 状态=%s 确认合格率=%.1f%% 样本=%d "
+                   "强制对冲=%d 失败观测=%d 原因=%s 建议=%s",
+                   names.get(cid, cid)[:45], quality.level,
+                   stats["confirmed_eligible_uptime_pct"], stats["samples"],
+                   stats["forced_hedges"], stats["post_failures"], quality.reason, advice)
 
     def _print_status(self) -> None:
         table = Table(title=f"pmbot — {'PAPER' if self.paper else 'LIVE'}")

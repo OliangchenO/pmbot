@@ -125,6 +125,25 @@ def test_guard_trip_pulls_quotes_immediately(tmp_path):
     asyncio.run(scenario())
 
 
+def test_guard_pull_clears_reward_eligibility_intent(tmp_path):
+    """A guard-pulled pair must not remain eligible merely because the last quote plan was full."""
+    async def scenario():
+        bot = _bot(tmp_path)
+        market = _market()
+        broker = _setup(bot, tmp_path, market)
+        pair = [Quote(market.yes_token, 0.45, 20.0), Quote(market.no_token, 0.52, 20.0)]
+        broker.set_quotes(market, pair)
+        bot._intended_reward_quotes[market.condition_id] = pair
+
+        bot.guards.trip_market(market.condition_id, time.time(), "test", market.question)
+        await asyncio.gather(*list(bot._pull_tasks))
+
+        assert bot._intended_reward_quotes[market.condition_id] == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_side_block_pulls_only_blocked_side(tmp_path):
     async def scenario():
         bot = _bot(tmp_path)
@@ -655,6 +674,56 @@ def test_sticky_disabled_returns_plain_top_n(tmp_path):
         [_scored("a", 3), _scored("b", 2), _scored("c", 1)])
     assert [m.condition_id for m in chosen] == ["a", "b"]
     bot.metrics.close()
+
+
+def test_reward_eligibility_reports_unconfirmed_pair_in_chinese(tmp_path):
+    """A desired two-sided pair without an exchange snapshot must not count as confirmed."""
+    bot = _bot(tmp_path)
+    market = _market()
+    tracker = BookTracker([market.yes_token, market.no_token])
+    tracker.books[market.yes_token].bids = {0.49: 100}
+    tracker.books[market.yes_token].asks = {0.51: 100}
+    bot.tracker = tracker
+    bot.markets = [market]
+    bot._intended_reward_quotes[market.condition_id] = [
+        Quote(market.yes_token, 0.49, 10.0),
+        Quote(market.no_token, 0.49, 10.0),
+    ]
+
+    class UnconfirmedBroker:
+        def confirmed_open_quotes(self, _market):
+            return None
+
+    bot.broker = UnconfirmedBroker()
+    bot._sample_reward_eligibility()
+    report = bot.metrics.reward_eligibility_by_market(0)
+    bot.metrics.close()
+
+    assert report[market.condition_id]["confirmed_eligible_uptime_pct"] == 0.0
+    assert report[market.condition_id]["failure_reasons"] == {"交易所订单快照未确认": 1}
+
+
+def test_market_quality_shadow_log_is_chinese_and_does_not_select_market(tmp_path, caplog,
+                                                                          monkeypatch):
+    """P1 must be diagnostic-only until an operator explicitly enables a later phase."""
+    bot = _bot(tmp_path)
+    market = _market()
+    bot.markets = [market]
+    monkeypatch.setattr(bot.metrics, "market_quality_stats", lambda _since: {
+        market.condition_id: {
+            "samples": 120, "confirmed_eligible_uptime_pct": 98.0,
+            "markout_cents": 0.1, "markout_samples": 5,
+            "forced_hedges": 1, "post_failures": 0,
+        },
+    })
+    caplog.set_level(logging.WARNING, logger="pmbot")
+
+    bot._log_market_quality_shadow()
+    bot.metrics.close()
+
+    assert "市场质量影子评估" in caplog.text
+    assert "状态=红色" in caplog.text
+    assert "建议=暂停扩仓并继续观察" in caplog.text
 
 
 def test_configure_logging_writes_utf8_date_named_file_without_renaming_active_log(

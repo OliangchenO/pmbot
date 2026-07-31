@@ -644,6 +644,9 @@ class LiveBroker:
         # (worker thread) iterates/trims — guard against concurrent mutation.
         self._ws_deltas_lock = threading.Lock()
         self._last_order_reconcile = 0.0
+        # Set only after ``get_open_orders`` succeeds.  P0 must distinguish an
+        # accepted order response from a fresh exchange-side order snapshot.
+        self._last_confirmed_order_snapshot = 0.0
         self._logged_post_shape = False
         self.metrics = None
         self.merger = None
@@ -1035,6 +1038,13 @@ class LiveBroker:
     def open_quotes(self, market: Market) -> list[Quote]:
         return [ro.quote for ro in self._open_orders.get(market.condition_id, [])]
 
+    def confirmed_open_quotes(self, market: Market) -> list[Quote] | None:
+        """Return exchange-confirmed quotes, or ``None`` when the snapshot is stale."""
+        if (time.time() - self._last_confirmed_order_snapshot
+                > ORDER_RECONCILE_SECONDS * 2):
+            return None
+        return self.open_quotes(market)
+
     def due_for_refresh(self, market: Market) -> bool:
         """True when a resting order is close enough to GTD expiry that it must
         be reposted now even if its price/size is unchanged. The quote loop only
@@ -1285,6 +1295,7 @@ class LiveBroker:
                 by_cid.setdefault(cid, []).append(ro)
         self._open_orders = by_cid
         self._exit_orders = exit_by_cid
+        self._last_confirmed_order_snapshot = time.time()
 
     def refresh_state(self) -> None:
         import httpx

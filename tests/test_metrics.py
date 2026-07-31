@@ -153,6 +153,36 @@ def test_reward_totals_all_time_and_24h(tmp_path):
     assert abs(out["est_24h"] - 3.0) < 1e-9
 
 
+def test_reward_eligibility_keeps_intent_and_exchange_confirmation_separate(tmp_path):
+    """A planned pair must not be reported as reward-eligible after exchange rejection."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+
+    store.record_reward_eligibility("cid1", intended=True, confirmed=True,
+                                    reason=None, minute=100)
+    store.record_reward_eligibility("cid1", intended=True, confirmed=False,
+                                    reason="下单未获交易所确认", minute=101)
+
+    report = store.reward_eligibility_by_market(100)
+    store.close()
+
+    assert report["cid1"]["samples"] == 2
+    assert report["cid1"]["intent_uptime_pct"] == 100.0
+    assert report["cid1"]["confirmed_eligible_uptime_pct"] == 50.0
+    assert report["cid1"]["failure_reasons"] == {"下单未获交易所确认": 1}
+
+
+def test_market_quality_counts_only_unconfirmed_exchange_snapshots_as_post_failures(tmp_path):
+    """A guard-paused missing leg is a risk state, not proof that the exchange rejected a post."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_reward_eligibility("cid1", True, False, "交易所订单快照未确认", minute=100)
+    store.record_reward_eligibility("cid1", False, False, "缺少YES奖励报价", minute=101)
+
+    stats = store.market_quality_stats(100)
+    store.close()
+
+    assert stats["cid1"]["post_failures"] == 1
+
+
 def test_reward_sample_records_per_minute_per_market(tmp_path):
     store = MetricsStore(str(tmp_path / "test.db"))
     store.record_reward_sample("cidA", 0.01)

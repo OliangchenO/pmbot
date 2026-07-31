@@ -94,6 +94,13 @@ class MetricsStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 minute_ts INTEGER, cid TEXT, in_band INTEGER
             );
+            CREATE TABLE IF NOT EXISTS reward_eligibility (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                minute_ts INTEGER, cid TEXT,
+                intended INTEGER, confirmed INTEGER, reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reward_eligibility_minute
+                ON reward_eligibility (minute_ts);
             CREATE TABLE IF NOT EXISTS rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, date TEXT, estimated REAL DEFAULT 0,
@@ -284,6 +291,81 @@ class MetricsStore:
         if minute != self._last_uptime_minute:
             self._flush_uptime(minute)
             self._last_uptime_minute = minute
+
+    def record_reward_eligibility(self, cid: str, intended: bool, confirmed: bool,
+                                  reason: str | None, minute: int | None = None) -> None:
+        """Record whether a planned reward quote was confirmed by the exchange.
+
+        ``uptime`` remains the legacy strategy-side signal.  This audit stream
+        intentionally separates a desired quote from a quote that the exchange
+        reports as resting, so order-post failures cannot inflate reward uptime.
+        """
+        minute = int(time.time()) // 60 if minute is None else int(minute)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reward_eligibility "
+                "(minute_ts,cid,intended,confirmed,reason) VALUES (?,?,?,?,?)",
+                (minute, cid, int(intended), int(confirmed), reason),
+            )
+            self._conn.commit()
+
+    def reward_eligibility_by_market(self, since_minute: int) -> dict[str, dict]:
+        """Return P0 diagnostics grouped by market for Chinese status reports."""
+        rows = self._conn.execute(
+            "SELECT cid, COUNT(*), AVG(intended) * 100.0, AVG(confirmed) * 100.0 "
+            "FROM reward_eligibility WHERE minute_ts >= ? GROUP BY cid",
+            (int(since_minute),),
+        ).fetchall()
+        reasons = self._conn.execute(
+            "SELECT cid, reason, COUNT(*) FROM reward_eligibility "
+            "WHERE minute_ts >= ? AND reason IS NOT NULL "
+            "GROUP BY cid, reason",
+            (int(since_minute),),
+        ).fetchall()
+        out = {
+            cid: {
+                "samples": count,
+                "intent_uptime_pct": round(intent_pct or 0.0, 2),
+                "confirmed_eligible_uptime_pct": round(confirmed_pct or 0.0, 2),
+                "failure_reasons": {},
+            }
+            for cid, count, intent_pct, confirmed_pct in rows
+        }
+        for cid, reason, count in reasons:
+            if cid in out:
+                out[cid]["failure_reasons"][reason] = count
+        return out
+
+    def market_quality_stats(self, since_minute: int) -> dict[str, dict]:
+        """Aggregate only local observations needed by P1 shadow classification."""
+        out = self.reward_eligibility_by_market(since_minute)
+        since_ts = int(since_minute) * 60
+        for cid, avg_markout, markout_samples in self._conn.execute(
+            "SELECT cid, AVG(markout) * 100.0, COUNT(*) FROM markouts "
+            "WHERE ts >= ? GROUP BY cid", (since_ts,),
+        ):
+            out.setdefault(cid, {"samples": 0, "intent_uptime_pct": 0.0,
+                                 "confirmed_eligible_uptime_pct": 0.0,
+                                 "failure_reasons": {}}).update({
+                                     "markout_cents": avg_markout,
+                                     "markout_samples": markout_samples,
+                                 })
+        for cid, forced_hedges in self._conn.execute(
+            "SELECT cid, COUNT(*) FROM hedges WHERE ts >= ? GROUP BY cid", (since_ts,),
+        ):
+            out.setdefault(cid, {"samples": 0, "intent_uptime_pct": 0.0,
+                                 "confirmed_eligible_uptime_pct": 0.0,
+                                 "failure_reasons": {}})["forced_hedges"] = forced_hedges
+        for stats in out.values():
+            stats.setdefault("markout_cents", None)
+            stats.setdefault("markout_samples", 0)
+            stats.setdefault("forced_hedges", 0)
+            # A missing leg can be an intentional guard/cooldown action.  Only
+            # a stale or absent exchange snapshot is evidence of a posting /
+            # confirmation problem for the P1 shadow classifier.
+            stats["post_failures"] = stats["failure_reasons"].get(
+                "交易所订单快照未确认", 0)
+        return out
 
     def _flush_uptime(self, minute: int) -> None:
         with self._lock:
