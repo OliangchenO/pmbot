@@ -546,6 +546,13 @@ class PaperBroker:
             if cid in self._markets and (pos.yes_shares > 0 or pos.no_shares > 0)
         ]
 
+    def last_fill_ts(self, cid: str) -> float | None:
+        """Timestamp of the most recent fill for this market, if any."""
+        for entry in reversed(self.state.fills_log):
+            if entry.get("cid") == cid:
+                return float(entry["ts"])
+        return None
+
     def total_inventory_usd(self) -> float:
         return sum(
             abs(self.net_yes_exposure_usd(m)) for m in self._markets.values()
@@ -1494,6 +1501,13 @@ class LiveBroker:
         with self._state_lock:
             cids = set(self._positions) | set(self._pending_hedges)
         return [self._markets[cid] for cid in cids if cid in self._markets]
+
+    def last_fill_ts(self, cid: str) -> float | None:
+        """Timestamp of the most recent fill for this market, if any."""
+        for entry in reversed(self.fills_log):
+            if entry.get("cid") == cid:
+                return float(entry["ts"])
+        return None
 
     def total_inventory_usd(self) -> float:
         managed = LiveBroker.held_markets(self)

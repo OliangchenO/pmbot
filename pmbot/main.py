@@ -1291,6 +1291,13 @@ class Bot:
                                       self._scale):
                 urgent = True
         start = self._over_since.setdefault(cid, now)
+        # If the broker recorded the fill that caused the unpaired position,
+        # use that timestamp instead of the first detection time. This gives
+        # the soft-recovery and escalate windows a more accurate start.
+        last_fill_ts = getattr(self.broker, "last_fill_ts", lambda _cid: None)(cid)
+        if last_fill_ts is not None and last_fill_ts <= now:
+            start = min(start, last_fill_ts)
+            self._over_since[cid] = start
         if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
             await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:
