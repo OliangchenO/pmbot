@@ -1361,6 +1361,7 @@ class LiveBroker:
                 log.info("LIVE FILL detected %s %s +%.1f shares",
                          market.question[:40],
                          "YES" if token == market.yes_token else "NO", gained)
+                _notify_live_fill(getattr(self, "notifier", None), entry, "BUY")
         self.fills_log = self.fills_log[-500:]
 
         post_poll: dict[str, float] = {}
