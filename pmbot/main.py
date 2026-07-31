@@ -1154,6 +1154,9 @@ class Bot:
             # book and leaves a gap until the next reconcile notices it's gone.
             changed = {q.key() for q in final} != {q.key() for q in current}
             if changed or (final and self.broker.due_for_refresh(m)):
+                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                basis = basis_fn(m) if abs(unpaired) >= MIN_TAKER_SHARES and basis_fn else None
+                cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     complement = m.no_token if unpaired > 0 else m.yes_token
                     recovery_quote = next((q for q in final if q.token_id == complement), None)
@@ -1162,9 +1165,6 @@ class Bot:
                             m, unpaired=unpaired, quote=recovery_quote,
                             yes_book=yes_book, no_book=no_book, pricing=pricing,
                             pair_cap=cap)
-                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
-                basis = basis_fn(m) if abs(unpaired) >= MIN_TAKER_SHARES and basis_fn else None
-                cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
                 # ── pair-cap with soft-window awareness for audit ──
                 audit_cap = cap
                 if basis is not None and cap is not None:
