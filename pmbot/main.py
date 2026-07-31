@@ -840,17 +840,23 @@ class Bot:
     @staticmethod
     def _log_inventory_recovery_quote(
             market: gamma.Market, *, unpaired: float, quote: strategy.Quote,
-            yes_book: Book, no_book: Book, pricing: dict[str, float]) -> None:
+            yes_book: Book, no_book: Book, pricing: dict[str, float],
+            pair_cap: float | None = None) -> None:
         """Log the quote inputs needed to reconstruct a complement bid."""
         held = "YES" if unpaired > 0 else "NO"
         quote_token = "YES" if quote.token_id == market.yes_token else "NO"
+        soft_flag = ""
+        if pair_cap is not None and quote.price > pair_cap + 1e-9:
+            soft_flag = f" soft=+{(quote.price - pair_cap) * 100:.1f}c"
+        held_cn = {"YES": "持有YES", "NO": "持有NO"}
         log.info(
-            "INVENTORY_RECOVERY_QUOTE market='%s' held=%s %.0f quote=BUY %s %.0f @ %.3f "
-            "yes_book=%.3fx%.0f/%.3fx%.0f no_book=%.3fx%.0f/%.3fx%.0f "
-            "micro=%.3f flow=%.3f drift=%+.4f fair=%.3f base_offset=%.4f "
-            "adaptive_offset=%+.4f offset=%.4f skew=%+.4f fade_yes=%.4f fade_no=%.4f "
-            "normal_quotes=yes@%.3f,no@%.3f",
-            market.question[:80], held, abs(unpaired), quote_token, quote.size, quote.price,
+            "补单挂出 market='%s' %s %.0f 方向=买%s %.0f 报价=%.3f "
+            "YES簿=%.3fx%.0f/%.3fx%.0f NO簿=%.3fx%.0f/%.3fx%.0f "
+            "微价=%.3f 流量=%.3f 漂移=%+.4f 公允=%.3f 基差=%.4f "
+            "自适应=%+.4f 偏移=%.4f 偏斜=%+.4f 衰减YES=%.4f 衰减NO=%.4f "
+            "正常价=yes@%.3f,no@%.3f%s",
+            market.question[:80], held_cn.get(held, held), abs(unpaired),
+            quote_token, quote.size, quote.price,
             yes_book.best_bid, yes_book.bids.get(yes_book.best_bid, 0.0),
             yes_book.best_ask, yes_book.asks.get(yes_book.best_ask, 0.0),
             no_book.best_bid, no_book.bids.get(no_book.best_bid, 0.0),
@@ -859,6 +865,7 @@ class Bot:
             pricing["fair"], pricing["base_offset"], pricing["adaptive_offset"],
             pricing["offset"], pricing["skew"], pricing["fade_yes"], pricing["fade_no"],
             pricing["yes_bid_quote"], pricing["no_bid_quote"],
+            soft_flag,
         )
 
     def _log_inventory_recovery_skip(
@@ -877,17 +884,35 @@ class Bot:
             return f"{book.best_bid:.3f}/{book.best_ask:.3f}"
 
         basis_text = "unknown" if basis is None else f"{basis:.3f}"
+        reason_cn = {
+            "near_resolution": "临近结算",
+            "stale_book": "订单簿过期",
+            "unquotable_book": "订单簿不可报价",
+            "theme_inventory_cap": "主题库存上限",
+            "unknown_cost_basis": "成本基准未知",
+            "no_complement_quote": "无互补报价",
+            "below_current_clob_min_order_size": "低于当前最小挂单量",
+            "strategy_no_quote": "策略无报价",
+        }
         log.warning(
-            "INVENTORY_RECOVERY_SKIPPED market='%s' reason=%s unpaired=%.0f "
-            "basis=%s yes_book=%s no_book=%s",
-            market.question[:80], reason, unpaired, basis_text,
+            "补单跳过 market='%s' 原因=%s 敞口=%.0f 成本基准=%s YES簿=%s NO簿=%s",
+            market.question[:80], reason_cn.get(reason, reason), unpaired, basis_text,
             top(yes_book), top(no_book),
         )
 
     def _inventory_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
-                                   unpaired: float) -> list[strategy.Quote]:
-        """Keep only a capped complement bid while a market is unpaired."""
+                                   unpaired: float,
+                                   now: float | None = None) -> list[strategy.Quote]:
+        """Keep only a capped complement bid while a market is unpaired.
+
+        During the soft recovery window (first N minutes after unpaired
+        inventory appears), the complement bid is allowed to exceed the
+        break-even cap by ``recovery_max_loss_cents`` — a small known loss
+        that improves fill probability while the market is still near the
+        original trade price. After the window expires the hard pair-cap
+        resumes as the backstop.
+        """
         if abs(unpaired) < MIN_TAKER_SHARES:
             return desired
         complement = m.no_token if unpaired > 0 else m.yes_token
@@ -899,6 +924,17 @@ class Bot:
         if basis is None:
             return []
         max_price = self._forced_hedge_max_price(m, basis)
+        # ── soft recovery window ──
+        if now is not None:
+            r = self.cfg["risk"]
+            soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
+            soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
+            if soft_loss > 0 and soft_window > 0:
+                over_since = self._over_since.get(m.condition_id)
+                if over_since is not None and now - over_since <= soft_window:
+                    relaxed = min(1.0 - m.tick, max_price + soft_loss)
+                    if relaxed > max_price:
+                        max_price = relaxed
         return [strategy.Quote(q.token_id, min(q.price, max_price),
                                min(q.size, abs(unpaired)))
                 for q in desired
@@ -934,18 +970,20 @@ class Bot:
 
     def _cooldown_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
-                                   unpaired: float) -> list[strategy.Quote]:
+                                   unpaired: float,
+                                   now: float | None = None) -> list[strategy.Quote]:
         """Keep only risk-reducing complementary bids during market cooldown."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        return self._inventory_recovery_quotes(m, desired, unpaired)
+        return self._inventory_recovery_quotes(m, desired, unpaired, now)
 
     def _held_market_recovery_quotes(self, m: gamma.Market, desired: list[strategy.Quote],
-                                     unpaired: float) -> list[strategy.Quote]:
+                                     unpaired: float,
+                                     now: float | None = None) -> list[strategy.Quote]:
         """Held-only markets may only quote the inventory-reducing complement."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        return self._inventory_recovery_quotes(m, desired, unpaired)
+        return self._inventory_recovery_quotes(m, desired, unpaired, now)
 
     def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
                               exposure_usd: float, threshold_usd: float,
@@ -1009,7 +1047,7 @@ class Bot:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="near_resolution")
                 if self.broker.open_quotes(m):
-                    log.warning("'%s' resolves in %.1fh — exiting market", m.question[:45], h)
+                    log.warning("'%s' %.1f小时后结算 — 退出市场", m.question[:45], h)
                     updates.append((m, [], None))
                 continue
             yes_book = self.tracker.books[m.yes_token]
@@ -1025,8 +1063,8 @@ class Bot:
                         m, unpaired=unpaired, reason="stale_book",
                         yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
-                    log.warning("feed/book stale (feed %.0fs, book %.0fs) — "
-                                "pulling quotes from '%s'",
+                    log.warning("数据源/订单簿过期 (数据源%.0fs, 订单簿%.0fs) — "
+                                "撤下 '%s' 报价",
                                 feed_age, book_age, m.question[:45])
                     updates.append((m, [], None))
                 continue
@@ -1041,7 +1079,7 @@ class Bot:
                         m, unpaired=unpaired, reason="unquotable_book",
                         yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
-                    log.warning("book not quotable on both sides — pulling '%s'",
+                    log.warning("订单簿双向不可报价 — 撤下 '%s'",
                                 m.question[:45])
                     updates.append((m, [], None))
                 continue
@@ -1053,7 +1091,7 @@ class Bot:
                         m, unpaired=unpaired, reason="theme_inventory_cap",
                         yes_book=yes_book, no_book=no_book)
                 if self.broker.open_quotes(m):
-                    log.warning("theme inventory cap — not quoting '%s'",
+                    log.warning("主题库存上限 — '%s' 不报价",
                                 m.question[:45])
                     updates.append((m, [], None))
                 continue
@@ -1088,13 +1126,13 @@ class Bot:
             normal_desired = desired
             recovery_path = "normal"
             if m.condition_id not in selected_cids:
-                desired = self._held_market_recovery_quotes(m, desired, unpaired)
+                desired = self._held_market_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "inventory_recovery"
             elif cooled_down:
-                desired = self._cooldown_recovery_quotes(m, desired, unpaired)
+                desired = self._cooldown_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "cooldown_recovery"
             else:
-                desired = self._inventory_recovery_quotes(m, desired, unpaired)
+                desired = self._inventory_recovery_quotes(m, desired, unpaired, now)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     recovery_path = "inventory_recovery"
                 desired = self._filter_quotes_for_side_guard(
@@ -1127,23 +1165,37 @@ class Bot:
             # book and leaves a gap until the next reconcile notices it's gone.
             changed = {q.key() for q in final} != {q.key() for q in current}
             if changed or (final and self.broker.due_for_refresh(m)):
+                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                basis = basis_fn(m) if abs(unpaired) >= MIN_TAKER_SHARES and basis_fn else None
+                cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     complement = m.no_token if unpaired > 0 else m.yes_token
                     recovery_quote = next((q for q in final if q.token_id == complement), None)
                     if recovery_quote is not None:
                         self._log_inventory_recovery_quote(
                             m, unpaired=unpaired, quote=recovery_quote,
-                            yes_book=yes_book, no_book=no_book, pricing=pricing)
-                basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
-                basis = basis_fn(m) if abs(unpaired) >= MIN_TAKER_SHARES and basis_fn else None
-                cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
+                            yes_book=yes_book, no_book=no_book, pricing=pricing,
+                            pair_cap=cap)
+                # ── pair-cap with soft-window awareness for audit ──
+                audit_cap = cap
+                if basis is not None and cap is not None:
+                    r = self.cfg["risk"]
+                    soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
+                    soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
+                    if soft_loss > 0 and soft_window > 0:
+                        over_since = self._over_since.get(m.condition_id)
+                        if over_since is not None and now - over_since <= soft_window:
+                            relaxed = min(1.0 - m.tick, cap + soft_loss)
+                            if relaxed > cap:
+                                audit_cap = relaxed
                 audit_context = {}
                 for q in final:
                     fee = m.fee_bps / 10_000.0 * (q.price * (1.0 - q.price)) ** m.fee_exponent
                     audit_context[q.token_id] = {
                         "path": recovery_path,
                         "unpaired_cost": basis,
-                        "pair_cap": cap,
+                        "pair_cap": audit_cap,
+                        "strike_pair_cap": cap,
                         "expected_pair_pnl": 1.0 - basis - q.price - fee if basis is not None else None,
                     }
                 updates.append((m, final, audit_context))
@@ -1208,16 +1260,28 @@ class Bot:
         if ask is None or bid is None or ask - bid > max_spread:
             if passive:
                 await self._update_exit_sell(m, unpaired)
-            log.warning("forced hedge needed in '%s' but complement book is "
-                        "wide/empty — retrying shortly", m.question[:45])
+            log.warning("需强制对冲市场 '%s' 但互补簿价差过大/无深度 — 稍后重试", m.question[:45])
             return
         basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
         basis = basis_fn(m) if basis_fn else None
         if not self._forced_hedge_allowed(
                 m, urgent=urgent, exposure_usd=exposure, threshold_usd=threshold,
                 risk_since=start, now=now, wait_secs=wait, basis=basis, ask=ask):
-            log.warning("forced hedge deferred in '%s': awaiting escalation or pair-cost cap",
-                        m.question[:45])
+            escalated = (urgent or abs(exposure) >= threshold
+                         or now - start >= wait)
+            cap = self._forced_hedge_max_price(m, basis) if basis is not None else None
+            if not escalated:
+                waited = now - start
+                remaining = max(0.0, wait - waited)
+                detail = f"等待 {waited:.0f}/{wait:.0f}秒"
+            elif cap is not None and ask > cap + 1e-9:
+                over = (ask - cap) * 100.0
+                detail = f"卖价={ask:.3f} 超保本价{over:.1f}分 pair_cap={cap:.3f}"
+            elif basis is None:
+                detail = "成本基准未知"
+            else:
+                detail = "未知"
+            log.warning("强制对冲推迟 '%s': %s", m.question[:45], detail)
             return
         await self._broker_call(self.broker.set_exit, m, None)
         price = self._forced_hedge_max_price(m, basis)
@@ -1234,8 +1298,7 @@ class Bot:
                 self.broker.taker_buy, m, token, abs(unpaired), price, audit_context)
         if filled > 0:
             self._over_since.pop(cid, None)
-            log.warning("FORCED HEDGE '%s': bought %.0f %s @ %.3f to pair off "
-                        "$%.0f exposure", m.question[:45], filled,
+            log.warning("强制对冲 '%s': 买入 %.0f 股%s @ %.3f 配平 $%.0f 敞口", m.question[:45], filled,
                         "NO" if excess_yes else "YES", price, abs(exposure))
 
     async def _update_exit_sell(self, m: gamma.Market, unpaired: float) -> None:

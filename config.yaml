@@ -313,6 +313,12 @@ risk:
   # open-ended binary risk.
   flatten_threshold_usd: 15
   flatten_after_secs: 90
+  # Soft recovery window: for the first N minutes after unpaired inventory
+  # appears, allow the complement bid to exceed the break-even cap by up to
+  # this many cents per share — a small known loss to improve fill probability
+  # while the market is still near the original trade price.
+  recovery_soft_window_minutes: 30
+  recovery_max_loss_cents: 1.5
   # Cap combined |net exposure| across markets that share a theme keyword
   # (e.g. three Iran date markets stacking to $40 while each stays under the
   # per-market flatten threshold). Scales with equity like other USD limits.
