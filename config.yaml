@@ -126,6 +126,9 @@ scanner:
     - temperature
     - highest temp
     - lowest temp
+    - typhoon
+    - hurricane
+    - cyclone
     - "°c"
     - "°f"
     - spx
