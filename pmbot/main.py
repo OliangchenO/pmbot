@@ -1279,6 +1279,8 @@ class Bot:
         unpaired = self.broker.unpaired_shares(m)
         if abs(unpaired) < MIN_TAKER_SHARES:
             self._over_since.pop(cid, None)
+            if hasattr(self.broker, "unpaired_since"):
+                self.broker.unpaired_since.pop(cid, None)
             await self._broker_call(self.broker.set_exit, m, None)
             return
         exposure = self.broker.net_yes_exposure_usd(m)
@@ -1298,6 +1300,11 @@ class Bot:
         if last_fill_ts is not None and last_fill_ts <= now:
             start = min(start, last_fill_ts)
             self._over_since[cid] = start
+        # Persist unpaired_since to survive restarts. PaperBroker saves via
+        # _persist(); LiveBroker mirrors to fills_log (ts of the last fill
+        # for this cid is already persisted via last_fill_ts).
+        if hasattr(self.broker, "unpaired_since"):
+            self.broker.unpaired_since[cid] = self._over_since[cid]
         if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
             await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:
@@ -1349,6 +1356,8 @@ class Bot:
                 self.broker.taker_buy, m, token, abs(unpaired), price, audit_context)
         if filled > 0:
             self._over_since.pop(cid, None)
+            if hasattr(self.broker, "unpaired_since"):
+                self.broker.unpaired_since.pop(cid, None)
             log.warning("强制对冲 '%s': 买入 %.0f 股%s @ %.3f 配平 $%.0f 敞口", m.question[:45], filled,
                         "NO" if excess_yes else "YES", price, abs(exposure))
 

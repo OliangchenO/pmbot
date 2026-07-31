@@ -156,6 +156,7 @@ class PaperBroker:
         self.state = PaperState(cash=capital, start_equity=capital)
         self.tracker = tracker
         self.latency = latency_secs
+        self.unpaired_since: dict[str, float] = {}
         self._quotes: dict[str, list[PaperQuoteState]] = {}
         self._exits: dict[str, PaperQuoteState] = {}
         # Quotes whose cancel is still in flight: list of (quote, fillable_until).
@@ -573,6 +574,7 @@ class PaperBroker:
                 "cash": self.state.cash,
                 "est_rewards": self.state.est_rewards,
                 "fills": self.state.fills_log[-200:],
+                "unpaired_since": getattr(self, "unpaired_since", {}),
             }, indent=2))
         except OSError as e:
             log.warning("could not persist state: %s", e)
