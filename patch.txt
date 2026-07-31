@@ -1,0 +1,5 @@
+    # 允许补单的软性亏损（仅第一阶段），可以随着成交价和市场价值实际差距来判断是否要持续承受一定的亏损，所以可以考虑设置为实际最大亏损
+    recovery_soft_window_minutes: 30
+    recovery_max_loss_cents: 5
+    # 软性补单窗口过期后，升级补单报价到正常的公允价格附近，只挂补单方向
+    recovery_escalate_after_minutes: 30

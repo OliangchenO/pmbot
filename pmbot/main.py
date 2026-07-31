@@ -962,18 +962,43 @@ class Bot:
                                    desired: list[strategy.Quote],
                                    unpaired: float,
                                    now: float | None = None) -> list[strategy.Quote]:
-        """Keep only risk-reducing complementary bids during market cooldown."""
+        """Keep only risk-reducing complementary bids during market cooldown.
+
+        Cooldown markets also escalate after the window, same as held-only."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
+        escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
+        if now is not None and escalate_secs > 0:
+            over_since = self._over_since.get(m.condition_id)
+            if over_since is not None and now - over_since >= escalate_secs:
+                return self._escalated_recovery_quotes(m, desired, unpaired)
         return self._inventory_recovery_quotes(m, desired, unpaired, now)
 
     def _held_market_recovery_quotes(self, m: gamma.Market, desired: list[strategy.Quote],
                                      unpaired: float,
                                      now: float | None = None) -> list[strategy.Quote]:
-        """Held-only markets may only quote the inventory-reducing complement."""
+        """Held-only markets may only quote the inventory-reducing complement.
+
+        After the escalate window has passed, promote to normal fair-price on
+        the complement side only — accepting a small known loss to resolve the
+        stale inventory rather than waiting indefinitely on a pair-cap quote
+        that can never fill.
+        """
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
+        escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
+        if now is not None and escalate_secs > 0:
+            over_since = self._over_since.get(m.condition_id)
+            if over_since is not None and now - over_since >= escalate_secs:
+                return self._escalated_recovery_quotes(m, desired, unpaired)
         return self._inventory_recovery_quotes(m, desired, unpaired, now)
+
+    def _escalated_recovery_quotes(self, m: gamma.Market,
+                                    desired: list[strategy.Quote],
+                                    unpaired: float) -> list[strategy.Quote]:
+        """Phase 2: complement side at normal fair-price, no opposite side."""
+        complement = m.no_token if unpaired > 0 else m.yes_token
+        return [q for q in desired if q.token_id == complement]
 
     def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
                               exposure_usd: float, threshold_usd: float,
@@ -1118,9 +1143,32 @@ class Bot:
             if m.condition_id not in selected_cids:
                 desired = self._held_market_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "inventory_recovery"
+                # Detect escalation: if the complement quote is at fair-price
+                # (not pair-capped), we are in Phase 2.
+                if abs(unpaired) >= MIN_TAKER_SHARES and desired:
+                    complement = m.no_token if unpaired > 0 else m.yes_token
+                    basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                    basis = basis_fn(m) if basis_fn else None
+                    if basis is not None:
+                        cap = self._forced_hedge_max_price(m, basis)
+                        for q in desired:
+                            if q.token_id == complement and q.price > cap + 1e-9:
+                                recovery_path = "escalated_recovery"
+                                break
             elif cooled_down:
                 desired = self._cooldown_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "cooldown_recovery"
+                # Same escalation detection for cooldown markets
+                if abs(unpaired) >= MIN_TAKER_SHARES and desired:
+                    complement = m.no_token if unpaired > 0 else m.yes_token
+                    basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+                    basis = basis_fn(m) if basis_fn else None
+                    if basis is not None:
+                        cap = self._forced_hedge_max_price(m, basis)
+                        for q in desired:
+                            if q.token_id == complement and q.price > cap + 1e-9:
+                                recovery_path = "escalated_recovery"
+                                break
             else:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired, now)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
@@ -1144,9 +1192,16 @@ class Bot:
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])
-            in_band = (len(final) == 2
-                       and any(q.token_id == m.yes_token for q in final)
-                       and any(q.token_id == m.no_token for q in final))
+            # Phase 2 (escalated recovery) only quotes one side — judge "in-band"
+            # by whether the complement is present (not whether both sides are).
+            is_escalated = recovery_path == "escalated_recovery"
+            if is_escalated:
+                complement = m.no_token if unpaired > 0 else m.yes_token
+                in_band = any(q.token_id == complement for q in final)
+            else:
+                in_band = (len(final) == 2
+                           and any(q.token_id == m.yes_token for q in final)
+                           and any(q.token_id == m.no_token for q in final))
             self.metrics.sample_uptime(m.condition_id, in_band)
             # Repost when the quote actually changed OR when a resting order is
             # near GTD expiry — otherwise a stable quote (unchanged key-set) is

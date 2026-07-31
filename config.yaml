@@ -305,6 +305,10 @@ risk:
   # while the market is still near the original trade price.
   recovery_soft_window_minutes: 30
   recovery_max_loss_cents: 1.5
+  # After the soft window expires without a fill, escalate the complement bid
+  # to the normal fair-price band (single-sided, no opposite quote). This
+  # market is added on top of the top-N set — it does NOT consume a scan slot.
+  recovery_escalate_after_minutes: 30
   # Cap combined |net exposure| across markets that share a theme keyword
   # (e.g. three Iran date markets stacking to $40 while each stays under the
   # per-market flatten threshold). Scales with equity like other USD limits.
