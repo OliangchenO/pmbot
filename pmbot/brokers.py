@@ -547,9 +547,13 @@ class PaperBroker:
         ]
 
     def last_fill_ts(self, cid: str) -> float | None:
-        """Timestamp of the most recent fill for this market, if any."""
+        """Timestamp of the most recent fill for this market, if any.
+
+        Only returns timestamps from confirmed fills (entries with a price),
+        not from Data API inferred position changes.
+        """
         for entry in reversed(self.state.fills_log):
-            if entry.get("cid") == cid:
+            if entry.get("cid") == cid and "price" in entry:
                 return float(entry["ts"])
         return None
 
