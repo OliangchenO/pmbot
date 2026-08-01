@@ -110,6 +110,22 @@ def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     return broker
 
 
+def test_inventory_sample_records_current_unpaired_paper_position(tmp_path):
+    bot = _bot(tmp_path)
+    market = _market()
+    broker = _setup(bot, tmp_path, market)
+    broker._fill(market, Quote(market.yes_token, 0.47, 12.0), 12.0)
+
+    bot._sample_inventory(time.time())
+    report = bot.metrics.performance_report()
+    bot.metrics.close()
+
+    row = next(m for m in report["markets"] if m["cid"] == market.condition_id)
+    assert row["inventory_status"] == "unpaired"
+    assert row["unpaired_shares"] == 12.0
+    assert row["unpaired_cost_basis"] == 0.47
+
+
 def test_guard_trip_pulls_quotes_immediately(tmp_path):
     async def scenario():
         bot = _bot(tmp_path)

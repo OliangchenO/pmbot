@@ -56,7 +56,8 @@ class MetricsStore:
             return
         with self._lock:
             for tbl in ("fills", "hedges", "merges", "equity", "markouts",
-                        "quotes"):
+                        "quotes", "inventory_snapshots", "inventory_events",
+                        "market_rewards", "guard_events"):
                 self._conn.execute(f"DELETE FROM {tbl} WHERE ts < ?", (ts,))
             self._conn.execute("DELETE FROM uptime WHERE minute_ts < ?",
                                (int(ts) // 60,))
@@ -99,6 +100,13 @@ class MetricsStore:
                 ts REAL, date TEXT, estimated REAL DEFAULT 0,
                 realized REAL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS market_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, date TEXT, cid TEXT, realized REAL, source TEXT,
+                UNIQUE(date, cid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_rewards_date_cid
+                ON market_rewards (date, cid);
             CREATE TABLE IF NOT EXISTS reward_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 minute_ts INTEGER, cid TEXT, est_usd REAL
@@ -116,6 +124,26 @@ class MetricsStore:
                 unpaired REAL, recovery_path TEXT,
                 quote_price REAL, pair_cap REAL
             );
+            CREATE TABLE IF NOT EXISTS inventory_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, market TEXT,
+                unpaired_shares REAL, cost_basis REAL,
+                exposure_usd REAL, status TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_inventory_snapshots_cid_ts
+                ON inventory_snapshots (cid, ts);
+            CREATE TABLE IF NOT EXISTS inventory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, event TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_inventory_events_cid_ts
+                ON inventory_events (cid, ts);
+            CREATE TABLE IF NOT EXISTS guard_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, scope TEXT, reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_guard_events_cid_ts
+                ON guard_events (cid, ts);
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
@@ -137,15 +165,20 @@ class MetricsStore:
             log.warning("could not append trades log: %s", e)
 
     def record_fill(self, entry: dict) -> None:
+        ts = entry.get("ts", time.time())
         with self._lock:
             self._conn.execute(
                 "INSERT INTO fills (ts,cid,market,side,token,price,size,taker,exit,merged,fee) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (entry.get("ts", time.time()), entry.get("cid"), entry.get("market"),
+                (ts, entry.get("cid"), entry.get("market"),
                  entry.get("side"), entry.get("token"), entry.get("price", 0),
                  entry.get("size", 0), int(bool(entry.get("taker"))),
                  int(bool(entry.get("exit"))), entry.get("merged", 0),
                  entry.get("fee", 0)),
+            )
+            self._conn.execute(
+                "INSERT INTO inventory_events (ts,cid,event) VALUES (?,?,?)",
+                (ts, entry.get("cid"), "exit" if entry.get("exit") else "fill"),
             )
             self._conn.commit()
         self._append_trades_log(entry)
@@ -170,19 +203,31 @@ class MetricsStore:
             )
             self._conn.commit()
 
-    def record_hedge(self, cid: str, price: float, size: float) -> None:
+    def record_hedge(self, cid: str, price: float, size: float,
+                     ts: float | None = None) -> None:
+        ts = time.time() if ts is None else ts
         with self._lock:
             self._conn.execute(
                 "INSERT INTO hedges (ts, cid, price, size) VALUES (?,?,?,?)",
-                (time.time(), cid, price, size),
+                (ts, cid, price, size),
+            )
+            self._conn.execute(
+                "INSERT INTO inventory_events (ts,cid,event) VALUES (?,?,?)",
+                (ts, cid, "hedge"),
             )
             self._conn.commit()
 
-    def record_merge(self, cid: str, pairs: float) -> None:
+    def record_merge(self, cid: str, pairs: float,
+                     ts: float | None = None) -> None:
+        ts = time.time() if ts is None else ts
         with self._lock:
             self._conn.execute(
                 "INSERT INTO merges (ts, cid, pairs) VALUES (?,?,?)",
-                (time.time(), cid, pairs),
+                (ts, cid, pairs),
+            )
+            self._conn.execute(
+                "INSERT INTO inventory_events (ts,cid,event) VALUES (?,?,?)",
+                (ts, cid, "merge"),
             )
             self._conn.commit()
 
@@ -217,6 +262,40 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO equity (ts, equity, inventory_usd) VALUES (?,?,?)",
                 (time.time(), equity, inventory_usd),
+            )
+            self._conn.commit()
+
+    def record_inventory_snapshot(
+            self, cid: str, market: str, *, unpaired_shares: float,
+            cost_basis: float | None, exposure_usd: float, status: str,
+            ts: float | None = None) -> None:
+        """Persist a read-only per-market inventory observation.
+
+        ``status`` describes only the observed balance: ``unpaired`` or
+        ``flat``. It never asserts whether a flat balance was merged, sold,
+        redeemed, or reconciled by the exchange.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO inventory_snapshots "
+                "(ts,cid,market,unpaired_shares,cost_basis,exposure_usd,status) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (time.time() if ts is None else ts, cid, market,
+                 unpaired_shares, cost_basis, exposure_usd, status),
+            )
+            self._conn.commit()
+
+    def record_guard_event(self, cid: str, scope: str, reason: str,
+                           ts: float | None = None) -> None:
+        """Persist a quote interruption caused by a risk guard.
+
+        ``reason`` names the observable action (for example
+        ``market_guard_pull``); it does not invent the risk rule that tripped.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO guard_events (ts,cid,scope,reason) VALUES (?,?,?,?)",
+                (time.time() if ts is None else ts, cid, scope, reason),
             )
             self._conn.commit()
 
@@ -297,6 +376,104 @@ class MetricsStore:
             }
         return out
 
+    def reward_calibration_report(self, days: int = 7,
+                                  end_date: str | None = None) -> dict:
+        """Read-only market/day reward calibration from explicitly attributed facts.
+
+        ``market_rewards`` must contain a source-specific market amount before
+        a ratio is emitted.  An account-level daily reward is intentionally not
+        allocated to market rows, so missing attribution remains inconclusive.
+        """
+        if days < 1:
+            raise ValueError("days must be positive")
+        end = (datetime.strptime(end_date, "%Y-%m-%d").date()
+               if end_date else datetime.now(timezone.utc).date())
+        start = end - timedelta(days=days - 1)
+        start_date = start.strftime("%Y-%m-%d")
+        end_date = end.strftime("%Y-%m-%d")
+        start_minute = int(datetime.combine(start, datetime.min.time(),
+                                            tzinfo=timezone.utc).timestamp()) // 60
+        end_minute = start_minute + days * 1440
+
+        rows: dict[tuple[str, str], dict] = {}
+
+        def _row(day: str, cid: str) -> dict:
+            return rows.setdefault((day, cid), {
+                "date": day, "cid": cid, "estimated_usd": 0.0,
+                "realized_usd": None, "calibration_ratio": None,
+                "status": "unattributed", "uptime_samples": 0,
+                "uptime_pct": None, "recovery_skips": 0,
+                "recovery_skip_reasons": {},
+                "guard_interruptions_status": "not_recorded",
+                "guard_interruptions": 0,
+                "guard_interruption_reasons": {},
+            })
+
+        for day, cid, estimated in self._conn.execute(
+            "SELECT strftime('%Y-%m-%d', minute_ts*60, 'unixepoch'), cid, "
+            "COALESCE(SUM(est_usd),0) FROM reward_samples "
+            "WHERE minute_ts>=? AND minute_ts<? GROUP BY 1, cid",
+            (start_minute, end_minute),
+        ):
+            _row(day, cid)["estimated_usd"] = estimated or 0.0
+        for day, cid, realized, source in self._conn.execute(
+            "SELECT date,cid,realized,source FROM market_rewards "
+            "WHERE date>=? AND date<=?",
+            (start_date, end_date),
+        ):
+            row = _row(day, cid)
+            if row["estimated_usd"] <= 0:
+                row["status"] = "missing_estimate"
+            row["realized_usd"] = realized
+            row["source"] = source
+            if row["estimated_usd"] > 0:
+                row["calibration_ratio"] = realized / row["estimated_usd"]
+                row["status"] = "calibrated"
+
+        for day, cid, n, in_band in self._conn.execute(
+            "SELECT strftime('%Y-%m-%d', minute_ts*60, 'unixepoch'), cid, "
+            "COUNT(*), COALESCE(SUM(in_band),0) FROM uptime "
+            "WHERE minute_ts>=? AND minute_ts<? GROUP BY 1, cid",
+            (start_minute, end_minute),
+        ):
+            row = _row(day, cid)
+            row["uptime_samples"] = n
+            row["uptime_pct"] = (in_band / n * 100.0) if n else None
+
+        for day, cid, reason, n in self._conn.execute(
+            "SELECT strftime('%Y-%m-%d', ts, 'unixepoch'), cid, reason, COUNT(*) "
+            "FROM recovery_events WHERE ts>=? AND ts<? AND event='skip' "
+            "GROUP BY 1, cid, reason",
+            (start_minute * 60, end_minute * 60),
+        ):
+            row = _row(day, cid)
+            row["recovery_skips"] += n
+            row["recovery_skip_reasons"][reason or "unknown"] = n
+
+        for day, cid, reason, n in self._conn.execute(
+            "SELECT strftime('%Y-%m-%d', ts, 'unixepoch'), cid, reason, COUNT(*) "
+            "FROM guard_events WHERE ts>=? AND ts<? GROUP BY 1, cid, reason",
+            (start_minute * 60, end_minute * 60),
+        ):
+            row = _row(day, cid)
+            row["guard_interruptions_status"] = "recorded"
+            row["guard_interruptions"] += n
+            row["guard_interruption_reasons"][reason or "unknown"] = n
+
+        market_days = sorted(rows.values(), key=lambda r: (r["date"], r["cid"]))
+        calibrated = [r for r in market_days if r["status"] == "calibrated"]
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "market_days": market_days,
+            "summary": {
+                "market_days": len(market_days),
+                "calibrated_market_days": len(calibrated),
+                "unattributed_market_days": sum(
+                    r["status"] == "unattributed" for r in market_days),
+            },
+        }
+
     def record_realized_reward(self, date: str, usd: float) -> None:
         with self._lock:
             row = self._conn.execute(
@@ -312,6 +489,64 @@ class MetricsStore:
                     (time.time(), date, usd),
                 )
             self._conn.commit()
+
+    def record_market_realized_reward(self, date: str, cid: str, usd: float,
+                                      source: str) -> None:
+        """Upsert one explicitly attributed realized reward amount.
+
+        This is intentionally separate from the CLOB account-day total in
+        ``rewards``.  A caller must supply a source that actually identifies
+        the market; no estimated or prorated allocation is accepted here.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO market_rewards (ts,date,cid,realized,source) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(date,cid) DO UPDATE SET "
+                "ts=excluded.ts, realized=excluded.realized, source=excluded.source",
+                (time.time(), date, cid, usd, source),
+            )
+            self._conn.commit()
+
+    def fetch_market_realized_rewards(self, client, date: str | None = None) -> int:
+        """Import official, condition-id-attributed reward rows for one UTC day.
+
+        The account-total endpoint deliberately remains the source of the daily
+        total.  This companion import only records rows that the official CLOB
+        response identifies with ``condition_id``; it never allocates a wallet
+        total across markets.
+        """
+        date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.inception_date and date < self.inception_date:
+            return 0
+        fetch = getattr(client, "get_earnings_for_user_for_day", None)
+        if fetch is None:
+            log.debug("market reward endpoint unavailable for %s", date)
+            return 0
+        try:
+            rows = fetch(date)
+        except Exception as e:  # noqa: BLE001
+            log.debug("market rewards fetch failed for %s: %s", date, e)
+            return 0
+        if isinstance(rows, dict):
+            rows = rows.get("data") or rows.get("earnings") or []
+        imported = 0
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("condition_id") or item.get("conditionId")
+            if not cid:
+                continue
+            try:
+                earnings = float(item.get("earnings") or item.get("amount")
+                                 or item.get("reward") or 0.0)
+                rate = float(item.get("asset_rate") or 1.0)
+            except (TypeError, ValueError):
+                continue
+            self.record_market_realized_reward(
+                date, str(cid), earnings * rate, "clob_rewards_user")
+            imported += 1
+        return imported
 
     def sample_uptime(self, cid: str, in_band: bool) -> None:
         self._uptime_samples.setdefault(cid, []).append(in_band)
@@ -404,6 +639,7 @@ class MetricsStore:
             return 0.0
         total = self._sum_earnings(rows)
         self.record_realized_reward(date, total)
+        self.fetch_market_realized_rewards(client, date)
         return total
 
     def backfill_realized_rewards(self, client, days: int = 7) -> dict[str, float]:
@@ -737,8 +973,36 @@ class MetricsStore:
                     "taker_fills": 0,
                     "exits": 0,
                     "merged_pairs": 0.0,
+                    "buy_cost_usd": 0.0,
+                    "exit_proceeds_usd": 0.0,
+                    "merge_proceeds_usd": 0.0,
                     "hedge_cost_usd": 0.0,
                     "fees_usd": 0.0,
+                    "trading_pnl_usd": 0.0,
+                    "selection_cashflow_usd": None,
+                    "cashflow_attribution_status": None,
+                    "carry_in_yes_shares": 0.0,
+                    "carry_in_no_shares": 0.0,
+                    "carry_in_paired_shares": 0.0,
+                    "cross_day_merge_pairs_upper_bound": 0.0,
+                    "cross_day_exit_shares_upper_bound": 0.0,
+                    "est_rewards_usd": 0.0,
+                    "realized_rewards_usd": None,
+                    "reward_attribution_status": None,
+                    "reward_calibration_ratio": None,
+                    "net_pnl_est_usd": 0.0,
+                    "inventory_status": None,
+                    "unpaired_shares": None,
+                    "unpaired_cost_basis": None,
+                    "inventory_exposure_usd": None,
+                    "unpaired_inventory_mtm_usd": None,
+                    "net_pnl_with_unpaired_mtm_est_usd": None,
+                    "completed_pair_count": 0.0,
+                    "cashflow_per_completed_pair_usd": None,
+                    "trade_event_count": 0,
+                    "last_inventory_event": None,
+                    "inventory_terminal_status": None,
+                    "inventory_terminal_evidence": None,
                     "markout_cents": None,
                     "markout_n": 0,
                     "uptime_pct": 0.0,
@@ -750,21 +1014,34 @@ class MetricsStore:
                 markets[cid]["market"] = name
             return markets[cid]
 
+        day_exit_shares: dict[str, dict[str, float]] = {}
         for row in self._conn.execute(
-            "SELECT cid, market, taker, exit, merged, fee FROM fills "
+            "SELECT cid, market, side, taker, exit, merged, fee, price, size FROM fills "
             "WHERE ts>=? AND ts<?",
             (day_start, day_end),
         ):
-            cid, name, taker, exit_, merged, fee = row
+            cid, name, side, taker, exit_, merged, fee, price, size = row
             m = _ensure(cid, name or "")
             if exit_:
                 m["exits"] += 1
+                m["exit_proceeds_usd"] += (price or 0.0) * (size or 0.0)
+                by_side = day_exit_shares.setdefault(cid, {"YES": 0.0, "NO": 0.0})
+                by_side["YES" if str(side).upper() == "YES" else "NO"] += size or 0.0
             elif taker:
                 m["taker_fills"] += 1
+                m["buy_cost_usd"] += (price or 0.0) * (size or 0.0)
             else:
                 m["maker_fills"] += 1
+                m["buy_cost_usd"] += (price or 0.0) * (size or 0.0)
             m["merged_pairs"] += merged or 0
             m["fees_usd"] += fee or 0
+
+        for cid, proceeds in self._conn.execute(
+            "SELECT cid, COALESCE(SUM(pairs),0) FROM merges "
+            "WHERE ts>=? AND ts<? GROUP BY cid",
+            (day_start, day_end),
+        ):
+            _ensure(cid)["merge_proceeds_usd"] = proceeds
 
         for cid, cost in self._conn.execute(
             "SELECT cid, COALESCE(SUM(price*size),0) FROM hedges "
@@ -812,11 +1089,180 @@ class MetricsStore:
             elif event == "forced_hedge":
                 m["forced_hedges"] = n
 
+        for cid, estimated in self._conn.execute(
+            "SELECT cid, COALESCE(SUM(est_usd),0) FROM reward_samples "
+            "WHERE minute_ts>=? AND minute_ts<? GROUP BY cid",
+            (minute_start, minute_end),
+        ):
+            _ensure(cid)["est_rewards_usd"] = estimated
+
+        for cid, realized in self._conn.execute(
+            "SELECT cid, realized FROM market_rewards WHERE date=?",
+            (date,),
+        ):
+            m = _ensure(cid)
+            m["realized_rewards_usd"] = realized
+            m["reward_attribution_status"] = "attributed"
+
+        latest_snapshots: dict[str, tuple[float, str]] = {}
+        for row in self._conn.execute(
+            "SELECT s.cid, s.market, s.unpaired_shares, s.cost_basis, "
+            "s.exposure_usd, s.status, s.ts "
+            "FROM inventory_snapshots s "
+            "JOIN ("
+            "  SELECT cid, MAX(id) AS latest_id FROM inventory_snapshots "
+            "  WHERE ts>=? AND ts<? GROUP BY cid"
+            ") latest ON latest.latest_id=s.id",
+            (day_start, day_end),
+        ):
+            cid, name, unpaired, basis, exposure, status, snapshot_ts = row
+            m = _ensure(cid, name or "")
+            m["inventory_status"] = status
+            m["unpaired_shares"] = unpaired
+            m["unpaired_cost_basis"] = basis
+            m["inventory_exposure_usd"] = exposure
+            m["unpaired_inventory_mtm_usd"] = exposure
+            latest_snapshots[cid] = (snapshot_ts, status)
+
+        for cid, event in self._conn.execute(
+            "SELECT e.cid, e.event FROM inventory_events e "
+            "JOIN ("
+            "  SELECT cid, MAX(id) AS latest_id FROM inventory_events "
+            "  WHERE ts>=? AND ts<? GROUP BY cid"
+            ") latest ON latest.latest_id=e.id",
+            (day_start, day_end),
+        ):
+            _ensure(cid)["last_inventory_event"] = event
+
+        for cid, (flat_ts, status) in latest_snapshots.items():
+            m = markets[cid]
+            if status != "flat":
+                m["inventory_terminal_status"] = "unresolved"
+                m["inventory_terminal_evidence"] = "latest_snapshot_unpaired"
+                continue
+            prior = self._conn.execute(
+                "SELECT ts, unpaired_shares FROM inventory_snapshots "
+                "WHERE cid=? AND ts>=? AND ts<=? "
+                "AND ABS(COALESCE(unpaired_shares,0))>? "
+                "ORDER BY id DESC LIMIT 1",
+                (cid, day_start, flat_ts, 1e-9),
+            ).fetchone()
+            if prior is None:
+                m["inventory_terminal_status"] = "unresolved"
+                m["inventory_terminal_evidence"] = "no_prior_unpaired_snapshot"
+                continue
+            opened_ts, unpaired = prior
+            needed = abs(float(unpaired))
+            merged = self._conn.execute(
+                "SELECT COALESCE(SUM(pairs),0) FROM merges "
+                "WHERE cid=? AND ts>=? AND ts<=?",
+                (cid, opened_ts, flat_ts),
+            ).fetchone()[0]
+            if merged >= needed:
+                m["inventory_terminal_status"] = "paired"
+                m["inventory_terminal_evidence"] = "confirmed_merge"
+                continue
+            exited = self._conn.execute(
+                "SELECT COALESCE(SUM(size),0) FROM fills "
+                "WHERE cid=? AND exit=1 AND side=? AND ts>=? AND ts<=?",
+                (cid, "YES" if unpaired > 0 else "NO", opened_ts, flat_ts),
+            ).fetchone()[0]
+            if exited >= needed:
+                m["inventory_terminal_status"] = "exit"
+                m["inventory_terminal_evidence"] = "reduce_only_exit"
+                continue
+            hedged = self._conn.execute(
+                "SELECT COALESCE(SUM(size),0) FROM hedges "
+                "WHERE cid=? AND ts>=? AND ts<=?",
+                (cid, opened_ts, flat_ts),
+            ).fetchone()[0]
+            if hedged >= needed:
+                m["inventory_terminal_status"] = "hedged"
+                m["inventory_terminal_evidence"] = "forced_complement_buy"
+            else:
+                m["inventory_terminal_status"] = "unresolved"
+                m["inventory_terminal_evidence"] = "insufficient_disposition_quantity"
+
+        account_realized = self._conn.execute(
+            "SELECT COALESCE(SUM(realized),0) FROM rewards WHERE date=?",
+            (date,),
+        ).fetchone()[0]
+        prior_tokens: dict[str, dict[str, float]] = {}
+        for cid, yes, no in self._conn.execute(
+            "SELECT cid, "
+            "COALESCE(SUM(CASE WHEN side='YES' AND exit=0 THEN size "
+            "WHEN side='YES' AND exit=1 THEN -size ELSE 0 END),0), "
+            "COALESCE(SUM(CASE WHEN side='NO' AND exit=0 THEN size "
+            "WHEN side='NO' AND exit=1 THEN -size ELSE 0 END),0) "
+            "FROM fills WHERE ts<? GROUP BY cid",
+            (day_start,),
+        ):
+            prior_tokens[cid] = {"YES": yes or 0.0, "NO": no or 0.0}
+        for cid, pairs in self._conn.execute(
+            "SELECT cid, COALESCE(SUM(pairs),0) FROM merges "
+            "WHERE ts<? GROUP BY cid",
+            (day_start,),
+        ):
+            state = prior_tokens.setdefault(cid, {"YES": 0.0, "NO": 0.0})
+            state["YES"] -= pairs or 0.0
+            state["NO"] -= pairs or 0.0
+        for m in markets.values():
+            m["trading_pnl_usd"] = (
+                m["merge_proceeds_usd"]
+                + m["exit_proceeds_usd"]
+                - m["buy_cost_usd"]
+                - m["fees_usd"]
+            )
+            # This is deliberately an estimate: realized rewards are only
+            # available as a daily account-level total, not per market.
+            m["net_pnl_est_usd"] = m["trading_pnl_usd"] + m["est_rewards_usd"]
+            if m["unpaired_inventory_mtm_usd"] is not None:
+                m["net_pnl_with_unpaired_mtm_est_usd"] = (
+                    m["net_pnl_est_usd"] + m["unpaired_inventory_mtm_usd"])
+            m["completed_pair_count"] = m["merge_proceeds_usd"]
+            m["trade_event_count"] = (
+                m["maker_fills"] + m["taker_fills"] + m["exits"])
+            if m["realized_rewards_usd"] is not None:
+                est = m["est_rewards_usd"]
+                m["reward_calibration_ratio"] = (
+                    m["realized_rewards_usd"] / est if est > 0 else None
+                )
+            else:
+                m["reward_attribution_status"] = (
+                    "account_total_only" if account_realized else "unavailable"
+                )
+
+            carry = prior_tokens.get(m["cid"], {"YES": 0.0, "NO": 0.0})
+            carry_yes = max(0.0, carry["YES"])
+            carry_no = max(0.0, carry["NO"])
+            carry_pairs = min(carry_yes, carry_no)
+            m["carry_in_yes_shares"] = carry_yes
+            m["carry_in_no_shares"] = carry_no
+            m["carry_in_paired_shares"] = carry_pairs
+            m["cross_day_merge_pairs_upper_bound"] = min(
+                m["merge_proceeds_usd"], carry_pairs)
+            exits = day_exit_shares.get(m["cid"], {"YES": 0.0, "NO": 0.0})
+            m["cross_day_exit_shares_upper_bound"] = (
+                min(exits["YES"], carry_yes) + min(exits["NO"], carry_no)
+            )
+            has_closing_cashflow = bool(m["merge_proceeds_usd"] or sum(exits.values()))
+            if (m["cross_day_merge_pairs_upper_bound"] > 1e-9
+                    or m["cross_day_exit_shares_upper_bound"] > 1e-9):
+                m["cashflow_attribution_status"] = "mixed_with_carry_in"
+            elif has_closing_cashflow:
+                m["cashflow_attribution_status"] = "same_day_cashflow"
+                m["selection_cashflow_usd"] = m["trading_pnl_usd"]
+                if m["completed_pair_count"] > 0:
+                    m["cashflow_per_completed_pair_usd"] = (
+                        m["selection_cashflow_usd"] / m["completed_pair_count"])
+            else:
+                m["cashflow_attribution_status"] = "no_closing_cashflow"
+
         rows = sorted(
             markets.values(),
             key=lambda r: (
+                r["net_pnl_est_usd"],
                 r["maker_fills"] + r["taker_fills"] + r["exits"],
-                r["merged_pairs"],
             ),
             reverse=True,
         )

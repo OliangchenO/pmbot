@@ -39,10 +39,17 @@
 
 **目的：** 让每个 `condition_id` 都能回答“赚/亏多少、来自哪里、证据是什么”。
 
-- [ ] 为 fill、merge、hedge、exit 和 reward 建立可按 `cid` 汇总的经济归因。
-- [ ] 记录未配对库存的加权成本、数量、最新估值和状态（`open` / `paired` / `exit` / `hedged` / `unresolved`）。
-- [ ] 在 `performance` 中增加每市场：已实现奖励、交易现金流、库存 MTM、净收益、每对净收益、样本数。
-- [ ] 为跨日未配对库存设置归因规则，避免把旧库存的结算现金流误记到当日选市表现。
+- [x] 为 fill、merge、hedge、exit 和 reward 建立可按 `cid` 汇总的经济归因。
+- [x] 已在 `performance` 增加单市场买入成本、合并收入、交易现金流、预估奖励和预估净收益。
+- [x] 仅使用可由本地账本精确核对的成交、合并、退出、手续费与预估奖励；未做市场级已实现奖励或 MTM 的猜测分摊。
+- [x] 每分钟记录未配对库存的数量、成本基准、敞口估值和观测状态（`unpaired` / `flat`）。
+- [x] 记录最近一次 `fill` / `exit` / `hedge` / `merge` 库存事件，并在 `performance` 展示。
+- [x] 将库存终态区分为 `paired` / `exit` / `hedged` / `unresolved`：仅在 `flat` 快照之后，有足量 merge、同侧 reduce-only exit 或 forced complement hedge 时标记为对应终态。
+- [x] 已联结事件与后续快照形成可证明终态；证据不足、没有先前裸仓快照或当前仍有裸仓时一律保持 `unresolved`。
+- [x] 新增带来源的市场级已实现奖励账本；`performance` 仅在存在显式市场来源时显示已实现奖励和兑现率，否则明确标为“仅账户汇总”或“无数据”。
+- [x] 接入可验证的官方逐市场奖励明细；通过官方 `get_earnings_for_user_for_day()` 的 `condition_id` 行写入 `market_rewards`，账户日汇总不做比例分摊。
+- [x] 在 `performance` 中增加未配对库存 MTM、含该 MTM 的预估净收益、已完成对数、可归因的每对现金流和交易事件样本数。
+- [x] 为跨日库存设置保守归因规则：从日初前的净 YES/NO token 和已 merge 数量计算 carry-in 上界；当日 merge/exit 可能消耗旧库存时标为 `mixed_with_carry_in`，不归因到当日选市现金流。
 
 **涉及文件：** `pmbot/metrics.py`、`pmbot/brokers.py`、`pmbot/main.py`、`tests/test_metrics.py`、`tests/test_brokers.py`。
 
@@ -52,12 +59,13 @@
 
 **目的：** 把“预估奖励”转换为有历史误差边界的运营信号。
 
-- [ ] 按市场和日期计算 `realized_reward / estimated_reward` 校准系数。
-- [ ] 样本不足时明确显示“未校准”，不把系数默认为 1。
-- [ ] 在报告中同时展示奖励兑现率、in-band uptime 和 quote/guard 中断原因。
-- [ ] 仅记录影子净收益分数，不改变选市和下单行为。
+- [x] 按市场和日期计算 `realized_reward / estimated_reward` 校准系数；仅在市场级实际奖励有显式来源、且预估值大于零时计算。
+- [x] 样本不足、缺少市场奖励来源或缺少预估时明确显示 `unattributed` / `missing_estimate`，不把系数默认为 1。
+- [x] 在校准报告中同时展示奖励兑现率、in-band uptime 和已记录的 recovery 跳过原因。
+- [x] 将普通 quote guard 中断按市场、日期和可观察动作原因写入结构化指标；无事件时仍明确标记为 `guard unrecorded`，不从日志猜测未发生的中断。
+- [x] 新增只读 `reward-calibration --days N` 影子报表；不改变选市和下单行为。
 
-**验收：** 每日可解释“奖励低于预估”是兑现率、低 uptime，还是市场退出；影子数据连续积累至少 7 天。
+**验收：** 每日可解释“奖励低于预估”是兑现率、低 uptime，还是市场退出；影子数据连续积累至少 7 天。实现已完成，连续 7 天属于后续真实运行数据验收，未到期前不据此调整策略或扩大仓位。
 
 ## P1：降低当前最确定的损耗
 
@@ -169,3 +177,6 @@ expected_net_hourly =
 | 日期 | 项目 | 状态 | 证据或报告链接 | 结论 / 下一步 |
 | --- | --- | --- | --- | --- |
 | 2026-08-01 | 规划建立 | [x] | `metrics.db`、`report`、`performance` | 当前先做 P0.4，不扩大仓位 |
+| 2026-08-01 | P0.4 市场级现金流、奖励、库存快照、事件、终态与跨日归因 | [x] | `performance_report()`、`market_rewards`、`inventory_snapshots`、`inventory_events`、`tests/test_metrics.py`、`tests/test_main.py` | 已完成可核对现金流、只读库存采样、终态归因、官方逐市场奖励导入、未配对 MTM、每对现金流与跨日库存上界；真实奖励兑现率仍需后续运行积累 |
+| 2026-08-01 | P0.5 奖励预估校准影子报表 | [x] | `reward_calibration_report()`、`pmbot.main reward-calibration --days 7`、`tests/test_metrics.py` | 已可逐市场逐日输出兑现率或无归因状态；没有官方市场级实际奖励时不能用于策略调整 |
+| 2026-08-01 | P0.5 校准可解释性 | [x] | `reward_calibration_report()`、`uptime`、`recovery_events`、`guard_events`、`tests/test_metrics.py` | 已显示 in-band uptime、recovery 跳过原因和普通 guard 拉单事件；事件原因仅记录实际发生的拉单动作 |

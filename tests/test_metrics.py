@@ -2,6 +2,7 @@
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pmbot.metrics import MetricsStore
@@ -84,6 +85,24 @@ def test_fetch_realized_rewards_records_total(tmp_path):
     assert abs(report["realized_rewards_usd"] - total) < 1e-9
 
 
+def test_fetch_market_realized_rewards_records_official_condition_ids(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+
+    class FakeClient:
+        def get_earnings_for_user_for_day(self, date):
+            return {"data": [
+                {"condition_id": "cid-a", "earnings": 2.0, "asset_rate": 0.5},
+                {"condition_id": "cid-b", "earnings": 1.25, "asset_rate": 1.0},
+            ]}
+
+    assert store.fetch_market_realized_rewards(FakeClient(), "2026-06-16") == 2
+    rows = store._conn.execute(
+        "SELECT cid,realized,source FROM market_rewards ORDER BY cid").fetchall()
+    store.close()
+    assert rows == [("cid-a", 1.0, "clob_rewards_user"),
+                    ("cid-b", 1.25, "clob_rewards_user")]
+
+
 def test_fetch_realized_rewards_keeps_prior_value_on_error(tmp_path):
     store = MetricsStore(str(tmp_path / "test.db"))
     store.record_realized_reward("2026-06-16", 8.0)
@@ -136,6 +155,228 @@ def test_performance_report(tmp_path):
     assert m["hedge_cost_usd"] == 5.0
     assert m["markout_cents"] == 1.0
     assert m["uptime_pct"] == 50.0
+
+
+def test_performance_report_attributes_market_cashflow_and_estimated_reward(tmp_path):
+    """A market report must expose only its own auditable cashflows and estimates."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+    store.record_fill({"ts": ts, "cid": "cid1", "market": "Market one",
+                       "side": "YES", "token": "yes", "price": 0.46, "size": 10})
+    store.record_fill({"ts": ts, "cid": "cid1", "market": "Market one",
+                       "side": "NO", "token": "no", "price": 0.55, "size": 10,
+                       "taker": True})
+    store.record_merge("cid1", 10)
+    store.record_reward_sample("cid1", 0.20)
+
+    report = store.performance_report()
+    store.close()
+
+    market = report["markets"][0]
+    assert abs(market["buy_cost_usd"] - 10.10) < 1e-9
+    assert abs(market["exit_proceeds_usd"] - 0.0) < 1e-9
+    assert abs(market["trading_pnl_usd"] - (-0.10)) < 1e-9
+    assert abs(market["est_rewards_usd"] - 0.20) < 1e-9
+    assert abs(market["net_pnl_est_usd"] - 0.10) < 1e-9
+
+
+def test_performance_report_includes_latest_market_inventory_snapshot(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+    store.record_inventory_snapshot(
+        "cid1", "Market one", unpaired_shares=12.0, cost_basis=0.47,
+        exposure_usd=5.64, status="unpaired", ts=ts,
+    )
+    store.record_inventory_snapshot(
+        "cid1", "Market one", unpaired_shares=0.0, cost_basis=None,
+        exposure_usd=0.0, status="flat", ts=ts + 1,
+    )
+
+    report = store.performance_report()
+    store.close()
+
+    market = report["markets"][0]
+    assert market["inventory_status"] == "flat"
+    assert market["unpaired_shares"] == 0.0
+    assert market["unpaired_cost_basis"] is None
+    assert market["inventory_exposure_usd"] == 0.0
+
+
+def test_performance_report_exposes_latest_inventory_event_without_inference(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+    store.record_fill({
+        "ts": ts, "cid": "cid1", "market": "Market one",
+        "side": "YES", "token": "yes", "price": 0.52, "size": 5,
+        "exit": True,
+    })
+    store.record_inventory_snapshot(
+        "cid1", "Market one", unpaired_shares=0.0, cost_basis=None,
+        exposure_usd=0.0, status="flat", ts=ts + 1,
+    )
+
+    report = store.performance_report()
+    store.close()
+
+    market = report["markets"][0]
+    assert market["last_inventory_event"] == "exit"
+    assert market["inventory_status"] == "flat"
+
+
+def test_performance_report_proves_inventory_terminal_states_from_event_and_snapshot(tmp_path):
+    """Only enough post-inventory quantity plus a flat observation proves a terminal state."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+
+    # A confirmed merge of the complete observed excess proves pairing.
+    store.record_inventory_snapshot("paired", "Paired", unpaired_shares=5.0,
+                                    cost_basis=0.46, exposure_usd=2.3,
+                                    status="unpaired", ts=ts)
+    store.record_merge("paired", 5.0, ts=ts + 1)
+    store.record_inventory_snapshot("paired", "Paired", unpaired_shares=0.0,
+                                    cost_basis=None, exposure_usd=0.0,
+                                    status="flat", ts=ts + 2)
+
+    # A reduce-only exit of the complete observed excess proves an exit.
+    store.record_inventory_snapshot("exited", "Exited", unpaired_shares=-4.0,
+                                    cost_basis=0.54, exposure_usd=-2.16,
+                                    status="unpaired", ts=ts)
+    store.record_fill({"ts": ts + 1, "cid": "exited", "market": "Exited",
+                       "side": "NO", "token": "no", "price": 0.50, "size": 4,
+                       "exit": True})
+    store.record_inventory_snapshot("exited", "Exited", unpaired_shares=0.0,
+                                    cost_basis=None, exposure_usd=0.0,
+                                    status="flat", ts=ts + 2)
+
+    # A complete forced complement buy, followed by flat inventory, proves a hedge.
+    store.record_inventory_snapshot("hedged", "Hedged", unpaired_shares=3.0,
+                                    cost_basis=0.49, exposure_usd=1.47,
+                                    status="unpaired", ts=ts)
+    store.record_hedge("hedged", 0.50, 3.0, ts=ts + 1)
+    store.record_inventory_snapshot("hedged", "Hedged", unpaired_shares=0.0,
+                                    cost_basis=None, exposure_usd=0.0,
+                                    status="flat", ts=ts + 2)
+
+    # Flat without an observed disposition is deliberately left unresolved.
+    store.record_inventory_snapshot("unknown", "Unknown", unpaired_shares=2.0,
+                                    cost_basis=0.40, exposure_usd=0.8,
+                                    status="unpaired", ts=ts)
+    store.record_inventory_snapshot("unknown", "Unknown", unpaired_shares=0.0,
+                                    cost_basis=None, exposure_usd=0.0,
+                                    status="flat", ts=ts + 2)
+
+    report = store.performance_report()
+    store.close()
+    markets = {m["cid"]: m for m in report["markets"]}
+    assert markets["paired"]["inventory_terminal_status"] == "paired"
+    assert markets["exited"]["inventory_terminal_status"] == "exit"
+    assert markets["hedged"]["inventory_terminal_status"] == "hedged"
+    assert markets["unknown"]["inventory_terminal_status"] == "unresolved"
+
+
+def test_performance_report_separates_market_reward_facts_from_account_total(tmp_path):
+    """Only explicitly attributed rewards produce a per-market realized payout."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%d")
+    store.record_reward_sample("attributed", 0.20)
+    store.record_reward_sample("unattributed", 0.10)
+    store.record_realized_reward(today, 0.25)  # official account-level daily total
+    store.record_market_realized_reward(today, "attributed", 0.15, source="official_detail")
+
+    report = store.performance_report(today)
+    store.close()
+
+    markets = {m["cid"]: m for m in report["markets"]}
+    attributed = markets["attributed"]
+    assert attributed["realized_rewards_usd"] == 0.15
+    assert attributed["reward_attribution_status"] == "attributed"
+    assert abs(attributed["reward_calibration_ratio"] - 0.75) < 1e-9
+
+    unattributed = markets["unattributed"]
+    assert unattributed["realized_rewards_usd"] is None
+    assert unattributed["reward_attribution_status"] == "account_total_only"
+    assert unattributed["reward_calibration_ratio"] is None
+
+
+def test_performance_report_marks_cashflow_mixed_with_carry_in_inventory(tmp_path):
+    """A merge funded by pre-day tokens must not be presented as today's selection cashflow."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    prior_ts = __import__("datetime").datetime(2026, 7, 31, 23, 0,
+                                                 tzinfo=__import__("datetime").timezone.utc).timestamp()
+    day_ts = __import__("datetime").datetime(2026, 8, 1, 1, 0,
+                                               tzinfo=__import__("datetime").timezone.utc).timestamp()
+    for side, token, price in (("YES", "yes", 0.46), ("NO", "no", 0.52)):
+        store.record_fill({"ts": prior_ts, "cid": "carry", "market": "Carry",
+                           "side": side, "token": token, "price": price, "size": 10})
+    store.record_merge("carry", 10, ts=day_ts)
+
+    # This comparison market opened and merged entirely on the reporting day.
+    for side, token, price in (("YES", "yes", 0.47), ("NO", "no", 0.51)):
+        store.record_fill({"ts": day_ts, "cid": "today", "market": "Today",
+                           "side": side, "token": token, "price": price, "size": 10})
+    store.record_merge("today", 10, ts=day_ts + 1)
+
+    report = store.performance_report("2026-08-01")
+    store.close()
+    markets = {m["cid"]: m for m in report["markets"]}
+
+    carry = markets["carry"]
+    assert carry["cashflow_attribution_status"] == "mixed_with_carry_in"
+    assert carry["carry_in_paired_shares"] == 10.0
+    assert carry["cross_day_merge_pairs_upper_bound"] == 10.0
+    assert carry["selection_cashflow_usd"] is None
+
+    today = markets["today"]
+    assert today["cashflow_attribution_status"] == "same_day_cashflow"
+    assert today["carry_in_paired_shares"] == 0.0
+    assert today["selection_cashflow_usd"] == today["trading_pnl_usd"]
+
+
+def test_reward_calibration_report_keeps_unattributed_market_days_inconclusive(tmp_path):
+    """A daily calibration ratio exists only when both estimate and market fact exist."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    day = "2026-07-31"
+    minute = int(__import__("datetime").datetime(2026, 7, 31, 12,
+                                                   tzinfo=__import__("datetime").timezone.utc).timestamp()) // 60
+    with store._lock:
+        store._conn.executemany(
+            "INSERT INTO reward_samples (minute_ts,cid,est_usd) VALUES (?,?,?)",
+            [(minute, "attributed", 0.10), (minute + 1, "attributed", 0.20),
+             (minute, "unattributed", 0.30)],
+        )
+        store._conn.executemany(
+            "INSERT INTO uptime (minute_ts,cid,in_band) VALUES (?,?,?)",
+            [(minute, "attributed", 1), (minute + 1, "attributed", 0)],
+        )
+        ts = minute * 60
+        store._conn.executemany(
+            "INSERT INTO recovery_events (ts,cid,event,reason,unpaired,recovery_path) "
+            "VALUES (?,?,?,?,?,?)",
+            [(ts, "attributed", "skip", "unknown_cost_basis", 10, "passive"),
+             (ts + 1, "attributed", "skip", "unknown_cost_basis", 10, "passive")],
+        )
+        store._conn.commit()
+    store.record_market_realized_reward(day, "attributed", 0.15, "official_detail")
+
+    report = store.reward_calibration_report(days=1, end_date=day)
+    store.close()
+    rows = {r["cid"]: r for r in report["market_days"]}
+
+    attributed = rows["attributed"]
+    assert attributed["status"] == "calibrated"
+    assert abs(attributed["estimated_usd"] - 0.30) < 1e-9
+    assert abs(attributed["realized_usd"] - 0.15) < 1e-9
+    assert abs(attributed["calibration_ratio"] - 0.5) < 1e-9
+    assert attributed["uptime_samples"] == 2
+    assert attributed["uptime_pct"] == 50.0
+    assert attributed["recovery_skips"] == 2
+    assert attributed["recovery_skip_reasons"] == {"unknown_cost_basis": 2}
+    assert attributed["guard_interruptions_status"] == "not_recorded"
+
+    unattributed = rows["unattributed"]
+    assert unattributed["status"] == "unattributed"
+    assert unattributed["realized_usd"] is None
+    assert unattributed["calibration_ratio"] is None
 
 
 def test_reward_totals_all_time_and_24h(tmp_path):
@@ -290,3 +531,39 @@ def test_inception_date_prunes_and_blocks(tmp_path):
     store.close()
     assert all(d >= "2026-06-14" for d in out)
     assert "2026-06-10" not in out
+
+
+def test_performance_reports_unpaired_mtm_and_completed_pair_metrics(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+    for side, price in (("YES", 0.46), ("NO", 0.55)):
+        store.record_fill({"ts": ts, "cid": "c", "market": "M", "side": side,
+                           "token": side, "price": price, "size": 10})
+    store.record_merge("c", 10, ts=ts)
+    store.record_inventory_snapshot("c", "M", unpaired_shares=2,
+                                    cost_basis=0.9, exposure_usd=1.1,
+                                    status="unpaired", ts=ts + 1)
+    row = store.performance_report("2026-08-01")["markets"][0]
+    store.close()
+    assert row["unpaired_inventory_mtm_usd"] == 1.1
+    assert abs(row["net_pnl_with_unpaired_mtm_est_usd"] - 1.0) < 1e-9
+    assert row["completed_pair_count"] == 10
+    assert abs(row["cashflow_per_completed_pair_usd"] - (-0.01)) < 1e-9
+    assert row["trade_event_count"] == 2
+
+
+def test_reward_calibration_reports_structured_guard_interruptions(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+    minute = int(ts) // 60
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO reward_samples (minute_ts,cid,est_usd) VALUES (?,?,?)",
+            (minute, "c", 0.02))
+        store._conn.commit()
+    store.record_guard_event("c", "market", "market_guard_pull", ts=ts)
+    row = store.reward_calibration_report(1, "2026-08-01")["market_days"][0]
+    store.close()
+    assert row["guard_interruptions_status"] == "recorded"
+    assert row["guard_interruptions"] == 1
+    assert row["guard_interruption_reasons"] == {"market_guard_pull": 1}

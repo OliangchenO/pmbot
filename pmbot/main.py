@@ -346,6 +346,7 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         f"hedges ${summary['hedge_cost_usd']:+.2f}  "
         f"fees ${summary['fees_usd']:+.2f}  "
         f"est. rewards ${summary['est_rewards_usd']:+.4f}  "
+        f"realized rewards ${summary['realized_rewards_usd']:+.4f} (account)  "
         f"maker fills {summary['maker_fills']}  "
         f"uptime {summary['uptime_pct']:.1f}%"
         + extra
@@ -355,8 +356,9 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         console.print("no per-market activity yet — run the bot in paper mode first")
         return
     table = Table(title=f"Per-market performance — {report['date']}")
-    for col in ("Market", "Maker", "Taker", "Exit", "Merged", "Hedge $",
-                "Fees", "Markout", "Uptime", "Recovery"):
+    for col in ("Market", "Maker", "Taker", "Exit", "Buy $", "Merge $",
+                "Trading", "Est Rwd", "Est Net", "Hedge $", "Fees", "Markout",
+                "Uptime", "Recovery / Evidence"):
         table.add_column(col)
     for m in markets:
         markout = "—"
@@ -365,12 +367,33 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         reco = ""
         if m.get("recovery_skips") or m.get("recovery_quotes") or m.get("forced_hedges"):
             reco = f"{m.get('recovery_skips',0)}s/{m.get('recovery_quotes',0)}q/{m.get('forced_hedges',0)}h"
+        event = m.get("last_inventory_event")
+        if event:
+            reco = f"{reco} {event}".strip()
+        terminal = m.get("inventory_terminal_status")
+        if terminal:
+            reco = f"{reco} -> {terminal}".strip()
+        if m.get("reward_attribution_status") == "attributed":
+            calibration = m.get("reward_calibration_ratio")
+            reward_evidence = f"reward ${m['realized_rewards_usd']:.2f}"
+            if calibration is not None:
+                reward_evidence += f"/{calibration:.0%}"
+            reco = f"{reco} {reward_evidence}".strip()
+        elif m.get("reward_attribution_status") == "account_total_only":
+            reco = f"{reco} reward account-only".strip()
+        if m.get("cashflow_attribution_status") == "mixed_with_carry_in":
+            reco = (f"{reco} carry merge<={m['cross_day_merge_pairs_upper_bound']:.0f} "
+                    f"exit<={m['cross_day_exit_shares_upper_bound']:.0f}").strip()
         table.add_row(
             (m["market"] or m["cid"][:12])[:40],
             str(m["maker_fills"]),
             str(m["taker_fills"]),
             str(m["exits"]),
-            f"${m['merged_pairs']:.0f}",
+            f"${m['buy_cost_usd']:.2f}",
+            f"${m['merge_proceeds_usd']:.2f}",
+            f"${m['trading_pnl_usd']:+.2f}",
+            f"${m['est_rewards_usd']:+.2f}",
+            f"${m['net_pnl_est_usd']:+.2f}",
             f"${m['hedge_cost_usd']:.2f}",
             f"${m['fees_usd']:.2f}",
             markout,
@@ -379,8 +402,59 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         )
     console.print(table)
     console.print(
-        "\n[dim]Use markout + uptime to drop toxic markets; "
-        "merged/hedge ratio shows spread capture vs forced pairing cost.[/]"
+        "\n[dim]Est Net = trading cashflow + estimated reward; it excludes "
+        "market-level realized rewards and inventory MTM. Account rewards are not "
+        "allocated to markets without an explicit market-level source. A terminal status needs "
+        "a flat snapshot plus enough observed merge/exit/hedge quantity; otherwise "
+        "it remains unresolved. Carry means today's closing cashflow may include "
+        "pre-day inventory, so it is not attributed to today's selection.[/]"
+    )
+
+
+def cmd_reward_calibration(cfg: dict, days: int) -> None:
+    """Display a read-only market/day reward calibration shadow report."""
+    store = _metrics_store(cfg)
+    report = store.reward_calibration_report(days=days)
+    store.close()
+    rows = report["market_days"]
+    summary = report["summary"]
+    console.print(
+        f"[bold]Reward calibration shadow — {report['start_date']} to "
+        f"{report['end_date']}[/]  calibrated {summary['calibrated_market_days']}/"
+        f"{summary['market_days']} market-days"
+    )
+    if not rows:
+        console.print("no market reward samples in this window")
+        return
+    table = Table(title="Per-market daily reward calibration")
+    for col in ("UTC Date", "Market", "Estimated $", "Realized $", "Ratio", "In-band", "Quote interruption", "Status"):
+        table.add_column(col)
+    for row in rows:
+        realized = (f"${row['realized_usd']:.4f}"
+                    if row["realized_usd"] is not None else "—")
+        ratio = (f"{row['calibration_ratio']:.1%}"
+                 if row["calibration_ratio"] is not None else "—")
+        uptime = (f"{row['uptime_pct']:.0f}%/{row['uptime_samples']}m"
+                  if row["uptime_pct"] is not None else "—")
+        guard_reasons = ",".join(
+            f"{reason}x{count}"
+            for reason, count in row["guard_interruption_reasons"].items())
+        recovery_reasons = ",".join(
+            f"{reason}x{count}"
+            for reason, count in row["recovery_skip_reasons"].items())
+        interruption = (f"guard {guard_reasons}" if guard_reasons
+                        else (f"recovery {recovery_reasons}"
+                              if recovery_reasons else "guard unrecorded"))
+        table.add_row(row["date"], row["cid"][:16],
+                      f"${row['estimated_usd']:.4f}", realized, ratio, uptime,
+                      interruption, row["status"])
+    console.print(table)
+    console.print(
+        "[dim]Only explicitly attributed market rewards can be calibrated. "
+        "Account-level reward totals and missing estimates remain inconclusive. "
+        "Recovery skips and observed guard-pull actions are recorded; a "
+        "missing guard event remains unrecorded rather than inferred. This report "
+        "does not change selection or quoting.[/]"
     )
 
 
@@ -404,6 +478,7 @@ class Bot:
         self._last_rotate = 0.0
         self._rotate_pending = False
         self._last_reward_sample = 0.0
+        self._last_inventory_sample = 0.0
         self._last_status = 0.0
         self._last_pos_refresh = 0.0
         self._last_merge_check = 0.0
@@ -515,6 +590,9 @@ class Bot:
                 action = self.risk.check(equity, self.broker.total_inventory_usd(),
                                          self._scale)
                 self.metrics.record_equity(equity, self.broker.total_inventory_usd())
+                if now - self._last_inventory_sample >= REWARD_SAMPLE_SECONDS:
+                    self._sample_inventory(now)
+                    self._last_inventory_sample = now
 
                 if action == RiskAction.KILL:
                     break
@@ -638,6 +716,8 @@ class Bot:
             if not self.broker.open_quotes(m):
                 return
             log.warning("guard trip — pulling quotes from '%s' now", m.question[:45])
+            self.metrics.record_guard_event(
+                cid, "market", "market_guard_pull")
             self.metrics.sample_uptime(cid, False)
             await self._broker_call(self.broker.set_quotes, m, [])
 
@@ -656,6 +736,8 @@ class Bot:
             log.warning("side block — pulling %s bid in '%s' now",
                         "YES" if token_id == m.yes_token else "NO",
                         m.question[:45])
+            self.metrics.record_guard_event(
+                m.condition_id, "side", "side_guard_pull")
             await self._broker_call(self.broker.set_quotes, m, remaining)
 
     def _rotatable_tripped_cids(self) -> set[str]:
@@ -1549,6 +1631,26 @@ class Bot:
             self.broker.accrue_rewards(usd)
             self.metrics.record_reward_sample(m.condition_id, usd)
 
+    def _sample_inventory(self, now: float) -> None:
+        """Record current per-market inventory facts without affecting decisions."""
+        if self.broker is None:
+            return
+        managed = {m.condition_id: m for m in self.markets}
+        for market in self.broker.held_markets():
+            managed.setdefault(market.condition_id, market)
+        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+        for market in managed.values():
+            unpaired = self.broker.unpaired_shares(market)
+            basis = basis_fn(market) if basis_fn and abs(unpaired) > 1e-9 else None
+            self.metrics.record_inventory_snapshot(
+                market.condition_id, market.question[:50],
+                unpaired_shares=unpaired,
+                cost_basis=basis,
+                exposure_usd=self.broker.net_yes_exposure_usd(market),
+                status="unpaired" if abs(unpaired) > 1e-9 else "flat",
+                ts=now,
+            )
+
     def _print_status(self) -> None:
         table = Table(title=f"pmbot — {'PAPER' if self.paper else 'LIVE'}")
         for col in ("Market", "Mid", "Our bid YES", "Our bid NO", "Net exposure"):
@@ -1611,7 +1713,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pmbot")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("scan", "run", "report", "trades", "performance"):
+    for name in ("scan", "run", "report", "trades", "performance", "reward-calibration"):
         sub.add_parser(name)
 
     trades_p = sub.choices["trades"]
@@ -1625,6 +1727,9 @@ def main() -> None:
     perf_p = sub.choices["performance"]
     perf_p.add_argument("--date", default=None,
                         help="UTC date YYYY-MM-DD (default: today)")
+    calibration_p = sub.choices["reward-calibration"]
+    calibration_p.add_argument("--days", type=int, default=7,
+                               help="number of UTC days to inspect (default: 7)")
 
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
@@ -1646,6 +1751,8 @@ def main() -> None:
         cmd_trades(cfg, args.limit, args.hours, args.export_csv)
     elif args.command == "performance":
         cmd_performance(cfg, args.date)
+    elif args.command == "reward-calibration":
+        cmd_reward_calibration(cfg, args.days)
     else:
         if cfg["mode"] == "live":
             console.print("[bold red]LIVE mode — real orders will be placed. Ctrl-C cancels all and exits.[/]")
