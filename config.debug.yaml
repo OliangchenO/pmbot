@@ -33,7 +33,7 @@ scanner:
   # volatility / book-not-quotable guards and tank in-band uptime (e.g. a $431
   # book quoting two-sided). This drops books too shallow to make on safely.
   # 0 disables. Tune against `scan` output — too high starves the scanner.
-  min_liquidity: 5000
+  min_liquidity: 2000
   # Ignore markets requiring quotes bigger than this (shares) — keeps
   # per-market capital small.
   max_min_size_shares: 100
@@ -49,14 +49,15 @@ scanner:
   min_pool_to_liquidity: 0.005
   # Market-selection ranking (Option C). These only re-order markets that
   # already pass the filters above (eligibility uses raw reward density), so
-  # they can never starve the scanner — set both to 0 for the old ranking.
+  # they can never starve the scanner. IGNORED when ranking_mode = "density";
+  # active only when ranking_mode = "capture".
   #   toxicity_turnover_penalty: down-weight markets whose 24h volume is large
   #     relative to resting liquidity (fast/informed flow that picks off makers).
   #     score *= 1 / (1 + w * volume24h/liquidity).
   #   band_room_bonus: prefer wider reward bands (more room to quote inside and
   #     still merge pairs near $1.00). score *= 1 + w * (max_spread_cents - 1).
   toxicity_turnover_penalty: 0.15
-  band_room_bonus: 0.10
+  band_room_bonus: 0.5
   # Hard cap on market fee rate (basis points), as reported by the CLOB
   # /fee-rate endpoint. On Polymarket makers are NEVER charged fees, so our
   # resting reward quotes pay nothing regardless of this value — the only fee
@@ -107,6 +108,20 @@ scanner:
   # out; ones still holding inventory stay so the exit path manages them.
   # Debounced by ROTATE_MIN_INTERVAL_SECS to avoid book-feed churn.
   rotate_on_trip: true
+  # Market ranking mode:
+  #   "density" = current behavior: rank by pool ÷ liquidity (pure density,
+  #                ignores toxicity/band weights; identical to today's ranking)
+  #   "capture" = rank by expected captured reward: pool × share(our_size,
+  #               competition), with toxicity/band multipliers active
+  ranking_mode: "density"
+  # Competition multiplier for the capture model. γ × liquidity is the
+  # estimated competing in-band score in a market. Calibrated from realized
+  # share data (~0.027 for the Polymarket reward pool). Only used when
+  # ranking_mode = "capture".
+  competition_gamma: 0.027
+  # Absolute book-liquidity floor (USD). Drops books too shallow to
+  # two-side without getting picked off. 0 = disabled.
+  min_liquidity: 2000
   # Skip markets whose question contains any of these (case-insensitive).
   # Event-driven / observation-driven books: guards trip constantly and
   # inventory stacks across correlated markets (Iran dates, Seoul temps, etc.).

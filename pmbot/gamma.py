@@ -43,6 +43,8 @@ class Market:
     best_ask: float | None = None
     last_trade: float | None = None
     score: float = field(default=0.0)
+    density: float = field(default=0.0)   # raw pool/liquidity (always computed)
+    capture: float = field(default=0.0)   # expected captured reward $/day (capture mode only)
 
     @property
     def mid_hint(self) -> float:
@@ -286,10 +288,14 @@ def scan(cfg: dict, exclude_cids: set[str] | None = None,
     min_liquidity = float(sc.get("min_liquidity", 0.0))
     fee_penalty = float(sc.get("fee_penalty_mult", 0.5))
     max_fee_bps = int(sc.get("max_fee_bps", 0))
-    # Option C — reward-density ranking adjusted for toxicity & band room.
-    # Eligibility still uses raw reward density (below), so these only re-order
-    # preference among markets the static filters already accept (graceful
-    # fallback: zero weights reproduce the old ranking exactly).
+    # Ranking mode: "density" = pool/liquidity (current behavior, ignores
+    # toxicity/band weights); "capture" = expected captured reward with
+    # toxicity/band multipliers active.
+    ranking_mode = str(sc.get("ranking_mode", "density")).lower()
+    gamma = float(sc.get("competition_gamma", 0.0))
+    # Knock-down factors for high-turnover / thin-band markets. In density mode
+    # these are pinned to 1.0 (no effect), guaranteeing identical ranking to
+    # the current behavior regardless of their config values.
     turnover_w = float(sc.get("toxicity_turnover_penalty", 0.0))
     band_w = float(sc.get("band_room_bonus", 0.0))
 
@@ -322,21 +328,34 @@ def scan(cfg: dict, exclude_cids: set[str] | None = None,
             # Polymarket, so our reward quotes are unaffected; this only caps
             # markets where the taker merge/exit cost would be extreme.
             continue
+        # --- reward density (always computed for eligibility gate and display)
         density = m.daily_pool / max(m.liquidity, 100.0)
         if m.fee_bps > 0:
-            # Slight down-rank: taker merges/exits cost more in fee markets.
             density *= max(0.1, 1.0 - m.fee_bps / 10000.0 * fee_penalty)
-        # Eligibility gate is on raw reward density — unchanged behavior.
+        m.density = density
+
+        # Eligibility gate on raw reward density — unchanged behavior.
         if density < sc["min_pool_to_liquidity"]:
             continue
-        # Toxicity proxy: high 24h turnover vs resting liquidity means fast,
-        # often informed flow (the kind that picks off maker quotes). Penalize it.
-        turnover = m.volume_24h / max(m.liquidity, 100.0)
-        tox_mult = 1.0 / (1.0 + turnover_w * turnover)
-        # A wider reward band leaves more room to quote inside it and still
-        # assemble pairs near $1.00 — directly eases the adverse-selection math.
-        band_mult = 1.0 + band_w * max(0.0, m.max_spread_cents - 1.0)
-        m.score = density * tox_mult * band_mult
+
+        # --- expected captured reward (capture mode only)
+        m.capture = 0.0
+        if ranking_mode == "capture":
+            alpha = (1.0 - float(cfg["quoting"]["offset_frac_of_max_spread"])) ** 2
+            our_q = alpha * float(max_capital)
+            comp_q = gamma * max(m.liquidity, 100.0)
+            denom = our_q + comp_q
+            m.capture = m.daily_pool * our_q / denom if denom > 0 else 0.0
+
+        # --- toxicity & band multipliers (capture mode only)
+        if ranking_mode == "capture":
+            turnover = m.volume_24h / max(m.liquidity, 100.0)
+            tox_mult = 1.0 / (1.0 + turnover_w * turnover)
+            band_mult = 1.0 + band_w * max(0.0, m.max_spread_cents - 1.0)
+            m.score = m.capture * tox_mult * band_mult
+        else:
+            m.score = density
+
         candidates.append(m)
 
     candidates.sort(key=lambda m: m.score, reverse=True)

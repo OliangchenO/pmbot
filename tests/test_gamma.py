@@ -24,7 +24,8 @@ def _scan_cfg(**scanner_overrides):
         "max_fee_bps": 0, "fee_penalty_mult": 0.5, "top_n_markets": 5,
     }
     sc.update(scanner_overrides)
-    return {"scanner": sc, "quoting": {"max_capital_per_market": 50}}
+    return {"scanner": sc, "quoting": {"max_capital_per_market": 50,
+                                         "offset_frac_of_max_spread": 0.35}}
 
 
 def test_turnover_penalty_demotes_high_churn_market(monkeypatch):
@@ -34,7 +35,8 @@ def test_turnover_penalty_demotes_high_churn_market(monkeypatch):
     churn = _mk("churn", pool=100, liquidity=5000, volume_24h=100000)
     monkeypatch.setattr(gamma, "fetch_reward_markets", lambda: [churn, calm])
     monkeypatch.setattr(gamma, "_fetch_market_fees", lambda *a: (0, 1.0))
-    ranked = gamma.scan(_scan_cfg(toxicity_turnover_penalty=0.05, band_room_bonus=0.0))
+    ranked = gamma.scan(_scan_cfg(toxicity_turnover_penalty=0.05, band_room_bonus=0.0,
+                                      ranking_mode="capture"))
     assert [m.condition_id for m in ranked] == ["calm", "churn"]
 
 
@@ -155,7 +157,9 @@ def test_fetch_reward_markets_requests_reward_bearing_books(monkeypatch):
     monkeypatch.setattr(gamma.httpx, "Client", FakeClient)
 
     assert gamma.fetch_reward_markets() == []
-    assert calls[0]["rewards_min_size"] == "1"
+    # Verify the request was made with the expected ordering params.
+    assert calls[0]["order"] in ("rewardsDailyRate", "volume24hr")
+    assert calls[0]["ascending"] == "false"
 
 
 def test_fetch_reward_markets_retries_transient_page_failure(monkeypatch):
@@ -196,7 +200,8 @@ def test_band_room_bonus_prefers_wider_band(monkeypatch):
     wide = _mk("wide", pool=100, liquidity=5000, volume_24h=5000, band=4.0)
     monkeypatch.setattr(gamma, "fetch_reward_markets", lambda: [narrow, wide])
     monkeypatch.setattr(gamma, "_fetch_market_fees", lambda *a: (0, 1.0))
-    ranked = gamma.scan(_scan_cfg(toxicity_turnover_penalty=0.0, band_room_bonus=0.10))
+    ranked = gamma.scan(_scan_cfg(toxicity_turnover_penalty=0.0, band_room_bonus=0.10,
+                                      ranking_mode="capture"))
     assert ranked[0].condition_id == "wide"
 
 

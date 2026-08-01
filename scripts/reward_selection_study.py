@@ -30,7 +30,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DB = ROOT / "data" / "live_metrics.db"
+DB = ROOT / "data" / "metrics.db"
 CONFIG = ROOT / "config.yaml"
 UNIVERSE = ROOT / "data" / "_scan_universe.json"  # snapshot from a live scan
 

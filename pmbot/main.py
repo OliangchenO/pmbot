@@ -170,15 +170,25 @@ def load_config(path: str) -> dict:
 
 
 def cmd_scan(cfg: dict) -> None:
+    sc = cfg["scanner"]
+    mode = str(sc.get("ranking_mode", "density"))
+    if mode == "capture":
+        gamma_val = sc.get("competition_gamma", 0.027)
+        title = f"Top reward markets (expected captured reward, γ={gamma_val})"
+    else:
+        title = "Top reward markets (pool / liquidity)"
     markets = gamma.scan(cfg)
-    table = Table(title="Top reward markets (pool ÷ liquidity)")
-    for col in ("Market", "Mid", "Pool/day", "Liquidity", "Fee", "Min size", "Band", "Score"):
+    table = Table(title=title)
+    for col in ("Market", "Mid", "Pool/day", "Liquidity", "Fee",
+                "Min size", "Band", "Density", "Capture/d", "Score"):
         table.add_column(col)
     for m in markets:
+        capture_str = f"${m.capture:.2f}" if mode == "capture" else "-"
         table.add_row(
             m.question[:55], f"{m.mid_hint:.2f}", f"${m.daily_pool:,.0f}",
             f"${m.liquidity:,.0f}", f"{m.fee_bps}bps",
-            f"{m.min_size:.0f} sh", f"{m.max_spread_cents}c", f"{m.score:.3f}",
+            f"{m.min_size:.0f} sh", f"{m.max_spread_cents}c",
+            f"{m.density:.4f}", capture_str, f"{m.score:.4f}",
         )
     console.print(table)
 
