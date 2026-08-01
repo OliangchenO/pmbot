@@ -110,10 +110,21 @@ class MetricsStore:
                 ts REAL, fill_ts REAL, cid TEXT, market TEXT,
                 horizon REAL, markout REAL
             );
+            CREATE TABLE IF NOT EXISTS recovery_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, event TEXT, reason TEXT,
+                unpaired REAL, recovery_path TEXT,
+                quote_price REAL, pair_cap REAL
+            );
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
             self._conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
+        rec_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(recovery_events)")}
+        if "quote_price" not in rec_cols:
+            self._conn.execute("ALTER TABLE recovery_events ADD COLUMN quote_price REAL")
+        if "pair_cap" not in rec_cols:
+            self._conn.execute("ALTER TABLE recovery_events ADD COLUMN pair_cap REAL")
         self._conn.commit()
 
     def _append_trades_log(self, entry: dict) -> None:
@@ -172,6 +183,30 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO merges (ts, cid, pairs) VALUES (?,?,?)",
                 (time.time(), cid, pairs),
+            )
+            self._conn.commit()
+
+    def record_recovery_event(self, cid: str, event: str, unpaired: float,
+                              reason: str | None = None,
+                              recovery_path: str | None = None,
+                              quote_price: float | None = None,
+                              pair_cap: float | None = None) -> None:
+        """Log one inventory-recovery lifecycle event for monitoring.
+
+        ``event`` is one of ``'skip'``, ``'quote_placed'``, or
+        ``'forced_hedge'``.  ``reason`` is the skip reason (only used when
+        ``event='skip'``).  ``recovery_path`` records the current recovery
+        stage so the stats query can group by phase.  ``quote_price`` and
+        ``pair_cap`` capture the complement bid price and the break-even
+        cap at the time of a ``'quote_placed'`` event.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO recovery_events (ts, cid, event, reason, unpaired, recovery_path, "
+                "quote_price, pair_cap) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (time.time(), cid, event, reason, unpaired, recovery_path,
+                 quote_price, pair_cap),
             )
             self._conn.commit()
 
@@ -452,6 +487,41 @@ class MetricsStore:
         uptime_pct = (sum(r[0] for r in uptime_rows) / len(uptime_rows) * 100
                       if uptime_rows else 0.0)
 
+        # ── recovery events ──
+        rec_skips = self._conn.execute(
+            "SELECT reason, COUNT(*) FROM recovery_events "
+            "WHERE ts>=? AND ts<? AND event='skip' GROUP BY reason",
+            (day_start, day_end),
+        ).fetchall()
+        total_skips = sum(n for _, n in rec_skips)
+        quotes_placed = self._conn.execute(
+            "SELECT COUNT(*) FROM recovery_events "
+            "WHERE ts>=? AND ts<? AND event='quote_placed'",
+            (day_start, day_end),
+        ).fetchone()[0]
+        forced_hedges = self._conn.execute(
+            "SELECT COUNT(*) FROM recovery_events "
+            "WHERE ts>=? AND ts<? AND event='forced_hedge'",
+            (day_start, day_end),
+        ).fetchone()[0]
+        recovery_attempts = quotes_placed + forced_hedges
+        hedge_success_rate = (quotes_placed / recovery_attempts
+                              if recovery_attempts > 0 else None)
+        # Average premium paid: (quote_price - pair_cap) on quotes placed
+        # above the break-even cap.  Positive = we paid extra.
+        premium_avg = self._conn.execute(
+            "SELECT AVG(quote_price - pair_cap) FROM recovery_events "
+            "WHERE ts>=? AND ts<? AND event='quote_placed' "
+            "AND quote_price IS NOT NULL AND pair_cap IS NOT NULL",
+            (day_start, day_end),
+        ).fetchone()[0]
+        premium_max = self._conn.execute(
+            "SELECT MAX(quote_price - pair_cap) FROM recovery_events "
+            "WHERE ts>=? AND ts<? AND event='quote_placed' "
+            "AND quote_price IS NOT NULL AND pair_cap IS NOT NULL",
+            (day_start, day_end),
+        ).fetchone()[0]
+
         return {
             "date": date,
             "merge_proceeds_usd": merges,
@@ -466,6 +536,15 @@ class MetricsStore:
             "equity_pnl_usd": equity_pnl,
             "maker_fills": fill_count,
             "uptime_pct": uptime_pct,
+            "recovery": {
+                "total_skips": total_skips,
+                "quotes_placed": quotes_placed,
+                "forced_hedges": forced_hedges,
+                "skips_by_reason": {r: n for r, n in rec_skips},
+                "hedge_success_rate": hedge_success_rate,
+                "premium_avg_cents": (premium_avg * 100.0) if premium_avg is not None else None,
+                "premium_max_cents": (premium_max * 100.0) if premium_max is not None else None,
+            },
         }
 
     def reward_totals(self) -> dict:
@@ -663,6 +742,9 @@ class MetricsStore:
                     "markout_cents": None,
                     "markout_n": 0,
                     "uptime_pct": 0.0,
+                    "recovery_skips": 0,
+                    "recovery_quotes": 0,
+                    "forced_hedges": 0,
                 }
             elif name and not markets[cid]["market"]:
                 markets[cid]["market"] = name
@@ -716,6 +798,19 @@ class MetricsStore:
         ):
             m = _ensure(cid)
             m["uptime_pct"] = (in_band / total * 100) if total else 0.0
+
+        for cid, event, n in self._conn.execute(
+            "SELECT cid, event, COUNT(*) FROM recovery_events "
+            "WHERE ts>=? AND ts<? GROUP BY cid, event",
+            (day_start, day_end),
+        ):
+            m = _ensure(cid)
+            if event == "skip":
+                m["recovery_skips"] = n
+            elif event == "quote_placed":
+                m["recovery_quotes"] = n
+            elif event == "forced_hedge":
+                m["forced_hedges"] = n
 
         rows = sorted(
             markets.values(),

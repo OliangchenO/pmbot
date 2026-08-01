@@ -185,7 +185,11 @@ def cmd_scan(cfg: dict) -> None:
 
 def _metrics_store(cfg: dict) -> MetricsStore:
     m = cfg.get("metrics") or {}
-    return MetricsStore(m.get("db_path", "data/metrics.db"),
+    db_path = m.get("db_path", "data/metrics.db")
+    # Paper mode uses a separate DB so simulated data doesn't mix with live.
+    if cfg.get("mode") == "paper" and "db_path" not in m:
+        db_path = "data/metrics_paper.db"
+    return MetricsStore(db_path,
                         trades_log=m.get("trades_log"),
                         inception_date=m.get("inception_date"))
 
@@ -213,6 +217,27 @@ def cmd_report(cfg: dict) -> None:
     table.add_row("Maker fills", str(report["maker_fills"]))
     table.add_row("In-band uptime", f"{report['uptime_pct']:.1f}%")
     console.print(table)
+
+    rec = report.get("recovery", {})
+    if rec is not None:
+        rec_table = Table(title="Recovery stats — today")
+        rec_table.add_column("Metric")
+        rec_table.add_column("Count")
+        rec_table.add_row("Recovery skips", str(rec.get("total_skips", 0)))
+        rec_table.add_row("Recovery quotes placed", str(rec.get("quotes_placed", 0)))
+        rec_table.add_row("Forced hedges", str(rec.get("forced_hedges", 0)))
+        if rec.get("hedge_success_rate") is not None:
+            rec_table.add_row("Hedge success rate", f"{rec['hedge_success_rate']:.0%}")
+        else:
+            rec_table.add_row("Hedge success rate", "—")
+        if rec.get("premium_avg_cents") is not None:
+            rec_table.add_row("Avg premium over cap", f"{rec['premium_avg_cents']:+.2f}¢")
+        if rec.get("premium_max_cents") is not None:
+            rec_table.add_row("Max premium over cap", f"{rec['premium_max_cents']:+.2f}¢")
+        if rec.get("skips_by_reason"):
+            for reason, n in sorted(rec["skips_by_reason"].items(), key=lambda x: -x[1]):
+                rec_table.add_row(f"  └ skip: {reason}", str(n))
+        console.print(rec_table)
 
     score = Table(title="Scoreboard — rewards vs trading P&L")
     score.add_column("Metric")
@@ -296,6 +321,13 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
     report = store.performance_report(date)
     store.close()
     summary = report["summary"]
+    # Show recovery totals in summary line if any exist
+    rec_sum = summary.get("recovery", {})
+    extra = ""
+    if rec_sum.get("total_skips") or rec_sum.get("quotes_placed") or rec_sum.get("forced_hedges"):
+        extra = (f"  recovery skips {rec_sum['total_skips']}  "
+                 f"quotes {rec_sum['quotes_placed']}  "
+                 f"forced hedges {rec_sum['forced_hedges']}")
     console.print(
         f"[bold]Session summary — {report['date']}[/]  "
         f"equity PnL ${summary['equity_pnl_usd']:+.2f}  "
@@ -305,6 +337,7 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         f"est. rewards ${summary['est_rewards_usd']:+.4f}  "
         f"maker fills {summary['maker_fills']}  "
         f"uptime {summary['uptime_pct']:.1f}%"
+        + extra
     )
     markets = report["markets"]
     if not markets:
@@ -312,12 +345,15 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         return
     table = Table(title=f"Per-market performance — {report['date']}")
     for col in ("Market", "Maker", "Taker", "Exit", "Merged", "Hedge $",
-                "Fees", "Markout", "Uptime"):
+                "Fees", "Markout", "Uptime", "Recovery"):
         table.add_column(col)
     for m in markets:
         markout = "—"
         if m["markout_cents"] is not None:
             markout = f"{m['markout_cents']:+.1f}c (n={m['markout_n']})"
+        reco = ""
+        if m.get("recovery_skips") or m.get("recovery_quotes") or m.get("forced_hedges"):
+            reco = f"{m.get('recovery_skips',0)}s/{m.get('recovery_quotes',0)}q/{m.get('forced_hedges',0)}h"
         table.add_row(
             (m["market"] or m["cid"][:12])[:40],
             str(m["maker_fills"]),
@@ -328,6 +364,7 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
             f"${m['fees_usd']:.2f}",
             markout,
             f"{m['uptime_pct']:.0f}%",
+            reco,
         )
     console.print(table)
     console.print(
@@ -1063,6 +1100,9 @@ class Bot:
                 if needs_recovery:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="near_resolution")
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            m.condition_id, "skip", unpaired, reason="near_resolution")
                 if self.broker.open_quotes(m):
                     log.warning("'%s' %.1f小时后结算 — 退出市场", m.question[:45], h)
                     updates.append((m, [], None))
@@ -1079,6 +1119,9 @@ class Bot:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="stale_book",
                         yes_book=yes_book, no_book=no_book)
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            m.condition_id, "skip", unpaired, reason="stale_book")
                 if self.broker.open_quotes(m):
                     log.warning("数据源/订单簿过期 (数据源%.0fs, 订单簿%.0fs) — "
                                 "撤下 '%s' 报价",
@@ -1095,6 +1138,9 @@ class Bot:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="unquotable_book",
                         yes_book=yes_book, no_book=no_book)
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            m.condition_id, "skip", unpaired, reason="unquotable_book")
                 if self.broker.open_quotes(m):
                     log.warning("订单簿双向不可报价 — 撤下 '%s'",
                                 m.question[:45])
@@ -1107,6 +1153,9 @@ class Bot:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="theme_inventory_cap",
                         yes_book=yes_book, no_book=no_book)
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            m.condition_id, "skip", unpaired, reason="theme_inventory_cap")
                 if self.broker.open_quotes(m):
                     log.warning("主题库存上限 — '%s' 不报价",
                                 m.question[:45])
@@ -1188,6 +1237,10 @@ class Bot:
                 self._log_inventory_recovery_skip(
                     m, unpaired=unpaired, reason=reason, basis=basis,
                     yes_book=yes_book, no_book=no_book)
+                if self.metrics:
+                    self.metrics.record_recovery_event(
+                        m.condition_id, "skip", unpaired,
+                        reason=reason, recovery_path=recovery_path)
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])
@@ -1234,6 +1287,12 @@ class Bot:
                             m, unpaired=unpaired, quote=recovery_quote,
                             yes_book=yes_book, no_book=no_book, pricing=pricing,
                             pair_cap=cap)
+                        if self.metrics:
+                            self.metrics.record_recovery_event(
+                                m.condition_id, "quote_placed", unpaired,
+                                recovery_path=recovery_path,
+                                quote_price=recovery_quote.price,
+                                pair_cap=cap)
                 # ── pair-cap with soft-window awareness for audit ──
                 audit_cap = cap
                 if basis is not None and cap is not None:
@@ -1373,6 +1432,10 @@ class Bot:
             self._over_since.pop(cid, None)
             if hasattr(self.broker, "unpaired_since"):
                 self.broker.unpaired_since.pop(cid, None)
+            if self.metrics:
+                self.metrics.record_recovery_event(
+                    cid, "forced_hedge", unpaired,
+                    quote_price=price)
             log.warning("强制对冲 '%s': 买入 %.0f 股%s @ %.3f 配平 $%.0f 敞口", m.question[:45], filled,
                         "NO" if excess_yes else "YES", price, abs(exposure))
 
@@ -1512,10 +1575,15 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
-    configure_logging()
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
     cfg = load_config(args.config)
+
+    # Paper mode uses a separate log directory so simulated runs don't mix with live.
+    log_dir = "logs"
+    if cfg.get("mode") == "paper":
+        log_dir = "logs_paper"
+
+    configure_logging(log_dir)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.command == "scan":
         cmd_scan(cfg)
     elif args.command == "report":
