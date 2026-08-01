@@ -128,8 +128,11 @@ def compute_quotes(
     # quotes cost nothing per fill. Widening here would only push us out of the
     # reward band and forfeit rewards. Fees apply solely on taker merges/exits.
 
+    # Inventory recovery uses the exact naked amount. Reward eligibility is
+    # irrelevant to a risk-reducing complement bid; the current CLOB floor is
+    # checked separately from the live book before this function is called.
     quote_min_size = (market.min_size if min_quote_size is None
-                      else max(market.min_size, min_quote_size))
+                      else min_quote_size)
     base_size = max(quote_min_size * q["size_mult_of_min"] * scale, quote_min_size)
     size = float(int(base_size * max(0.5, min(2.0, size_factor))))
 

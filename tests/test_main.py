@@ -126,6 +126,29 @@ def test_inventory_sample_records_current_unpaired_paper_position(tmp_path):
     assert row["unpaired_cost_basis"] == 0.47
 
 
+def test_recovery_history_command_renders_decision_reason_and_inventory(tmp_path):
+    """The operator-facing drill-down must explain why a hedge did not run."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    store.record_recovery_event(
+        "cid1", "forced_hedge_deferred", 10, reason="over_hard_cap",
+        quote_price=0.52, pair_cap=0.49, cost_basis=0.50,
+        expected_pair_pnl=-0.02, ts=100.0)
+    store.record_inventory_snapshot("cid1", "Question", unpaired_shares=10,
+                                    cost_basis=0.50, exposure_usd=5.0,
+                                    status="unpaired", ts=101.0)
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_recovery_history(cfg, "cid1")
+
+    output = capture.get()
+    assert "forced_hedge_deferred" in output
+    assert "over_hard_cap" in output
+    assert "最新库存" in output
+    assert "unpaired" in output
+
 def test_guard_trip_pulls_quotes_immediately(tmp_path):
     async def scenario():
         bot = _bot(tmp_path)
@@ -567,6 +590,25 @@ def test_inventory_recovery_clamps_quote_above_pair_cost_cap(tmp_path):
 
     assert allowed == [Quote(market.yes_token, 0.329, 50.0)]
     assert capped == [Quote(market.yes_token, 0.330, 50.0)]
+    bot.metrics.close()
+
+
+def test_soft_recovery_window_records_tolerance_without_raising_hard_cap(tmp_path):
+    """A soft-loss setting must not silently turn a passive recovery bid into a loss."""
+    bot = _bot(tmp_path)
+    broker = _RecoveryBasisBroker(0.669)
+    broker.last_fill_ts = lambda _cid: 100.0
+    bot.broker = broker
+    bot.cfg["risk"] = {
+        "recovery_soft_window_minutes": 30,
+        "recovery_max_loss_cents": 1.5,
+    }
+    market = _market()
+
+    quotes = bot._inventory_recovery_quotes(
+        market, [Quote(market.yes_token, 0.340, 50.0)], unpaired=-50.0, now=120.0)
+
+    assert quotes == [Quote(market.yes_token, 0.330, 50.0)]
     bot.metrics.close()
 
 

@@ -567,3 +567,70 @@ def test_reward_calibration_reports_structured_guard_interruptions(tmp_path):
     assert row["guard_interruptions_status"] == "recorded"
     assert row["guard_interruptions"] == 1
     assert row["guard_interruption_reasons"] == {"market_guard_pull": 1}
+
+
+def test_recovery_event_persists_pair_economics_for_audit(tmp_path):
+    """Dropping a recovery decision's cost inputs must make later PnL review impossible."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_recovery_event(
+        "cid1", "forced_hedge_deferred", 12.0,
+        reason="over_hard_cap", recovery_path="forced_hedge",
+        quote_price=0.53, pair_cap=0.50, proposed_price=0.53,
+        cost_basis=0.49, fee_per_share=0.003, expected_pair_pnl=-0.023,
+        soft_expected_pair_pnl=-0.038,
+        ts=1_700_000_000.0,
+    )
+    row = store._conn.execute(
+        "SELECT event,reason,unpaired,quote_price,pair_cap,proposed_price,"
+        "cost_basis,fee_per_share,expected_pair_pnl,soft_expected_pair_pnl,ts FROM recovery_events "
+        "WHERE cid='cid1'").fetchone()
+    store.close()
+
+    assert row == (
+        "forced_hedge_deferred", "over_hard_cap", 12.0, 0.53, 0.50, 0.53,
+        0.49, 0.003, -0.023, -0.038, 1_700_000_000.0,
+    )
+
+
+def test_pause_day_event_persists_smoothed_loss_and_inventory(tmp_path):
+    """A daily-loss pause without its calculation cannot be reviewed or tuned."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_pause_day_event(
+        "triggered", reason="daily_loss_limit", equity=470.0,
+        smoothed_equity=475.0, day_loss=25.0, inventory_usd=13.5,
+        ts=1_700_000_001.0,
+    )
+    row = store._conn.execute(
+        "SELECT event,reason,equity,smoothed_equity,day_loss,inventory_usd,ts "
+        "FROM pause_day_events").fetchone()
+    store.close()
+
+    assert row == (
+        "triggered", "daily_loss_limit", 470.0, 475.0, 25.0, 13.5,
+        1_700_000_001.0,
+    )
+
+
+def test_recovery_history_returns_one_market_timeline_and_latest_inventory(tmp_path):
+    """A market drill-down must neither mix other markets nor lose decision order."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_recovery_event("wanted", "quote_placed", 8, quote_price=0.44,
+                                pair_cap=0.45, ts=100.0)
+    store.record_recovery_event("other", "skip", 3, reason="stale_book", ts=101.0)
+    store.record_recovery_event("wanted", "forced_hedge_deferred", 8,
+                                reason="over_hard_cap", quote_price=0.48,
+                                pair_cap=0.45, ts=102.0)
+    store.record_inventory_snapshot("wanted", "Question", unpaired_shares=8,
+                                    cost_basis=0.53, exposure_usd=4.24,
+                                    status="unpaired", ts=103.0)
+
+    history = store.recovery_history("wanted")
+    store.close()
+
+    assert [event["event"] for event in history["events"]] == [
+        "quote_placed", "forced_hedge_deferred"]
+    assert history["events"][1]["reason"] == "over_hard_cap"
+    assert history["inventory"] == {
+        "market": "Question", "unpaired_shares": 8.0, "cost_basis": 0.53,
+        "exposure_usd": 4.24, "status": "unpaired", "ts": 103.0,
+    }

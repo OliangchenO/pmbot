@@ -22,6 +22,40 @@ Paper mode tracks simulated fills against the live orderbook, marks positions
 to market, and estimates liquidity-reward accrual. State is written to
 `data/paper_state.json`; structured metrics go to `data/metrics.db`.
 
+## 命令速查
+
+所有命令通过 `python -m pmbot.main <command>` 运行。除 `run` 外均为只读：
+它们只扫描公开市场或读取本地账本，不会创建、撤销或修改订单。默认读取
+`config.yaml`；需要切换配置时使用 `--config <配置文件>`。
+
+| 命令 | 用途 | 常用参数 |
+| --- | --- | --- |
+| `scan` | 扫描并展示当前符合条件的市场，不下单 | — |
+| `run` | 按配置启动机器人；`mode: paper` 为模拟成交，`mode: live` 才会真实下单 | — |
+| `report` | 展示全局每日 PnL、奖励、库存和回收统计 | — |
+| `performance` | 按市场查看成交、合并、对冲、markout、uptime 与估算净收益 | `--date YYYY-MM-DD`（UTC 日期） |
+| `trades` | 查看本地账本中的成交 | `--limit N`、`--hours N`、`--csv <文件>` |
+| `reward-calibration` | 查看逐市场、逐日的预估奖励与可归因实际奖励的校准情况 | `--days N` |
+| `recovery-history <condition_id>` | 梳理一个市场的补仓/强平决策链与最新库存状态 | 必填 `condition_id` |
+
+常用示例：
+
+```bash
+# 使用 paper 配置扫描或查看报表
+python -m pmbot.main --config config.debug.yaml scan
+python -m pmbot.main --config config.debug.yaml performance --date 2026-08-01
+
+# 查看某市场为何补单、跳过补单或拒绝强平
+python -m pmbot.main recovery-history 0xYOUR_CONDITION_ID
+
+# 导出最近 24 小时的本地成交（不访问交易接口）
+python -m pmbot.main trades --hours 24 --csv data/trades-24h.csv
+```
+
+`recovery-history` 中 `quote_placed` 只代表补单已挂出，
+`forced_hedge_filled` 代表本地收到吃单结果；两者都应结合“最新库存”确认
+是否最终配平。预估奖励和未配对库存 MTM 不是已实现现金收益。
+
 The fill simulation is deliberately pessimistic to make paper PnL a usable
 go-live signal (`paper:` section in `config.yaml`):
 

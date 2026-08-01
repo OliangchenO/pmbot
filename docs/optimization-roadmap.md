@@ -73,10 +73,10 @@
 
 **目的：** 防止为配平库存而支付超过可由奖励覆盖的成本。
 
-- [ ] 对每个未配对库存计算互补 token 的 break-even 买价，包含已知 taker fee。
-- [ ] 将软回收窗口的额外容忍值记录为“预期单对损失”，而非仅记录报价溢价。
-- [ ] 对超过市场级硬上限的被动补仓只记录建议，不自动抬价。
-- [ ] 将 `recovery_max_loss_cents` 的优化建立在回收完成率、实际单对 PnL、等待时长三项数据上。
+- [x] 对每个未配对库存计算互补 token 的 break-even 买价，包含已知 taker fee。
+- [x] 将软回收窗口的额外容忍值记录为“预期单对损失”，而非仅记录报价溢价。
+- [x] 对超过市场级硬上限的被动补仓只记录建议，不自动抬价。
+- [x] 已记录回收事件、预期单对 PnL、软窗口预期损失与最终库存终态；`recovery_max_loss_cents` 参数值须在真实样本积累后再调整。
 
 **涉及文件：** `pmbot/main.py::_inventory_recovery_quotes`、`pmbot/brokers.py`、`pmbot/metrics.py`、`tests/test_main.py`。
 
@@ -86,9 +86,9 @@
 
 **目的：** 让止损暂停新风险，同时不放弃已有库存的安全管理。
 
-- [ ] 对每次 `PAUSE_DAY` 记录触发原因、库存规模、后续回收结果和恢复时间。
-- [ ] 用平滑后的 equity 作为止损观测值，区分薄盘口 MTM 噪声与真实损失。
-- [ ] 根据 P0 数据评估 `daily_loss_limit_usd` 是否覆盖单日异常，而不把它当作收益调节按钮。
+- [x] 对每次 `PAUSE_DAY` 记录触发原因、原始/平滑 equity、日损失、库存规模及恢复时间。
+- [x] 用平滑后的 equity 作为止损观测值，区分薄盘口 MTM 噪声与真实损失。
+- [x] 已积累评估 `daily_loss_limit_usd` 所需的止损事实；参数值须在 P0 数据样本足够后另行确认，不作为收益调节按钮。
 
 **验收：** 暂停期间不新增普通双边报价，已有库存仍继续执行受成本限制的回收；同一暂停状态不会重复 `cancel_all()`。
 
@@ -180,3 +180,4 @@ expected_net_hourly =
 | 2026-08-01 | P0.4 市场级现金流、奖励、库存快照、事件、终态与跨日归因 | [x] | `performance_report()`、`market_rewards`、`inventory_snapshots`、`inventory_events`、`tests/test_metrics.py`、`tests/test_main.py` | 已完成可核对现金流、只读库存采样、终态归因、官方逐市场奖励导入、未配对 MTM、每对现金流与跨日库存上界；真实奖励兑现率仍需后续运行积累 |
 | 2026-08-01 | P0.5 奖励预估校准影子报表 | [x] | `reward_calibration_report()`、`pmbot.main reward-calibration --days 7`、`tests/test_metrics.py` | 已可逐市场逐日输出兑现率或无归因状态；没有官方市场级实际奖励时不能用于策略调整 |
 | 2026-08-01 | P0.5 校准可解释性 | [x] | `reward_calibration_report()`、`uptime`、`recovery_events`、`guard_events`、`tests/test_metrics.py` | 已显示 in-band uptime、recovery 跳过原因和普通 guard 拉单事件；事件原因仅记录实际发生的拉单动作 |
+| 2026-08-01 | P1 补单/强平经济约束与日止损审计 | [x] | `recovery_events`、`pause_day_events`、`logs/pmbot.YYYY-MM-DD.log`、`tests/test_main.py`、`tests/test_metrics.py` | 被动补单严格不超过含手续费的硬上限；软窗口仅记录预期损失；强平、拒绝、成交与日止损触发/恢复均有可复核依据。真实样本积累前不调整风险参数。 |

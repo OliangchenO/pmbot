@@ -458,6 +458,59 @@ def cmd_reward_calibration(cfg: dict, days: int) -> None:
     )
 
 
+def cmd_recovery_history(cfg: dict, cid: str) -> None:
+    """Display a read-only recovery/hedge timeline for one condition id."""
+    store = _metrics_store(cfg)
+    history = store.recovery_history(cid)
+    store.close()
+    console.print(f"[bold]补仓流程 — {cid}[/]")
+    if not history["events"]:
+        console.print("未找到该市场的补仓或强平事件。")
+    else:
+        table = Table(title="补仓与强平决策时间线")
+        for column in ("时间（北京时间）", "事件", "原因", "裸仓", "候选/实际价",
+                       "成本/硬上限", "费用", "预期单对PnL"):
+            table.add_column(column)
+        for event in history["events"]:
+            ts = datetime.fromtimestamp(event["ts"], BEIJING_TZ).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            proposed = event["proposed_price"]
+            quote = event["quote_price"]
+            prices = (f"候选 {proposed:.3f}" if proposed is not None else "候选 —")
+            prices += f" / 实际 {quote:.3f}" if quote is not None else " / 实际 —"
+            basis = event["cost_basis"]
+            cap = event["hard_cap"] if event["hard_cap"] is not None else event["pair_cap"]
+            economics = (f"成本 {basis:.3f}" if basis is not None else "成本 —")
+            economics += f" / 上限 {cap:.3f}" if cap is not None else " / 上限 —"
+            fee = (f"{event['fee_per_share']:.6f}"
+                   if event["fee_per_share"] is not None else "—")
+            pnl = (f"{event['expected_pair_pnl']:+.6f}"
+                   if event["expected_pair_pnl"] is not None else "—")
+            table.add_row(ts, event["event"], event["reason"] or "—",
+                          f"{event['unpaired']:.6g}", prices, economics, fee, pnl)
+        console.print(table)
+        for event in history["events"]:
+            console.print(
+                f"[dim]事件详情 event={event['event']} "
+                f"reason={event['reason'] or '—'} "
+                f"path={event['recovery_path'] or '—'}[/]"
+            )
+    inventory = history["inventory"]
+    if inventory is None:
+        console.print("[dim]最新库存：无本地快照（不能据此断言已配平）。[/]")
+    else:
+        basis = "—" if inventory["cost_basis"] is None else f"{inventory['cost_basis']:.4f}"
+        console.print(
+            f"[bold]最新库存[/] 市场={inventory['market'] or '—'} "
+            f"状态={inventory['status']} 裸仓={inventory['unpaired_shares']:.6g} "
+            f"成本={basis} 敞口=${inventory['exposure_usd']:.4f}"
+        )
+    console.print(
+        "[dim]这是本地审计时间线：quote_placed 是挂单，不是成交；"
+        "forced_hedge_filled 是本地成交结果，仍应结合后续库存快照确认配平。[/]"
+    )
+
+
 class Bot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -497,6 +550,7 @@ class Bot:
         self._recovery_phase_logged: dict[str, str] = {}
         self._scale = 1.0
         self._was_paused = False
+        self._pause_day_active = False
         # Event-driven quote pulls: guards fire these between loop ticks so we
         # don't stay quoted on an endangered side for up to LOOP_SECONDS.
         self._pull_tasks: set[asyncio.Task] = set()
@@ -590,6 +644,35 @@ class Bot:
                 action = self.risk.check(equity, self.broker.total_inventory_usd(),
                                          self._scale)
                 self.metrics.record_equity(equity, self.broker.total_inventory_usd())
+                observation = self.risk.last_observation
+                if action == RiskAction.PAUSE_DAY and not self._pause_day_active:
+                    self._pause_day_active = True
+                    self.metrics.record_pause_day_event(
+                        "triggered", reason="daily_loss_limit", equity=equity,
+                        smoothed_equity=float(observation["smoothed_equity"]),
+                        day_loss=float(observation["day_loss"]),
+                        inventory_usd=float(observation["inventory_usd"]), ts=now)
+                    log.warning(
+                        "PAUSE_DAY_TRIGGERED equity=%.4f smoothed_equity=%.4f "
+                        "day_loss=%.4f inventory=%.4f limit=%.4f "
+                        "说明=停止普通双边报价；保留受成本约束的库存回收",
+                        equity, float(observation["smoothed_equity"]),
+                        float(observation["day_loss"]),
+                        float(observation["inventory_usd"]),
+                        self.cfg["risk"]["daily_loss_limit_usd"])
+                elif action != RiskAction.PAUSE_DAY and self._pause_day_active:
+                    self._pause_day_active = False
+                    self.metrics.record_pause_day_event(
+                        "resumed", reason="new_utc_day", equity=equity,
+                        smoothed_equity=float(observation["smoothed_equity"]),
+                        day_loss=float(observation["day_loss"]),
+                        inventory_usd=float(observation["inventory_usd"]), ts=now)
+                    log.info(
+                        "PAUSE_DAY_RESUMED equity=%.4f smoothed_equity=%.4f "
+                        "day_loss=%.4f inventory=%.4f 说明=新UTC日已恢复普通报价资格",
+                        equity, float(observation["smoothed_equity"]),
+                        float(observation["day_loss"]),
+                        float(observation["inventory_usd"]))
                 if now - self._last_inventory_sample >= REWARD_SAMPLE_SECONDS:
                     self._sample_inventory(now)
                     self._last_inventory_sample = now
@@ -999,22 +1082,36 @@ class Bot:
     def _log_inventory_recovery_quote(
             market: gamma.Market, *, unpaired: float, quote: strategy.Quote,
             yes_book: Book, no_book: Book, pricing: dict[str, float],
-            pair_cap: float | None = None) -> None:
+            pair_cap: float | None = None, hard_cap: float | None = None,
+            cost_basis: float | None = None,
+            proposed_price: float | None = None,
+            soft_expected_pair_pnl: float | None = None) -> None:
         """Log the quote inputs needed to reconstruct a complement bid."""
         held = "YES" if unpaired > 0 else "NO"
         quote_token = "YES" if quote.token_id == market.yes_token else "NO"
-        soft_flag = ""
-        if pair_cap is not None and quote.price > pair_cap + 1e-9:
-            soft_flag = f" soft=+{(quote.price - pair_cap) * 100:.1f}c"
-        held_cn = {"YES": "持有YES", "NO": "持有NO"}
+        fee = market.fee_bps / 10_000.0 * (
+            quote.price * (1.0 - quote.price)) ** market.fee_exponent
+        expected = (1.0 - cost_basis - quote.price - fee
+                    if cost_basis is not None else None)
+        proposed_price = quote.price if proposed_price is None else proposed_price
         log.info(
-            "补单挂出 market='%s' %s %.0f 方向=买%s %.0f 报价=%.3f "
-            "YES簿=%.3fx%.0f/%.3fx%.0f NO簿=%.3fx%.0f/%.3fx%.0f "
-            "微价=%.3f 流量=%.3f 漂移=%+.4f 公允=%.3f 基差=%.4f "
-            "自适应=%+.4f 偏移=%.4f 偏斜=%+.4f 衰减YES=%.4f 衰减NO=%.4f "
-            "正常价=yes@%.3f,no@%.3f%s",
-            market.question[:80], held_cn.get(held, held), abs(unpaired),
-            quote_token, quote.size, quote.price,
+            "INVENTORY_RECOVERY_QUOTE market='%s' held=%s %.0f "
+            "quote=BUY %s %.0f @ %.3f proposed=%.3f cost_basis=%s "
+            "effective_cap=%s hard_cap=%s fee_per_share=%.6f expected_pair_pnl=%s "
+            "soft_expected_pair_pnl=%s "
+            "yes_book=%.3fx%.0f/%.3fx%.0f no_book=%.3fx%.0f/%.3fx%.0f "
+            "microprice=%.3f flow=%.3f drift=%+.4f fair=%.3f "
+            "base_offset=%.4f adaptive=%+.4f offset=%.4f skew=%+.4f "
+            "fade_yes=%.4f fade_no=%.4f normal=yes@%.3f,no@%.3f "
+            "说明=已检测裸仓；互补买单按成本、手续费与价格上限生成",
+            market.question[:80], held, abs(unpaired), quote_token, quote.size,
+            quote.price, proposed_price,
+            "unknown" if cost_basis is None else f"{cost_basis:.3f}",
+            "unknown" if pair_cap is None else f"{pair_cap:.3f}",
+            "unknown" if hard_cap is None else f"{hard_cap:.3f}", fee,
+            "unknown" if expected is None else f"{expected:+.6f}",
+            "not_applicable" if soft_expected_pair_pnl is None
+            else f"{soft_expected_pair_pnl:+.6f}",
             yes_book.best_bid, yes_book.bids.get(yes_book.best_bid, 0.0),
             yes_book.best_ask, yes_book.asks.get(yes_book.best_ask, 0.0),
             no_book.best_bid, no_book.bids.get(no_book.best_bid, 0.0),
@@ -1023,7 +1120,6 @@ class Bot:
             pricing["fair"], pricing["base_offset"], pricing["adaptive_offset"],
             pricing["offset"], pricing["skew"], pricing["fade_yes"], pricing["fade_no"],
             pricing["yes_bid_quote"], pricing["no_bid_quote"],
-            soft_flag,
         )
 
     def _log_inventory_recovery_skip(
@@ -1053,9 +1149,11 @@ class Bot:
             "strategy_no_quote": "策略无报价",
         }
         log.warning(
-            "补单跳过 market='%s' 原因=%s 敞口=%.0f 成本基准=%s YES簿=%s NO簿=%s",
-            market.question[:80], reason_cn.get(reason, reason), unpaired, basis_text,
-            top(yes_book), top(no_book),
+            "INVENTORY_RECOVERY_SKIPPED market='%s' reason=%s 原因=%s "
+            "unpaired=%.0f cost_basis=%s yes_book=%s no_book=%s "
+            "说明=检测到裸仓，但当前条件不允许生成安全互补买单",
+            market.question[:80], reason, reason_cn.get(reason, reason), unpaired,
+            basis_text, top(yes_book), top(no_book),
         )
 
     def _inventory_recovery_quotes(self, m: gamma.Market,
@@ -1064,12 +1162,9 @@ class Bot:
                                    now: float | None = None) -> list[strategy.Quote]:
         """Keep only a capped complement bid while a market is unpaired.
 
-        During the soft recovery window (first N minutes after unpaired
-        inventory appears), the complement bid is allowed to exceed the
-        break-even cap by ``recovery_max_loss_cents`` — a small known loss
-        that improves fill probability while the market is still near the
-        original trade price. After the window expires the hard pair-cap
-        resumes as the backstop.
+        The strict fee-inclusive break-even cap always limits the passive
+        bid.  ``recovery_max_loss_cents`` remains an audit-only estimate of
+        the fill probability trade-off; it must never silently raise a quote.
         """
         if abs(unpaired) < MIN_TAKER_SHARES:
             return desired
@@ -1082,17 +1177,6 @@ class Bot:
         if basis is None:
             return []
         max_price = self._forced_hedge_max_price(m, basis)
-        # ── soft recovery window ──
-        if now is not None and self.broker is not None:
-            r = self.cfg["risk"]
-            soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
-            soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
-            if soft_loss > 0 and soft_window > 0:
-                last_fill = self.broker.last_fill_ts(m.condition_id)
-                if last_fill is not None and now - last_fill <= soft_window:
-                    relaxed = min(1.0 - m.tick, max_price + soft_loss)
-                    if relaxed > max_price:
-                        max_price = relaxed
         return [strategy.Quote(q.token_id, min(q.price, max_price), abs(unpaired))
                 for q in desired
                 if q.token_id == complement]
@@ -1134,7 +1218,8 @@ class Bot:
         Cooldown markets also escalate after the window, same as held-only."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
+        risk_cfg = self.cfg.get("risk") or {}
+        escalate_secs = float(risk_cfg.get("recovery_escalate_after_minutes", 0)) * 60.0
         if now is not None and escalate_secs > 0 and self.broker is not None:
             last_fill = self.broker.last_fill_ts(m.condition_id)
             if last_fill is not None and now - last_fill >= escalate_secs:
@@ -1153,7 +1238,8 @@ class Bot:
         """
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
-        escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
+        risk_cfg = self.cfg.get("risk") or {}
+        escalate_secs = float(risk_cfg.get("recovery_escalate_after_minutes", 0)) * 60.0
         if now is not None and escalate_secs > 0 and self.broker is not None:
             last_fill = self.broker.last_fill_ts(m.condition_id)
             if last_fill is not None and now - last_fill >= escalate_secs:
@@ -1419,35 +1505,49 @@ class Bot:
                     complement = m.no_token if unpaired > 0 else m.yes_token
                     recovery_quote = next((q for q in final if q.token_id == complement), None)
                     if recovery_quote is not None:
+                        proposed_price = (pricing["yes_bid_quote"]
+                                          if complement == m.yes_token
+                                          else pricing["no_bid_quote"])
+                        fee = m.fee_bps / 10_000.0 * (
+                            recovery_quote.price * (1.0 - recovery_quote.price)) ** m.fee_exponent
+                        expected = (1.0 - basis - recovery_quote.price - fee
+                                    if basis is not None else None)
+                        soft_expected = None
+                        if basis is not None and cap is not None:
+                            risk_cfg = self.cfg.get("risk") or {}
+                            soft_window = float(risk_cfg.get(
+                                "recovery_soft_window_minutes", 0)) * 60.0
+                            soft_loss = float(risk_cfg.get(
+                                "recovery_max_loss_cents", 0)) / 100.0
+                            last_fill = self.broker.last_fill_ts(m.condition_id)
+                            if (soft_window > 0 and soft_loss > 0 and last_fill is not None
+                                    and now - last_fill <= soft_window):
+                                soft_price = min(1.0 - m.tick, cap + soft_loss)
+                                soft_fee = m.fee_bps / 10_000.0 * (
+                                    soft_price * (1.0 - soft_price)) ** m.fee_exponent
+                                soft_expected = 1.0 - basis - soft_price - soft_fee
                         self._log_inventory_recovery_quote(
                             m, unpaired=unpaired, quote=recovery_quote,
                             yes_book=yes_book, no_book=no_book, pricing=pricing,
-                            pair_cap=cap)
+                            pair_cap=cap, hard_cap=cap, cost_basis=basis,
+                            proposed_price=proposed_price,
+                            soft_expected_pair_pnl=soft_expected)
                         if self.metrics:
                             self.metrics.record_recovery_event(
                                 m.condition_id, "quote_placed", unpaired,
                                 recovery_path=recovery_path,
                                 quote_price=recovery_quote.price,
-                                pair_cap=cap)
-                # ── pair-cap with soft-window awareness for audit ──
-                audit_cap = cap
-                if basis is not None and cap is not None:
-                    r = self.cfg["risk"]
-                    soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
-                    soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
-                    if soft_loss > 0 and soft_window > 0:
-                        last_fill = self.broker.last_fill_ts(m.condition_id)
-                        if last_fill is not None and now - last_fill <= soft_window:
-                            relaxed = min(1.0 - m.tick, cap + soft_loss)
-                            if relaxed > cap:
-                                audit_cap = relaxed
+                                pair_cap=cap, proposed_price=proposed_price,
+                                cost_basis=basis, fee_per_share=fee,
+                                expected_pair_pnl=expected,
+                                soft_expected_pair_pnl=soft_expected, hard_cap=cap)
                 audit_context = {}
                 for q in final:
                     fee = m.fee_bps / 10_000.0 * (q.price * (1.0 - q.price)) ** m.fee_exponent
                     audit_context[q.token_id] = {
                         "path": recovery_path,
                         "unpaired_cost": basis,
-                        "pair_cap": audit_cap,
+                        "pair_cap": cap,
                         "strike_pair_cap": cap,
                         "expected_pair_pnl": 1.0 - basis - q.price - fee if basis is not None else None,
                     }
@@ -1528,7 +1628,18 @@ class Bot:
         if ask is None or bid is None or ask - bid > max_spread:
             if passive:
                 await self._update_exit_sell(m, unpaired)
-            log.warning("需强制对冲市场 '%s' 但互补簿价差过大/无深度 — 稍后重试", m.question[:45])
+            log.warning(
+                "FORCED_HEDGE_DEFERRED market='%s' reason=book_unavailable_or_wide "
+                "unpaired=%.0f bid=%s ask=%s max_spread=%.3f "
+                "说明=强平条件尚未评估；互补订单簿无有效深度或价差过大",
+                m.question[:45], unpaired,
+                "unknown" if bid is None else f"{bid:.3f}",
+                "unknown" if ask is None else f"{ask:.3f}", max_spread)
+            if self.metrics:
+                self.metrics.record_recovery_event(
+                    cid, "forced_hedge_deferred", unpaired,
+                    reason="book_unavailable_or_wide", recovery_path="forced_hedge",
+                    proposed_price=ask)
             return
         basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
         basis = basis_fn(m) if basis_fn else None
@@ -1549,14 +1660,42 @@ class Bot:
                 detail = "成本基准未知"
             else:
                 detail = "未知"
-            log.warning("强制对冲推迟 '%s': %s", m.question[:45], detail)
+            fee = (m.fee_bps / 10_000.0 * (ask * (1.0 - ask)) ** m.fee_exponent)
+            expected = (1.0 - basis - ask - fee if basis is not None else None)
+            reason = ("not_escalated" if not escalated else
+                      "over_hard_cap" if cap is not None and ask > cap + 1e-9 else
+                      "unknown_cost_basis" if basis is None else "rejected")
+            log.warning(
+                "FORCED_HEDGE_DEFERRED market='%s' reason=%s unpaired=%.0f "
+                "urgent=%s exposure=%.4f threshold=%.4f waited=%.0fs/%.0fs "
+                "bid=%.3f ask=%.3f cost_basis=%s hard_cap=%s fee_per_share=%.6f "
+                "expected_pair_pnl=%s detail=%s "
+                "说明=未提交吃单；风险条件或单对经济约束未满足",
+                m.question[:45], reason, unpaired, urgent, exposure, threshold,
+                now - start, wait, bid, ask,
+                "unknown" if basis is None else f"{basis:.3f}",
+                "unknown" if cap is None else f"{cap:.3f}", fee,
+                "unknown" if expected is None else f"{expected:+.6f}", detail)
+            if self.metrics:
+                self.metrics.record_recovery_event(
+                    cid, "forced_hedge_deferred", unpaired, reason=reason,
+                    recovery_path="forced_hedge", quote_price=ask,
+                    proposed_price=ask, cost_basis=basis, fee_per_share=fee,
+                    expected_pair_pnl=expected, hard_cap=cap)
             return
         await self._broker_call(self.broker.set_exit, m, None)
         price = self._forced_hedge_max_price(m, basis)
+        fee = m.fee_bps / 10_000.0 * (price * (1.0 - price)) ** m.fee_exponent
+        expected = 1.0 - basis - price - fee
+        log.warning(
+            "FORCED_HEDGE_SUBMITTED market='%s' unpaired=%.0f token=%s size=%.0f "
+            "limit=%.3f cost_basis=%.3f hard_cap=%.3f fee_per_share=%.6f "
+            "expected_pair_pnl=%+.6f 说明=风险触发且成本加手续费不超过$1，提交互补吃单",
+            m.question[:45], unpaired, "NO" if excess_yes else "YES", abs(unpaired),
+            price, basis, price, fee, expected)
         if self.paper:
             filled = self.broker.taker_buy(m, token, abs(unpaired), price)
         else:
-            fee = m.fee_bps / 10_000.0 * (price * (1.0 - price)) ** m.fee_exponent
             audit_context = {
                 "path": "forced_hedge", "unpaired_cost": basis,
                 "pair_cap": price,
@@ -1570,10 +1709,16 @@ class Bot:
                 self.broker.unpaired_since.pop(cid, None)
             if self.metrics:
                 self.metrics.record_recovery_event(
-                    cid, "forced_hedge", unpaired,
-                    quote_price=price)
-            log.warning("强制对冲 '%s': 买入 %.0f 股%s @ %.3f 配平 $%.0f 敞口", m.question[:45], filled,
-                        "NO" if excess_yes else "YES", price, abs(exposure))
+                    cid, "forced_hedge_filled", unpaired,
+                    recovery_path="forced_hedge", quote_price=price,
+                    proposed_price=price, cost_basis=basis, fee_per_share=fee,
+                    expected_pair_pnl=expected, hard_cap=price)
+            log.warning(
+                "FORCED_HEDGE_FILLED market='%s' filled=%.6f token=%s limit=%.3f "
+                "exposure=%.4f expected_pair_pnl=%+.6f "
+                "说明=本地已收到成交结果；仍需后续仓位快照确认最终配平",
+                m.question[:45], filled, "NO" if excess_yes else "YES", price,
+                exposure, expected)
 
     async def _update_exit_sell(self, m: gamma.Market, unpaired: float) -> None:
         token = m.yes_token if unpaired > 0 else m.no_token
@@ -1713,7 +1858,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pmbot")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("scan", "run", "report", "trades", "performance", "reward-calibration"):
+    for name in ("scan", "run", "report", "trades", "performance", "reward-calibration",
+                 "recovery-history"):
         sub.add_parser(name)
 
     trades_p = sub.choices["trades"]
@@ -1730,6 +1876,8 @@ def main() -> None:
     calibration_p = sub.choices["reward-calibration"]
     calibration_p.add_argument("--days", type=int, default=7,
                                help="number of UTC days to inspect (default: 7)")
+    recovery_p = sub.choices["recovery-history"]
+    recovery_p.add_argument("condition_id", help="condition id to inspect")
 
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
@@ -1753,6 +1901,8 @@ def main() -> None:
         cmd_performance(cfg, args.date)
     elif args.command == "reward-calibration":
         cmd_reward_calibration(cfg, args.days)
+    elif args.command == "recovery-history":
+        cmd_recovery_history(cfg, args.condition_id)
     else:
         if cfg["mode"] == "live":
             console.print("[bold red]LIVE mode — real orders will be placed. Ctrl-C cancels all and exits.[/]")

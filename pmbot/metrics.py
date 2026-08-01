@@ -57,7 +57,7 @@ class MetricsStore:
         with self._lock:
             for tbl in ("fills", "hedges", "merges", "equity", "markouts",
                         "quotes", "inventory_snapshots", "inventory_events",
-                        "market_rewards", "guard_events"):
+                        "market_rewards", "guard_events", "pause_day_events"):
                 self._conn.execute(f"DELETE FROM {tbl} WHERE ts < ?", (ts,))
             self._conn.execute("DELETE FROM uptime WHERE minute_ts < ?",
                                (int(ts) // 60,))
@@ -122,7 +122,10 @@ class MetricsStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, cid TEXT, event TEXT, reason TEXT,
                 unpaired REAL, recovery_path TEXT,
-                quote_price REAL, pair_cap REAL
+                quote_price REAL, pair_cap REAL, proposed_price REAL,
+                cost_basis REAL, fee_per_share REAL,
+                expected_pair_pnl REAL, soft_expected_pair_pnl REAL,
+                hard_cap REAL
             );
             CREATE TABLE IF NOT EXISTS inventory_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,6 +147,11 @@ class MetricsStore:
             );
             CREATE INDEX IF NOT EXISTS idx_guard_events_cid_ts
                 ON guard_events (cid, ts);
+            CREATE TABLE IF NOT EXISTS pause_day_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, event TEXT, reason TEXT, equity REAL,
+                smoothed_equity REAL, day_loss REAL, inventory_usd REAL
+            );
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
@@ -153,6 +161,11 @@ class MetricsStore:
             self._conn.execute("ALTER TABLE recovery_events ADD COLUMN quote_price REAL")
         if "pair_cap" not in rec_cols:
             self._conn.execute("ALTER TABLE recovery_events ADD COLUMN pair_cap REAL")
+        for column in ("proposed_price", "cost_basis", "fee_per_share",
+                       "expected_pair_pnl", "soft_expected_pair_pnl", "hard_cap"):
+            if column not in rec_cols:
+                self._conn.execute(
+                    f"ALTER TABLE recovery_events ADD COLUMN {column} REAL")
         self._conn.commit()
 
     def _append_trades_log(self, entry: dict) -> None:
@@ -235,23 +248,32 @@ class MetricsStore:
                               reason: str | None = None,
                               recovery_path: str | None = None,
                               quote_price: float | None = None,
-                              pair_cap: float | None = None) -> None:
+                              pair_cap: float | None = None,
+                              proposed_price: float | None = None,
+                              cost_basis: float | None = None,
+                              fee_per_share: float | None = None,
+                              expected_pair_pnl: float | None = None,
+                              soft_expected_pair_pnl: float | None = None,
+                              hard_cap: float | None = None,
+                              ts: float | None = None) -> None:
         """Log one inventory-recovery lifecycle event for monitoring.
 
         ``event`` is one of ``'skip'``, ``'quote_placed'``, or
         ``'forced_hedge'``.  ``reason`` is the skip reason (only used when
         ``event='skip'``).  ``recovery_path`` records the current recovery
         stage so the stats query can group by phase.  ``quote_price`` and
-        ``pair_cap`` capture the complement bid price and the break-even
-        cap at the time of a ``'quote_placed'`` event.
+            ``pair_cap`` records the effective cap and ``hard_cap`` the strict
+            fee-inclusive break-even cap. The remaining economic inputs retain
+            the decision facts needed to audit a future fill or refusal.
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO recovery_events (ts, cid, event, reason, unpaired, recovery_path, "
-                "quote_price, pair_cap) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (time.time(), cid, event, reason, unpaired, recovery_path,
-                 quote_price, pair_cap),
+                "INSERT INTO recovery_events (ts,cid,event,reason,unpaired,recovery_path,"
+                "quote_price,pair_cap,proposed_price,cost_basis,fee_per_share,"
+                "expected_pair_pnl,soft_expected_pair_pnl,hard_cap) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time() if ts is None else ts, cid, event, reason, unpaired,
+                 recovery_path, quote_price, pair_cap, proposed_price, cost_basis,
+                 fee_per_share, expected_pair_pnl, soft_expected_pair_pnl, hard_cap),
             )
             self._conn.commit()
 
@@ -296,6 +318,21 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO guard_events (ts,cid,scope,reason) VALUES (?,?,?,?)",
                 (time.time() if ts is None else ts, cid, scope, reason),
+            )
+            self._conn.commit()
+
+    def record_pause_day_event(
+            self, event: str, *, reason: str, equity: float,
+            smoothed_equity: float, day_loss: float, inventory_usd: float,
+            ts: float | None = None) -> None:
+        """Persist the facts that caused or ended a daily-loss pause."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pause_day_events "
+                "(ts,event,reason,equity,smoothed_equity,day_loss,inventory_usd) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (time.time() if ts is None else ts, event, reason, equity,
+                 smoothed_equity, day_loss, inventory_usd),
             )
             self._conn.commit()
 
@@ -952,6 +989,34 @@ class MetricsStore:
             }
             for r in rows
         ]
+
+    def recovery_history(self, cid: str) -> dict:
+        """Return one market's recovery decision timeline without side effects."""
+        rows = self._conn.execute(
+            "SELECT ts,event,reason,unpaired,recovery_path,quote_price,pair_cap,"
+            "proposed_price,cost_basis,fee_per_share,expected_pair_pnl,"
+            "soft_expected_pair_pnl,hard_cap FROM recovery_events "
+            "WHERE cid=? ORDER BY ts,id", (cid,)).fetchall()
+        events = [
+            {
+                "ts": r[0], "event": r[1], "reason": r[2], "unpaired": r[3],
+                "recovery_path": r[4], "quote_price": r[5], "pair_cap": r[6],
+                "proposed_price": r[7], "cost_basis": r[8],
+                "fee_per_share": r[9], "expected_pair_pnl": r[10],
+                "soft_expected_pair_pnl": r[11], "hard_cap": r[12],
+            }
+            for r in rows
+        ]
+        inventory_row = self._conn.execute(
+            "SELECT market,unpaired_shares,cost_basis,exposure_usd,status,ts "
+            "FROM inventory_snapshots WHERE cid=? ORDER BY ts DESC,id DESC LIMIT 1",
+            (cid,)).fetchone()
+        inventory = None if inventory_row is None else {
+            "market": inventory_row[0], "unpaired_shares": inventory_row[1],
+            "cost_basis": inventory_row[2], "exposure_usd": inventory_row[3],
+            "status": inventory_row[4], "ts": inventory_row[5],
+        }
+        return {"cid": cid, "events": events, "inventory": inventory}
 
     def performance_report(self, date: str | None = None) -> dict:
         """Per-market breakdown for tuning: fills, merges, hedges, markouts, uptime."""

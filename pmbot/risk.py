@@ -27,6 +27,7 @@ class RiskManager:
         self.day = self._today()
         self.paused = False
         self._equity_history: deque[float] = deque(maxlen=20)
+        self.last_observation: dict[str, float | str] = {}
 
     @staticmethod
     def _today() -> str:
@@ -65,6 +66,12 @@ class RiskManager:
 
         smoothed = self._smoothed_equity(equity)
         day_loss = self.day_start_equity - smoothed
+        self.last_observation = {
+            "equity": equity,
+            "smoothed_equity": smoothed,
+            "day_loss": day_loss,
+            "inventory_usd": total_inventory_usd,
+        }
         if day_loss >= self.cfg["hard_kill_loss_usd"]:
             log.error("HARD KILL: daily loss $%.2f >= $%.2f",
                       day_loss, self.cfg["hard_kill_loss_usd"])
