@@ -1,5 +1,9 @@
 # pmbot 优化路线图
 
+> 详细的分阶段目标、验收口径、上线门槛和进度记录见
+> [`docs/optimization-roadmap.md`](docs/optimization-roadmap.md)。本文件保留为快速索引；
+> 任何优化项目的状态变更应同时更新详细规划中的对应条目。
+
 ## 已完成
 
 - [x] **P0.1** `risk.scale_with_equity: true` — 仓位随净值增长同比缩放（config.yaml line 285）
