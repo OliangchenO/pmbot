@@ -282,7 +282,7 @@ risk:
   # and the bot sizes up automatically; draw down and it sizes down. Clamped
   # so a bad mark or a single losing day can't whipsaw sizing. The dollar
   # values below are calibrated at capital_usd. Loss limits stay absolute.
-  scale_with_equity: false
+  scale_with_equity: true
   scale_min: 0.5
   scale_max: 10.0
   # Stop adding inventory in a market beyond this (USD at current prices).
