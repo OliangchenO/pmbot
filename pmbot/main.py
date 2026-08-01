@@ -205,11 +205,11 @@ def _metrics_store(cfg: dict) -> MetricsStore:
                         inception_date=m.get("inception_date"))
 
 
-def cmd_report(cfg: dict) -> None:
+def cmd_report(cfg: dict, date: str | None = None) -> None:
     store = _metrics_store(cfg)
-    report = store.daily_report()
-    rewards = store.reward_totals()
-    ledger = store.trading_pnl_ledger()
+    report = store.daily_report(date)
+    rewards = store.reward_totals(date)
+    ledger = store.trading_pnl_ledger(date)
     store.close()
     table = Table(title=f"PnL report — {report['date']}")
     table.add_column("Component")
@@ -253,7 +253,7 @@ def cmd_report(cfg: dict) -> None:
     score = Table(title="Scoreboard — rewards vs trading P&L")
     score.add_column("Metric")
     score.add_column("All-time", justify="right")
-    score.add_column("Last 24h", justify="right")
+    score.add_column("Selected day" if date else "Last 24h", justify="right")
     score.add_row("Realized rewards (exact)",
                   f"${rewards['realized_total']:+.2f}",
                   f"${rewards['realized_24h']:+.2f}")
@@ -266,7 +266,8 @@ def cmd_report(cfg: dict) -> None:
         f"ground-truth match for your Polymarket history (sum of +/- trades - "
         f"deposits - rewards): realized ${ledger['realized_total']:+.2f} all-time "
         f"plus the current inventory mark ${ledger['inventory_usd']:.2f} = "
-        f"${ledger['mtm_total']:+.2f} mark-to-market. Realized 24h reads low while "
+        f"${ledger['mtm_total']:+.2f} mark-to-market. Realized "
+        f"{'selected-day' if date else '24h'} reads low while "
         f"bought pairs await merge/resolution. For the audited bottom line compare "
         f"deposits vs wallet balance.[/]"
     )
@@ -1962,6 +1963,9 @@ def main() -> None:
                  "recovery-history"):
         sub.add_parser(name)
 
+    report_p = sub.choices["report"]
+    report_p.add_argument("--date", default=None,
+                          help="UTC date YYYY-MM-DD (default: today)")
     trades_p = sub.choices["trades"]
     trades_p.add_argument("--limit", type=int, default=50,
                           help="max fills to show (default 50)")
@@ -1994,7 +1998,7 @@ def main() -> None:
     if args.command == "scan":
         cmd_scan(cfg)
     elif args.command == "report":
-        cmd_report(cfg)
+        cmd_report(cfg, args.date)
     elif args.command == "trades":
         cmd_trades(cfg, args.limit, args.hours, args.export_csv)
     elif args.command == "performance":

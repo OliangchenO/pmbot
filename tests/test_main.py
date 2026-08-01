@@ -41,6 +41,23 @@ BASE_CFG = {
 }
 
 
+def test_report_command_renders_requested_utc_date(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    store.record_realized_reward("2026-07-30", 1.25)
+    store.record_realized_reward("2026-07-31", 2.50)
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_report(cfg, "2026-07-30")
+
+    output = capture.get()
+    assert "PnL report — 2026-07-30" in output
+    assert "$+1.25" in output
+    assert "$+2.50" not in output
+
+
 def test_build_live_notifier_uses_enabled_dingtalk_environment(monkeypatch):
     """Removing the live-alert configuration path must disable this behavior."""
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")
