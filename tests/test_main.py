@@ -58,6 +58,41 @@ def test_report_command_renders_requested_utc_date(tmp_path):
     assert "$+2.50" not in output
 
 
+def test_trades_command_keeps_full_market_question(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    question = "Will the complete market question remain visible in PowerShell output? ENDMARKER"
+    store = main._metrics_store(cfg)
+    store.record_fill({
+        "cid": "cid", "market": question, "side": "YES",
+        "token": "yes", "price": 0.5, "size": 10,
+    })
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_trades(cfg, limit=50, hours=None, export_csv=None)
+
+    assert "ENDMARKER" in capture.get()
+
+
+def test_performance_command_keeps_full_market_question(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    question = "Will the complete market question remain visible in PowerShell output? ENDMARKER"
+    store = main._metrics_store(cfg)
+    store.record_fill({
+        "cid": "cid", "market": question, "side": "YES",
+        "token": "yes", "price": 0.5, "size": 10,
+    })
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    market_list = capture.get().split("Per-market performance", maxsplit=1)[0]
+    assert "ENDMARKER" in market_list
+
+
 def test_build_live_notifier_uses_enabled_dingtalk_environment(monkeypatch):
     """Removing the live-alert configuration path must disable this behavior."""
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")

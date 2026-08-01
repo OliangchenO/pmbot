@@ -306,7 +306,9 @@ def cmd_trades(cfg: dict, limit: int, hours: float | None,
         console.print("no fills recorded yet — run the bot in paper mode first")
         return
     table = Table(title="Recent fills")
-    for col in ("Time (UTC)", "Market", "Type", "Side", "Price", "Size", "Merged", "Fee"):
+    table.add_column("Time (UTC)")
+    table.add_column("Market", overflow="fold")
+    for col in ("Type", "Side", "Price", "Size", "Merged", "Fee"):
         table.add_column(col)
     for fill in fills:
         if fill["exit"]:
@@ -317,7 +319,7 @@ def cmd_trades(cfg: dict, limit: int, hours: float | None,
             kind = "maker"
         table.add_row(
             _fmt_ts(fill["ts"]),
-            fill["market"][:40],
+            fill["market"],
             kind,
             fill["side"],
             f"{fill['price']:.3f}",
@@ -377,8 +379,12 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
     if not markets:
         console.print("no per-market activity yet — run the bot in paper mode first")
         return
+    console.print("[bold]Markets (full question / condition ID)[/]")
+    for m in markets:
+        console.print(f"  {m['market'] or '—'}\n    {m['cid']}")
     table = Table(title=f"Per-market performance — {report['date']}")
-    for col in ("Market", "Maker", "Taker", "Exit", "Buy $", "Merge $",
+    table.add_column("Market", overflow="fold")
+    for col in ("Maker", "Taker", "Exit", "Buy $", "Merge $",
                 "Trading", "Est Rwd", "Est Net", "Hedge $", "Fees", "Markout",
                 "Uptime", "Recovery / Evidence"):
         table.add_column(col)
@@ -407,7 +413,7 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
             reco = (f"{reco} carry merge<={m['cross_day_merge_pairs_upper_bound']:.0f} "
                     f"exit<={m['cross_day_exit_shares_upper_bound']:.0f}").strip()
         table.add_row(
-            (m["market"] or m["cid"][:12])[:40],
+            m["market"] or m["cid"][:12],
             str(m["maker_fills"]),
             str(m["taker_fills"]),
             str(m["exits"]),
@@ -423,9 +429,6 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
             reco,
         )
     console.print(table)
-    console.print("[bold]Condition IDs（可直接复制给 recovery-history）[/]")
-    for m in markets:
-        console.print(f"  {m['cid']}  {m['market'] or '—'}")
     console.print(
         "\n[dim]Est Net = trading cashflow + estimated reward; it excludes "
         "market-level realized rewards and inventory MTM. Account rewards are not "
