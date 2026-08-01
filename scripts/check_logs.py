@@ -69,7 +69,26 @@ def main(minutes: int = 10):
         for s in skips[-5:]:
             print(f"  {s.strip()[:300]}")
 
-    # ── 5. Order failures ──
+    # ── 5. Order duplicates ──
+    placed = re.findall(r"ORDER_PLACED.*price=([\d.]+).*size=([\d.]+).*side=(\w+)", "\n".join(recent))
+    placed_counts = Counter(placed)
+    cancelled_counts = Counter()
+    for line in recent:
+        m = re.search(r"ORDER_CANCELLED.*price=([\d.]+).*size=([\d.]+).*side=(\w+)", line)
+        if m:
+            cancelled_counts[(m.group(3), m.group(1), m.group(2))] += 1
+    # GTD refresh overlap: new order placed before old one is cancelled,
+    # so one "extra" PLACED per side at any moment is normal.
+    dupes = {k: (v, cancelled_counts.get(k, 0)) for k, v in placed_counts.items()
+             if v - cancelled_counts.get(k, 0) > 1}
+    if dupes:
+        print(f"\n🔴 重复报价（placed - cancelled > 1）:")
+        for (side, price, size), (placed_n, cancelled_n) in dupes.items():
+            print(f"  {side} x{size} @ {price} — placed {placed_n}, cancelled {cancelled_n}")
+    else:
+        print("✅ 无重复报价")
+
+    # ── 6. Order failures ──
     fails = [l for l in recent if "ORDER_POST_FAILED" in l or "ORDER_CANCEL_FAILED" in l
              or "request error" in l]
     if fails:
@@ -77,7 +96,7 @@ def main(minutes: int = 10):
         for f in fails:
             print(f"  {f.strip()[:300]}")
 
-    # ── 6. WebSocket ──
+    # ── 7. WebSocket ──
     ws = [l for l in recent if any(k in l for k in ("WebSocket", "websocket", "ws_fill",
                 "subscripti", "disconnect", "feed stale", "feed_age"))]
     if ws:
@@ -85,14 +104,14 @@ def main(minutes: int = 10):
         for w in ws[-5:]:
             print(f"  {w.strip()[:200]}")
 
-    # ── 7. Controller ──
+    # ── 8. Controller ──
     ctrl = [l for l in recent if "controller adjusted" in l]
     if ctrl:
         print(f"\n🎛️ Controller:")
         for c in ctrl[-3:]:
             print(f"  {c.strip()[:300]}")
 
-    # ── 8. WARNINGs not covered above ──
+    # ── 9. WARNINGs not covered above ──
     covered = {*errors, *phases, *hedges, *skips, *fails, *ws, *ctrl}
     other_warn = [l for l in recent if "WARNING" in l and l not in covered]
     if other_warn:

@@ -113,6 +113,7 @@ class PendingHedge:
     target_token_shares: float
     created_ts: float
     ws_observed: float = 0.0
+    notified: bool = False  # 已发送 DingTalk 通知，防止 record_user_fill / refresh_state 重复推送
 
 
 @dataclass
@@ -1185,6 +1186,21 @@ class LiveBroker:
                 })
                 if filled > 0:
                     LiveBroker._register_pending_hedge(self, market, token_id, filled)
+                    _notify_live_fill(
+                        getattr(self, "notifier", None),
+                        {
+                            "ts": time.time(), "cid": market.condition_id,
+                            "market": market.question[:50],
+                            "side": "YES" if token_id == market.yes_token else "NO",
+                            "token": token_id, "price": max_price, "size": filled,
+                            "taker": True,
+                        },
+                        "BUY",
+                    )
+                    with self._state_lock:
+                        pending = self._pending_hedges.get(market.condition_id)
+                        if pending is not None:
+                            pending.notified = True
         except Exception as e:  # noqa: BLE001
             log.error("taker order failed %s @ %.3f: %s", token_id[:12], max_price, e)
             return 0.0
@@ -1236,6 +1252,8 @@ class LiveBroker:
             if pending is not None and side == "BUY" and pending.token_id == token_id:
                 pending_part = min(size, max(0.0, pending.size - pending.ws_observed))
                 pending.ws_observed += pending_part
+            # taker_buy 已发送即时通知则跳过，避免同一笔 FAK 对冲重复推送
+            skip_notify = pending is not None and pending.notified
             local_delta = delta - pending_part
             if abs(local_delta) > 1e-9:
                 self._token_shares[token_id] = max(
@@ -1276,7 +1294,8 @@ class LiveBroker:
             "pair_cap": context.get("pair_cap"),
             "expected_pair_pnl": context.get("expected_pair_pnl"),
         })
-        _notify_live_fill(getattr(self, "notifier", None), entry, side)
+        if not skip_notify:
+            _notify_live_fill(getattr(self, "notifier", None), entry, side)
 
     def reconcile_orders(self) -> None:
         """Rebuild local order state from exchange truth."""
@@ -1396,7 +1415,14 @@ class LiveBroker:
                 log.info("LIVE FILL detected %s %s +%.1f shares",
                          market.question[:40],
                          "YES" if token == market.yes_token else "NO", gained)
-                _notify_live_fill(getattr(self, "notifier", None), entry, "BUY")
+                skip_notify = False
+                if "price" in entry:
+                    with self._state_lock:
+                        pending = self._pending_hedges.get(market.condition_id)
+                        if pending is not None and pending.notified:
+                            skip_notify = True
+                    if not skip_notify:
+                        _notify_live_fill(getattr(self, "notifier", None), entry, "BUY")
         self.fills_log = self.fills_log[-500:]
 
         post_poll: dict[str, float] = {}
