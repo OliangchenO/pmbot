@@ -76,7 +76,7 @@ def main(minutes: int = 10):
     for line in recent:
         m = re.search(r"ORDER_CANCELLED.*price=([\d.]+).*size=([\d.]+).*side=(\w+)", line)
         if m:
-            cancelled_counts[(m.group(3), m.group(1), m.group(2))] += 1
+            cancelled_counts[(m.group(1), m.group(2), m.group(3))] += 1
     # GTD refresh overlap: new order placed before old one is cancelled,
     # so one "extra" PLACED per side at any moment is normal.
     dupes = {k: (v, cancelled_counts.get(k, 0)) for k, v in placed_counts.items()
