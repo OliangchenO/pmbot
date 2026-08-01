@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import contextlib
 import csv
+import json
 import logging
 import math
 import os
@@ -410,6 +411,13 @@ class Bot:
         self._merge_task: asyncio.Task | None = None
         self._over_since: dict[str, float] = {}
         self._last_flatten: dict[str, float] = {}
+        # P1.3: markout-trip banned markets — 持久化到 data/banned_markets.json
+        self._banned_cids: set[str] = set()
+        self._banned_path = (
+            Path((cfg.get("metrics") or {}).get("db_path", "data/metrics.db")).parent
+            / "banned_markets.json"
+        )
+        self._load_banned_cids()
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
         self._scale = 1.0
@@ -420,6 +428,28 @@ class Bot:
         self._market_locks: dict[str, asyncio.Lock] = {}
         self.guards.on_trip = self._schedule_market_pull
         self.guards.on_side_block = self._schedule_side_pull
+
+    def _load_banned_cids(self) -> None:
+        """从 JSON 文件加载持久化的 banned 市场，使 markout-ban 在重启后不丢失。"""
+        try:
+            if not self._banned_path.exists():
+                return
+            data = json.loads(self._banned_path.read_text())
+            self._banned_cids = set(data.get("banned_cids", []))
+            log.info("加载 %d 个 banned 市场（文件: %s）",
+                     len(self._banned_cids), self._banned_path)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            log.warning("无法加载 banned_markets.json: %s", e)
+
+    def _persist_banned_cids(self) -> None:
+        """持久化 banned 市场列表，重启后不丢失。"""
+        try:
+            self._banned_path.parent.mkdir(parents=True, exist_ok=True)
+            self._banned_path.write_text(json.dumps({
+                "banned_cids": sorted(self._banned_cids),
+            }, indent=2))
+        except OSError as e:
+            log.warning("无法持久化 banned_markets.json: %s", e)
 
     async def run(self) -> None:
         if not self.paper:
@@ -675,9 +705,15 @@ class Bot:
         # A small, still-manageable residual cannot earn rewards until it reaches
         # this market's rewardsMinSize. Keep it on the recovery path without
         # spending a normal scan slot; once it reaches min_size it occupies one.
+        ranked_cids = {m.condition_id for m in ranked}
+        # A locked market that is still in ranked would survive via sticky
+        # selection on its own score — it doesn't need to occupy a slot.
+        # Only markets that depend SOLELY on inventory to stay (not in
+        # ranked) count as occupying.
         occupying = [
             m for m in locked
-            if abs(self.broker.unpaired_shares(m)) >= m.min_size
+            if (abs(self.broker.unpaired_shares(m)) >= m.min_size
+                and m.condition_id not in ranked_cids)
         ][:top_n]
         occupying_cids = {m.condition_id for m in occupying}
         free_locked = [m for m in locked if m.condition_id not in occupying_cids]
@@ -743,6 +779,8 @@ class Bot:
         if rotate:
             self._last_rotate = time.time()
         exclude = set() if initial else self._rotatable_tripped_cids()
+        # P1.3: 把 markout-ban 的 cid 也排除，确保 banned 市场不会被重新扫入。
+        exclude |= self._banned_cids
         log.info("scanning for reward markets…%s",
                  f" (rotating out {len(exclude)} tripped)" if exclude else "")
         ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
@@ -1090,6 +1128,12 @@ class Bot:
             self.guards.trip_market(
                 cid, now, f"avg markout {avg_cents:+.1f}c over {n} fills",
                 m.question if m else cid)
+            # P1.3: markout-ban on trip — 一次 trip 直接 ban，持久化到磁盘，重启不丢失。
+            if self.cfg["guards"].get("markout_ban_on_trip", False):
+                self._banned_cids.add(cid)
+                self._persist_banned_cids()
+                log.warning("markout-ban — 已将 %s 加入禁止名单（持久化，重启后仍然有效）",
+                            (m.question if m else cid)[:50])
             self.markouts.reset_market(cid)
         managed = {m.condition_id: m for m in self.markets}
         for m in self.broker.held_markets():

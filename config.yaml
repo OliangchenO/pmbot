@@ -281,6 +281,12 @@ guards:
   markout_window_minutes: 120
   markout_min_samples: 5
   markout_trip_cents: -1.5
+  # markout trip 后除 45 分钟冷却外，是否将市场加入禁止名单（持久化到磁盘，重启后仍然有效）。
+  # 开启后：一次 markout trip → 直接 ban 掉该市场，持久化到 data/banned_markets.json
+  # 避免反复被同一个有毒市场反向套利。若需手动清除 banned 市场，删除该 JSON 文件或编辑其中的 cid 列表。
+  # 关闭后：保持原有行为，冷却 45 分钟后该市场仍可被重新扫入选入。
+  # P1.3 — markout 联动自动退出市场。
+  markout_ban_on_trip: true
   # Flow imbalance (VPIN-lite): signed taker volume over a rolling window,
   # in YES-equivalent shares. Above the widen threshold the endangered bid
   # fades out progressively (up to flow_widen_max_cents); above the pull

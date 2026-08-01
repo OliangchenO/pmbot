@@ -15,11 +15,11 @@
 - [ ] **P0.2** `recovery_max_loss_cents` 参数调优 — 当前 1.5¢，需跑几天后看 avg/max premium over cap + hedge success rate 再决策
 
 ### 下一步可直接推进
-- [ ] **P0.3** 选市策略优化（`gamma.py`）— 当前 ~0.5% share 线性区间，提升选市质量是关键 P&L 杠杆
+- [x] **P0.3** 选市策略优化（`gamma.py`）— 新增 `ranking_mode` 开关（density/capture），capture 模式使用预期捕获奖励排名 + toxicity/band 权重，`min_liquidity: 2000`
 
 ### P1（风控 / 稳定性）
 - [ ] **P1.1** 每日止损纪律（`risk.daily_loss_limit_usd`）— 评估当前值是否合理
-- [ ] **P1.3** markout 联动自动退出市场 — controller 已有基础，需加自动 drop 逻辑
+- [x] **P1.3** markout 联动自动退出市场 — `markout_ban_on_trip: true`，一次 trip 直接 ban，持久化到 `data/banned_markets.json`，重启后仍然有效
 
 ### P2（效率 / 体验）
 - [ ] **P2.1** controller 第三层（reward objective）— 当前只有 capital tiers + toxicity
