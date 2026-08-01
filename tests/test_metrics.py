@@ -2,11 +2,32 @@
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pmbot.gamma import Market
 from pmbot.metrics import MetricsStore
+
+
+def test_report_totals_use_the_requested_utc_day(tmp_path):
+    store = MetricsStore(str(tmp_path / "metrics.db"))
+    old = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    new = old + timedelta(days=1)
+    store.record_fill({
+        "ts": old.timestamp() + 60, "cid": "old", "market": "Old",
+        "side": "YES", "token": "yes", "price": 0.40, "size": 10,
+    })
+    store.record_merge("old", 10, ts=old.timestamp() + 120)
+    store.record_fill({
+        "ts": new.timestamp() + 60, "cid": "new", "market": "New",
+        "side": "YES", "token": "yes", "price": 0.40, "size": 20,
+    })
+    store.record_realized_reward("2026-07-30", 1.25)
+    store.record_realized_reward("2026-07-31", 2.50)
+
+    assert store.reward_totals("2026-07-30")["realized_24h"] == 1.25
+    assert store.trading_pnl_ledger("2026-07-30")["realized_24h"] == 6.0
+    store.close()
 
 
 def test_metrics_daily_report(tmp_path):

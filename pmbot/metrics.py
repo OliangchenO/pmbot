@@ -948,7 +948,7 @@ class MetricsStore:
             },
         }
 
-    def reward_totals(self) -> dict:
+    def reward_totals(self, date: str | None = None) -> dict:
         """Realized/estimated rewards, all-time and rolling last 24h.
 
         Realized rewards are stored per UTC day (the CLOB finalizes them
@@ -960,13 +960,13 @@ class MetricsStore:
             "SELECT COALESCE(SUM(realized),0) FROM rewards").fetchone()[0]
         est_total = self._conn.execute(
             "SELECT COALESCE(SUM(estimated),0) FROM rewards").fetchone()[0]
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        report_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         realized_24h = self._conn.execute(
             "SELECT COALESCE(SUM(realized),0) FROM rewards WHERE date=?",
-            (today,)).fetchone()[0]
+            (report_date,)).fetchone()[0]
         est_24h = self._conn.execute(
             "SELECT COALESCE(SUM(estimated),0) FROM rewards WHERE date=?",
-            (today,)).fetchone()[0]
+            (report_date,)).fetchone()[0]
         return {
             "realized_total": realized_total, "realized_24h": realized_24h,
             "est_total": est_total, "est_24h": est_24h,
@@ -1037,7 +1037,7 @@ class MetricsStore:
                 out["pnl_24h"] += min(a["sz24"], held) * (1.0 - hpx24 - basis)
         return out
 
-    def trading_pnl_ledger(self) -> dict:
+    def trading_pnl_ledger(self, date: str | None = None) -> dict:
         """Ground-truth realized trading P&L from the cash ledger.
 
         Reconciles the ACTUAL logged cashflows the way the Polymarket trade
@@ -1060,22 +1060,29 @@ class MetricsStore:
         merge are not captured here, which would make the ledger look slightly
         worse than reality; with ``merge_enabled`` this should be small.
         """
-        def _cash(since: float | None) -> float:
-            extra = "" if since is None else " AND ts >= ?"
-            args = () if since is None else (since,)
-            margs = () if since is None else (since,)
+        def _cash(since: float | None, until: float | None = None) -> float:
+            clauses, args = [], []
+            if since is not None:
+                clauses.append("ts >= ?")
+                args.append(since)
+            if until is not None:
+                clauses.append("ts < ?")
+                args.append(until)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             buys = self._conn.execute(
-                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=0" + extra,
+                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=0"
+                + (f" AND {' AND '.join(clauses)}" if clauses else ""),
                 args).fetchone()[0] or 0.0
             sells = self._conn.execute(
-                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=1" + extra,
+                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=1"
+                + (f" AND {' AND '.join(clauses)}" if clauses else ""),
                 args).fetchone()[0] or 0.0
             fees = self._conn.execute(
-                "SELECT COALESCE(SUM(fee),0) FROM fills"
-                + ("" if since is None else " WHERE ts >= ?"), margs).fetchone()[0] or 0.0
+                "SELECT COALESCE(SUM(fee),0) FROM fills" + where,
+                args).fetchone()[0] or 0.0
             merge_cash = self._conn.execute(
-                "SELECT COALESCE(SUM(pairs),0) FROM merges"
-                + ("" if since is None else " WHERE ts >= ?"), margs).fetchone()[0] or 0.0
+                "SELECT COALESCE(SUM(pairs),0) FROM merges" + where,
+                args).fetchone()[0] or 0.0
             return merge_cash + sells - buys - fees
 
         inv_row = self._conn.execute(
@@ -1083,7 +1090,12 @@ class MetricsStore:
         ).fetchone()
         inv = float(inv_row[0]) if inv_row and inv_row[0] is not None else 0.0
         realized_total = _cash(None)
-        realized_24h = _cash(time.time() - 86400)
+        if date is None:
+            realized_24h = _cash(time.time() - 86400)
+        else:
+            day_start = datetime.strptime(date, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc).timestamp()
+            realized_24h = _cash(day_start, day_start + 86400)
         return {
             "realized_total": realized_total,
             "realized_24h": realized_24h,
