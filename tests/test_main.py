@@ -93,6 +93,24 @@ def test_performance_command_keeps_full_market_question(tmp_path):
     assert "ENDMARKER" in market_list
 
 
+def test_performance_command_separates_full_market_entries(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    for cid, question in (("cid-1", "First market"), ("cid-2", "Second market")):
+        store.record_fill({
+            "cid": cid, "market": question, "side": "YES",
+            "token": f"{cid}-yes", "price": 0.5, "size": 10,
+        })
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    market_list = capture.get().split("Per-market performance", maxsplit=1)[0]
+    assert market_list.count("─" * 40) == 1
+
+
 def test_build_live_notifier_uses_enabled_dingtalk_environment(monkeypatch):
     """Removing the live-alert configuration path must disable this behavior."""
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")

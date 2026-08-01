@@ -380,7 +380,9 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         console.print("no per-market activity yet — run the bot in paper mode first")
         return
     console.print("[bold]Markets (full question / condition ID)[/]")
-    for m in markets:
+    for index, m in enumerate(markets):
+        if index:
+            console.print("─" * 72)
         console.print(f"  {m['market'] or '—'}\n    {m['cid']}")
     table = Table(title=f"Per-market performance — {report['date']}")
     table.add_column("Market", overflow="fold")
