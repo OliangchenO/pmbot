@@ -167,7 +167,21 @@ class PaperBroker:
         self._data_path = Path(data_dir) / "paper_state.json"
         self._data_path.parent.mkdir(exist_ok=True)
         self.metrics = None
+        self._load_persisted()
         tracker.on_trade(self._on_trade)
+
+    def _load_persisted(self) -> None:
+        """Restore fills_log and unpaired_since so escalation windows survive restarts."""
+        try:
+            if not self._data_path.exists():
+                return
+            data = json.loads(self._data_path.read_text())
+            self.state.fills_log = data.get("fills", [])
+            self.unpaired_since = {
+                str(k): float(v) for k, v in data.get("unpaired_since", {}).items()
+            }
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            log.warning("could not load persisted state: %s", e)
 
     def _fee_usd(self, market: Market, price: float, size: float) -> float:
         """Taker fee for a fill: rate × (p·(1−p))^exponent × shares.
@@ -556,7 +570,7 @@ class PaperBroker:
         for entry in reversed(self.state.fills_log):
             if entry.get("cid") == cid and "price" in entry:
                 return float(entry["ts"])
-        return None
+        return getattr(self, "unpaired_since", {}).get(cid)
 
     def total_inventory_usd(self) -> float:
         return sum(
@@ -652,6 +666,14 @@ class LiveBroker:
         self._collateral: float = float("nan")
         self._synced = False
         self.fills_log: list[dict] = []
+        # _over_since timestamps that survive restarts so escalate windows
+        # don't reset. Populated by Bot._manage_market_inventory and read
+        # back by last_fill_ts fallback when fills_log is cold (fresh start).
+        metrics_cfg = cfg.get("metrics") or {}
+        self._live_data_path = Path(metrics_cfg.get("db_path", "data/metrics.db")).parent / "live_state.json"
+        self._live_data_path.parent.mkdir(parents=True, exist_ok=True)
+        self.unpaired_since: dict[str, float] = {}
+        self._load_persisted()
         self._ws_deltas: deque[tuple[float, str, float, str, float, str]] = deque()
         # record_user_fill appends on the event loop while refresh_state
         # (worker thread) iterates/trims — guard against concurrent mutation.
@@ -1517,7 +1539,30 @@ class LiveBroker:
         for entry in reversed(self.fills_log):
             if entry.get("cid") == cid and "price" in entry:
                 return float(entry["ts"])
-        return None
+        return getattr(self, "unpaired_since", {}).get(cid)
+
+    def _load_persisted(self) -> None:
+        """Restore unpaired_since so escalation windows survive restarts."""
+        try:
+            if not self._live_data_path.exists():
+                return
+            data = json.loads(self._live_data_path.read_text())
+            self.unpaired_since = {
+                str(k): float(v) for k, v in data.get("unpaired_since", {}).items()
+            }
+            log.info("loaded %d unpaired_since entries from %s",
+                     len(self.unpaired_since), self._live_data_path)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            log.warning("could not load live_state.json: %s", e)
+
+    def _persist_unpaired_since(self) -> None:
+        """Persist unpaired_since so escalate windows survive restarts."""
+        try:
+            self._live_data_path.write_text(json.dumps({
+                "unpaired_since": self.unpaired_since,
+            }, indent=2))
+        except OSError as e:
+            log.warning("could not persist live_state.json: %s", e)
 
     def total_inventory_usd(self) -> float:
         managed = LiveBroker.held_markets(self)

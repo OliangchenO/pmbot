@@ -364,6 +364,7 @@ class Bot:
         self._over_since: dict[str, float] = {}
         self._last_flatten: dict[str, float] = {}
         self._recovery_skip_logged_at: dict[str, float] = {}
+        self._recovery_phase_logged: dict[str, str] = {}
         self._scale = 1.0
         self._was_paused = False
         # Event-driven quote pulls: guards fire these between loop ticks so we
@@ -915,18 +916,17 @@ class Bot:
             return []
         max_price = self._forced_hedge_max_price(m, basis)
         # ── soft recovery window ──
-        if now is not None:
+        if now is not None and self.broker is not None:
             r = self.cfg["risk"]
             soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
             soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
             if soft_loss > 0 and soft_window > 0:
-                over_since = self._over_since.get(m.condition_id)
-                if over_since is not None and now - over_since <= soft_window:
+                last_fill = self.broker.last_fill_ts(m.condition_id)
+                if last_fill is not None and now - last_fill <= soft_window:
                     relaxed = min(1.0 - m.tick, max_price + soft_loss)
                     if relaxed > max_price:
                         max_price = relaxed
-        return [strategy.Quote(q.token_id, min(q.price, max_price),
-                               min(q.size, abs(unpaired)))
+        return [strategy.Quote(q.token_id, min(q.price, max_price), abs(unpaired))
                 for q in desired
                 if q.token_id == complement]
 
@@ -968,9 +968,9 @@ class Bot:
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
         escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
-        if now is not None and escalate_secs > 0:
-            over_since = self._over_since.get(m.condition_id)
-            if over_since is not None and now - over_since >= escalate_secs:
+        if now is not None and escalate_secs > 0 and self.broker is not None:
+            last_fill = self.broker.last_fill_ts(m.condition_id)
+            if last_fill is not None and now - last_fill >= escalate_secs:
                 return self._escalated_recovery_quotes(m, desired, unpaired)
         return self._inventory_recovery_quotes(m, desired, unpaired, now)
 
@@ -987,18 +987,18 @@ class Bot:
         if abs(unpaired) < MIN_TAKER_SHARES:
             return []
         escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
-        if now is not None and escalate_secs > 0:
-            over_since = self._over_since.get(m.condition_id)
-            if over_since is not None and now - over_since >= escalate_secs:
+        if now is not None and escalate_secs > 0 and self.broker is not None:
+            last_fill = self.broker.last_fill_ts(m.condition_id)
+            if last_fill is not None and now - last_fill >= escalate_secs:
                 return self._escalated_recovery_quotes(m, desired, unpaired)
         return self._inventory_recovery_quotes(m, desired, unpaired, now)
 
     def _escalated_recovery_quotes(self, m: gamma.Market,
                                     desired: list[strategy.Quote],
                                     unpaired: float) -> list[strategy.Quote]:
-        """Phase 2: complement side at normal fair-price, size capped to unpaired shares."""
+        """Phase 2: complement at fair-price, size = unpaired shares."""
         complement = m.no_token if unpaired > 0 else m.yes_token
-        return [strategy.Quote(q.token_id, q.price, min(q.size, abs(unpaired)))
+        return [strategy.Quote(q.token_id, q.price, abs(unpaired))
                 for q in desired
                 if q.token_id == complement]
 
@@ -1142,39 +1142,36 @@ class Bot:
             )
             normal_desired = desired
             recovery_path = "normal"
+            escalate_secs = float(self.cfg["risk"].get("recovery_escalate_after_minutes", 0)) * 60.0
             if m.condition_id not in selected_cids:
                 desired = self._held_market_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "inventory_recovery"
-                # Detect escalation: if the complement quote is at fair-price
-                # (not pair-capped), we are in Phase 2.
-                if abs(unpaired) >= MIN_TAKER_SHARES and desired:
-                    complement = m.no_token if unpaired > 0 else m.yes_token
-                    basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
-                    basis = basis_fn(m) if basis_fn else None
-                    if basis is not None:
-                        cap = self._forced_hedge_max_price(m, basis)
-                        for q in desired:
-                            if q.token_id == complement and q.price > cap + 1e-9:
-                                recovery_path = "escalated_recovery"
-                                break
+                # Detect escalation by checking the same condition as
+                # _held_market_recovery_quotes — not by price comparison,
+                # because the soft window can push a pair-capped quote above cap.
+                if (escalate_secs > 0 and self.broker is not None
+                        and abs(unpaired) >= MIN_TAKER_SHARES and desired):
+                    last_fill = self.broker.last_fill_ts(m.condition_id)
+                    if last_fill is not None and now - last_fill >= escalate_secs:
+                        recovery_path = "escalated_recovery"
             elif cooled_down:
                 desired = self._cooldown_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "cooldown_recovery"
-                # Same escalation detection for cooldown markets
-                if abs(unpaired) >= MIN_TAKER_SHARES and desired:
-                    complement = m.no_token if unpaired > 0 else m.yes_token
-                    basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
-                    basis = basis_fn(m) if basis_fn else None
-                    if basis is not None:
-                        cap = self._forced_hedge_max_price(m, basis)
-                        for q in desired:
-                            if q.token_id == complement and q.price > cap + 1e-9:
-                                recovery_path = "escalated_recovery"
-                                break
+                if (escalate_secs > 0 and self.broker is not None
+                        and abs(unpaired) >= MIN_TAKER_SHARES and desired):
+                    last_fill = self.broker.last_fill_ts(m.condition_id)
+                    if last_fill is not None and now - last_fill >= escalate_secs:
+                        recovery_path = "escalated_recovery"
             else:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired, now)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     recovery_path = "inventory_recovery"
+                # Escalate to Phase 2 after the window, same as held-only / cooldown.
+                if escalate_secs > 0 and self.broker is not None and desired:
+                    last_fill = self.broker.last_fill_ts(m.condition_id)
+                    if last_fill is not None and now - last_fill >= escalate_secs:
+                        desired = self._escalated_recovery_quotes(m, normal_desired, unpaired)
+                        recovery_path = "escalated_recovery"
                 desired = self._filter_quotes_for_side_guard(
                     desired, unpaired=unpaired, now=now)
             if needs_recovery and not desired:
@@ -1194,6 +1191,21 @@ class Bot:
             current = self.broker.open_quotes(m)
             final = strategy.reconcile_quotes(
                 current, desired, self.cfg["quoting"]["requote_move_cents"])
+            # ── log phase transitions (debounced) ──
+            if needs_recovery and recovery_path != "normal":
+                prev = self._recovery_phase_logged.get(m.condition_id)
+                if prev != recovery_path:
+                    phase_label = {
+                        "inventory_recovery": "Phase 1 (软窗口补单)",
+                        "cooldown_recovery": "Phase 1 (冷却期补单)",
+                        "escalated_recovery": "Phase 2 (升级: 公允价补单)",
+                    }
+                    log.warning("补单阶段 '%s': %s  敞口=%.0f",
+                                phase_label.get(recovery_path, recovery_path),
+                                m.question[:60], unpaired)
+                    self._recovery_phase_logged[m.condition_id] = recovery_path
+            elif recovery_path == "normal":
+                self._recovery_phase_logged.pop(m.condition_id, None)
             # Phase 2 (escalated recovery) only quotes one side — judge "in-band"
             # by whether the complement is present (not whether both sides are).
             is_escalated = recovery_path == "escalated_recovery"
@@ -1229,8 +1241,8 @@ class Bot:
                     soft_loss = float(r.get("recovery_max_loss_cents", 0)) / 100.0
                     soft_window = float(r.get("recovery_soft_window_minutes", 0)) * 60.0
                     if soft_loss > 0 and soft_window > 0:
-                        over_since = self._over_since.get(m.condition_id)
-                        if over_since is not None and now - over_since <= soft_window:
+                        last_fill = self.broker.last_fill_ts(m.condition_id)
+                        if last_fill is not None and now - last_fill <= soft_window:
                             relaxed = min(1.0 - m.tick, cap + soft_loss)
                             if relaxed > cap:
                                 audit_cap = relaxed
@@ -1302,11 +1314,12 @@ class Bot:
         if last_fill_ts is not None and last_fill_ts <= now:
             start = min(start, last_fill_ts)
             self._over_since[cid] = start
-        # Persist unpaired_since to survive restarts. PaperBroker saves via
-        # _persist(); LiveBroker mirrors to fills_log (ts of the last fill
-        # for this cid is already persisted via last_fill_ts).
+        # Persist unpaired_since to survive restarts.
         if hasattr(self.broker, "unpaired_since"):
             self.broker.unpaired_since[cid] = self._over_since[cid]
+            persist_fn = getattr(self.broker, "_persist_unpaired_since", None)
+            if persist_fn is not None:
+                persist_fn()
         if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
             await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:

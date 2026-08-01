@@ -129,7 +129,7 @@ def compute_quotes(
     # reward band and forfeit rewards. Fees apply solely on taker merges/exits.
 
     quote_min_size = (market.min_size if min_quote_size is None
-                      else min(market.min_size, min_quote_size))
+                      else max(market.min_size, min_quote_size))
     base_size = max(quote_min_size * q["size_mult_of_min"] * scale, quote_min_size)
     size = float(int(base_size * max(0.5, min(2.0, size_factor))))
 
