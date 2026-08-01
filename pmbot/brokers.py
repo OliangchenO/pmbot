@@ -1549,6 +1549,24 @@ class LiveBroker:
         unpaired = abs(float(d.get("yes") or 0.0) - float(d.get("no") or 0.0))
         if cached is not None and abs(cached[1] - unpaired) <= 1e-9:
             return cached[0]
+        # Fallback: Data API omitted cost fields for this market's excess leg.
+        # Estimate the average entry price from our own fill log so recovery
+        # and forced hedging are not blocked by missing upstream data.
+        excess_side = "YES" if key == "yes" else "NO"
+        total_cost = 0.0
+        total_shares = 0.0
+        for entry in self.fills_log:
+            if (entry.get("cid") == market.condition_id
+                    and entry.get("side") == excess_side
+                    and not entry.get("exit")
+                    and "price" in entry
+                    and "size" in entry):
+                total_cost += float(entry["price"]) * float(entry["size"])
+                total_shares += float(entry["size"])
+        if total_shares > 0:
+            basis = total_cost / total_shares
+            if 0.0 < basis < 1.0:
+                return basis
         return None
 
     def held_markets(self) -> list[Market]:
