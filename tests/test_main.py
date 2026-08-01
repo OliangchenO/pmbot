@@ -111,6 +111,44 @@ def test_performance_command_separates_full_market_entries(tmp_path):
     assert market_list.count("─" * 40) == 1
 
 
+def test_performance_table_separates_market_rows(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    for cid, question in (("cid-1", "First market"), ("cid-2", "Second market")):
+        store.record_fill({
+            "cid": cid, "market": question, "side": "YES",
+            "token": f"{cid}-yes", "price": 0.5, "size": 10,
+        })
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    table_output = capture.get()
+    assert table_output.count("├") >= 2
+
+
+def test_performance_table_shows_full_chinese_recovery_evidence(tmp_path):
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    store.record_fill({
+        "cid": "cid", "market": "Market", "side": "YES",
+        "token": "yes", "price": 0.5, "size": 10,
+    })
+    store.record_recovery_event("cid", "skip", 10, reason="over_hard_cap")
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    compact = "".join(capture.get().split())
+    for header in ("市场", "成交", "资金", "收益", "风险", "恢复 / 证据"):
+        assert "".join(header.split()) in compact
+    assert "1s/0q/0h" in compact
+
+
 def test_build_live_notifier_uses_enabled_dingtalk_environment(monkeypatch):
     """Removing the live-alert configuration path must disable this behavior."""
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.test/robot")

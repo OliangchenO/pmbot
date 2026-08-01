@@ -384,12 +384,11 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         if index:
             console.print("─" * 72)
         console.print(f"  {m['market'] or '—'}\n    {m['cid']}")
-    table = Table(title=f"Per-market performance — {report['date']}")
-    table.add_column("Market", overflow="fold")
-    for col in ("Maker", "Taker", "Exit", "Buy $", "Merge $",
-                "Trading", "Est Rwd", "Est Net", "Hedge $", "Fees", "Markout",
-                "Uptime", "Recovery / Evidence"):
+    table = Table(title=f"Per-market performance — {report['date']}", show_lines=True)
+    table.add_column("市场", overflow="fold")
+    for col in ("成交", "资金", "收益", "风险"):
         table.add_column(col)
+    table.add_column("恢复 / 证据", overflow="fold", min_width=18)
     for m in markets:
         markout = "—"
         if m["markout_cents"] is not None:
@@ -416,18 +415,12 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
                     f"exit<={m['cross_day_exit_shares_upper_bound']:.0f}").strip()
         table.add_row(
             m["market"] or m["cid"][:12],
-            str(m["maker_fills"]),
-            str(m["taker_fills"]),
-            str(m["exits"]),
-            f"${m['buy_cost_usd']:.2f}",
-            f"${m['merge_proceeds_usd']:.2f}",
+            f"挂/吃/退 {m['maker_fills']}/{m['taker_fills']}/{m['exits']}",
+            f"买/合/盈亏 ${m['buy_cost_usd']:.2f}/${m['merge_proceeds_usd']:.2f}/"
             f"${m['trading_pnl_usd']:+.2f}",
-            f"${m['est_rewards_usd']:+.2f}",
-            f"${m['net_pnl_est_usd']:+.2f}",
-            f"${m['hedge_cost_usd']:.2f}",
-            f"${m['fees_usd']:.2f}",
-            markout,
-            f"{m['uptime_pct']:.0f}%",
+            f"奖/净 ${m['est_rewards_usd']:+.2f}/${m['net_pnl_est_usd']:+.2f}",
+            f"对冲/费 ${m['hedge_cost_usd']:.2f}/${m['fees_usd']:.2f}\n"
+            f"偏离 {markout}\n在线 {m['uptime_pct']:.0f}%",
             reco,
         )
     console.print(table)
