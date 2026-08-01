@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pmbot.gamma import Market
 from pmbot.metrics import MetricsStore
 
 
@@ -155,6 +156,75 @@ def test_performance_report(tmp_path):
     assert m["hedge_cost_usd"] == 5.0
     assert m["markout_cents"] == 1.0
     assert m["uptime_pct"] == 50.0
+
+
+def test_net_shadow_inputs_are_market_scoped_and_charge_negative_markout(tmp_path):
+    """P2.1 must never borrow another market's measured loss or activity."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+    store.record_fill({"ts": ts, "cid": "A", "market": "A", "side": "YES",
+                       "token": "ay", "price": 0.45, "size": 10})
+    store.record_fill({"ts": ts, "cid": "B", "market": "B", "side": "YES",
+                       "token": "by", "price": 0.45, "size": 50})
+    store.record_markout({"ts": ts, "fill_ts": ts, "cid": "A", "market": "A",
+                          "horizon": 300, "markout": -0.02})
+    with store._lock:
+        store._conn.execute("INSERT INTO uptime (minute_ts,cid,in_band) VALUES (?,?,?)",
+                            (int(ts) // 60, "A", 1))
+        store._conn.commit()
+    inputs = store.net_shadow_inputs(lookback_hours=1, now=ts)
+    store.close()
+
+    assert inputs["A"]["maker_fill_count"] == 1
+    assert inputs["A"]["markout_cost_per_hour"] == 0.02
+    assert inputs["B"]["maker_fill_count"] == 1
+    assert inputs["B"]["markout_samples"] == 0
+
+
+def test_net_shadow_inputs_use_explicit_market_reward_realization(tmp_path):
+    """Only an official cid-attributed reward may calibrate a market's pool."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    now = time.time()
+    with store._lock:
+        store._conn.execute("INSERT INTO reward_samples (minute_ts,cid,est_usd) VALUES (?,?,?)",
+                            (int(now) // 60, "A", 2.0))
+        store._conn.commit()
+    store.record_market_realized_reward(
+        datetime.now(timezone.utc).strftime("%Y-%m-%d"), "A", 1.5, "official")
+
+    inputs = store.net_shadow_inputs(lookback_hours=1, now=now)
+    store.close()
+
+    assert inputs["A"]["reward_realization"] == 0.75
+    assert inputs["A"]["reward_samples"] == 1
+
+
+def test_net_shadow_snapshot_preserves_distinct_legacy_and_shadow_rankings(tmp_path):
+    """The report needs both rankings to make P2.1 comparable after a scan."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    scanned_at = datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp()
+    a = Market("A", "A", "ay", "an", 1, 2, 240, 100, 1, 0.01, None, False,
+               score=2.0, net_shadow_score=0.1,
+               net_shadow_inputs={"insufficient_sample": False})
+    b = Market("B", "B", "by", "bn", 1, 2, 120, 100, 1, 0.01, None, False,
+               score=1.0, net_shadow_score=0.2,
+               net_shadow_inputs={"insufficient_sample": True})
+    store.record_net_shadow_snapshot([a, b], scanned_at, {"top_n": 1})
+    report = store.net_shadow_report("2026-08-01")
+    store.close()
+
+    assert [row["cid"] for row in report["legacy_top"]] == ["A"]
+    assert [row["cid"] for row in report["shadow_top"]] == ["B"]
+    assert report["status"] == "ok"
+
+
+def test_performance_report_marks_missing_shadow_scan_data_explicitly(tmp_path):
+    """An empty history is uncertainty, not evidence that old and new picks agree."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    report = store.performance_report("2026-08-01")
+    store.close()
+
+    assert report["shadow_selection"]["status"] == "no_shadow_scan_data"
 
 
 def test_performance_report_attributes_market_cashflow_and_estimated_reward(tmp_path):

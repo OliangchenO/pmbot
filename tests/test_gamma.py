@@ -86,6 +86,38 @@ def test_scan_full_returns_all_ranked_not_just_top_n(monkeypatch):
     assert [m.condition_id for m in gamma.scan(cfg, full=True)] == ["a", "b", "c"]
 
 
+def test_shadow_score_does_not_change_legacy_scan_order(monkeypatch):
+    """P2.1 is observational: a better shadow score cannot replace a legacy pick."""
+    high = _mk("high", pool=300, liquidity=5000, volume_24h=0)
+    low = _mk("low", pool=100, liquidity=5000, volume_24h=0)
+    monkeypatch.setattr(gamma, "fetch_reward_markets", lambda: [low, high])
+    monkeypatch.setattr(gamma, "_fetch_market_fees", lambda *a: (0, 1.0))
+    cfg = _scan_cfg(min_pool_per_day=25, top_n_markets=2, net_shadow={
+        "min_reward_samples": 1, "min_uptime_samples": 1,
+        "min_markout_samples": 1, "min_recovery_samples": 1,
+        "reward_realization_prior": 0.5, "uptime_prior": 0.5,
+        "markout_cost_per_hour_prior": 0.2,
+        "recovery_cost_per_hour_prior": 0.3,
+    })
+    inputs = {
+        "high": {"reward_realization": 0.1, "reward_samples": 1,
+                 "uptime_ratio": 0.1, "uptime_samples": 1,
+                 "markout_cost_per_hour": 2.0, "markout_samples": 1,
+                 "recovery_cost_per_hour": 1.0, "recovery_samples": 1,
+                 "taker_fee_per_hour": 0.0, "taker_fee_samples": 0},
+        "low": {"reward_realization": 1.0, "reward_samples": 1,
+                "uptime_ratio": 1.0, "uptime_samples": 1,
+                "markout_cost_per_hour": 0.0, "markout_samples": 1,
+                "recovery_cost_per_hour": 0.0, "recovery_samples": 1,
+                "taker_fee_per_hour": 0.0, "taker_fee_samples": 0},
+    }
+
+    ranked = gamma.scan(cfg, full=True, shadow_inputs=inputs)
+
+    assert [m.condition_id for m in ranked] == ["high", "low"]
+    assert ranked[1].net_shadow_score > ranked[0].net_shadow_score
+
+
 def test_fetch_market_loads_held_market_without_rewards(monkeypatch):
     """A held position must be manageable even after its reward pool ends."""
     raw = {

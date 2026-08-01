@@ -75,12 +75,12 @@
 
 - [x] 对每个未配对库存计算互补 token 的 break-even 买价，包含已知 taker fee。
 - [x] 将软回收窗口的额外容忍值记录为“预期单对损失”，而非仅记录报价溢价。
-- [x] 对超过市场级硬上限的被动补仓只记录建议，不自动抬价。
+- [x] 软窗口内的被动补仓不超过市场级硬上限；超时后使用 `market_center_recovery`，按盘口中枢策略价挂等量互补单，即使普通 `mid_range` 过滤不产出报价。
 - [x] 已记录回收事件、预期单对 PnL、软窗口预期损失与最终库存终态；`recovery_max_loss_cents` 参数值须在真实样本积累后再调整。
 
 **涉及文件：** `pmbot/main.py::_inventory_recovery_quotes`、`pmbot/brokers.py`、`pmbot/metrics.py`、`tests/test_main.py`。
 
-**验收：** 每个 recovery event 都能关联到最终 PnL；任何主动 hedge 均可验证 `成本 + fee <= 1.00` 或有显式例外原因。
+**验收：** 每个 recovery event 都能关联到最终 PnL；超时恢复单可复核其盘口中枢、策略价与预期配对盈亏，且方向/数量只减少现有敞口；任何主动 hedge 均可验证 `成本 + fee <= 1.00` 或有显式例外原因。
 
 ### P1.2 保留并评估每日止损纪律
 
@@ -106,9 +106,9 @@ expected_net_hourly =
   - 预期 taker fee
 ```
 
-- [ ] 在 `gamma.py` 保留现有 `density/capture` 排名，新增只记录的 `net_shadow_score`。
-- [ ] 使用市场级而非全局 markout、uptime、奖励兑现率和回收成本；样本不足市场使用保守先验。
-- [ ] 在 `performance` 中并列显示旧评分与影子评分的候选集合、实际后续表现。
+- [x] 在 `gamma.py` 保留现有 `density/capture` 排名，新增只记录的 `net_shadow_score`。
+- [x] 使用市场级而非全局 markout、uptime、奖励兑现率和回收成本；样本不足市场使用保守先验。
+- [x] 在 `performance` 中并列显示旧评分与影子评分的候选集合、实际后续表现。
 - [ ] 连续 7 天评估影子前 N 与实际已选市场的净收益差异。
 
 **涉及文件：** `pmbot/gamma.py`、`pmbot/strategy.py`、`pmbot/metrics.py`、`pmbot/main.py`、`tests/test_gamma.py`、`tests/test_strategy.py`。
@@ -180,4 +180,5 @@ expected_net_hourly =
 | 2026-08-01 | P0.4 市场级现金流、奖励、库存快照、事件、终态与跨日归因 | [x] | `performance_report()`、`market_rewards`、`inventory_snapshots`、`inventory_events`、`tests/test_metrics.py`、`tests/test_main.py` | 已完成可核对现金流、只读库存采样、终态归因、官方逐市场奖励导入、未配对 MTM、每对现金流与跨日库存上界；真实奖励兑现率仍需后续运行积累 |
 | 2026-08-01 | P0.5 奖励预估校准影子报表 | [x] | `reward_calibration_report()`、`pmbot.main reward-calibration --days 7`、`tests/test_metrics.py` | 已可逐市场逐日输出兑现率或无归因状态；没有官方市场级实际奖励时不能用于策略调整 |
 | 2026-08-01 | P0.5 校准可解释性 | [x] | `reward_calibration_report()`、`uptime`、`recovery_events`、`guard_events`、`tests/test_metrics.py` | 已显示 in-band uptime、recovery 跳过原因和普通 guard 拉单事件；事件原因仅记录实际发生的拉单动作 |
-| 2026-08-01 | P1 补单/强平经济约束与日止损审计 | [x] | `recovery_events`、`pause_day_events`、`logs/pmbot.YYYY-MM-DD.log`、`tests/test_main.py`、`tests/test_metrics.py` | 被动补单严格不超过含手续费的硬上限；软窗口仅记录预期损失；强平、拒绝、成交与日止损触发/恢复均有可复核依据。真实样本积累前不调整风险参数。 |
+| 2026-08-01 | P1 补单/强平经济约束与日止损审计 | [x] | `recovery_events`、`pause_day_events`、`logs/pmbot.YYYY-MM-DD.log`、`tests/test_main.py`、`tests/test_strategy.py`、`tests/test_metrics.py` | 软窗口被动补单不超过含手续费硬上限；超时后按盘口中枢策略价补等量互补仓位，可记录超保本的预期损失但不扩大同向敞口；强平、拒绝、成交与日止损触发/恢复均有可复核依据。真实样本积累前不调整风险参数。 |
+| 2026-08-01 | P2.1 净收益影子评分 | [-] | `net_shadow_scans`、`net_shadow_candidates`、`pmbot.strategy.compute_net_shadow_score()`、`pmbot.main performance`、P2.1 定向 pytest | 已记录旧评分与影子评分、市场级输入来源和保守先验；不参与选市、报价、下单或仓位。连续 7 天真实候选/后续收益比较仍待数据积累，P2.2 保持未开始。 |

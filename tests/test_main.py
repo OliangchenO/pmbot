@@ -149,6 +149,44 @@ def test_recovery_history_command_renders_decision_reason_and_inventory(tmp_path
     assert "最新库存" in output
     assert "unpaired" in output
 
+
+def test_performance_command_shows_legacy_and_shadow_candidates(tmp_path):
+    """Operators must be able to compare P2.1 without reading SQLite directly."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    ts = main.datetime.now(main.timezone.utc).timestamp()
+    legacy = _scored("legacy", 2.0)
+    shadow = _scored("shadow", 1.0)
+    shadow.net_shadow_score = 0.2
+    legacy.net_shadow_score = 0.1
+    store.record_net_shadow_snapshot([legacy, shadow], ts, {"top_n": 1})
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    output = capture.get()
+    assert "Net shadow candidates" in output
+    assert "legacy" in output
+    assert "shadow" in output
+
+
+def test_performance_command_prints_full_condition_id_for_recovery_lookup(tmp_path):
+    """Operators need a copyable CID, not just a shortened market label."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    cid = "0x" + "a" * 64
+    store = main._metrics_store(cfg)
+    store.record_fill({"cid": cid, "market": "Question", "side": "YES",
+                       "token": "yes", "price": 0.5, "size": 10})
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_performance(cfg, None)
+
+    assert cid in capture.get()
+
 def test_guard_trip_pulls_quotes_immediately(tmp_path):
     async def scenario():
         bot = _bot(tmp_path)
@@ -330,6 +368,41 @@ def test_rescan_is_sticky_and_swaps_incrementally(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_path, monkeypatch):
+    """Passive P2.1 instrumentation must not make the shadow winner tradable."""
+    from pmbot import gamma as gamma_mod
+    from pmbot.books import BookTracker
+
+    async def fake_start(self):
+        return None
+
+    monkeypatch.setattr(BookTracker, "start", fake_start)
+    legacy_winner, shadow_winner = _scored("legacy", 2.0), _scored("shadow", 1.0)
+    shadow_winner.daily_pool = 300
+    monkeypatch.setattr(gamma_mod, "scan",
+                        lambda cfg, exclude=None, full=False: [legacy_winner, shadow_winner])
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.cfg = dict(bot.cfg)
+        bot.cfg["paper"] = {}
+        bot.cfg["risk"] = {}
+        bot.cfg["quoting"] = {"max_capital_per_market": 50}
+        bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": False,
+                              "net_shadow": {"reward_realization_prior": 1.0,
+                                             "uptime_prior": 1.0,
+                                             "markout_cost_per_hour_prior": 0.0,
+                                             "recovery_cost_per_hour_prior": 0.0}}
+        await bot._rescan(initial=True)
+        report = bot.metrics.net_shadow_report(
+            main.datetime.now(main.timezone.utc).strftime("%Y-%m-%d"))
+        assert [m.condition_id for m in bot.markets] == ["legacy"]
+        assert [row["cid"] for row in report["legacy_top"]] == ["legacy"]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch):
     """扫描器不得换出仍有未配对库存的市场。"""
     from pmbot import gamma as gamma_mod
@@ -474,6 +547,36 @@ def test_unselected_held_market_keeps_only_complement_bid(tmp_path):
     assert [(q.token_id, q.size) for q in bot._held_market_recovery_quotes(
         market, desired, unpaired=11.0)] == [(market.no_token, 11.0)]
     assert bot._held_market_recovery_quotes(market, desired, unpaired=0.0) == []
+    bot.metrics.close()
+
+
+def test_escalated_recovery_generates_center_quote_without_normal_strategy_quote(tmp_path):
+    """超时恢复必须在区间外市场独立生成等量反向补单。"""
+    bot = _bot(tmp_path)
+    bot.cfg["quoting"] = {
+        "offset_frac_of_max_spread": 0.35,
+        "skew_strength": 0.6,
+        "flow_drift_max_cents": 1.0,
+        "adaptive_markout_gain": 1.0,
+        "adaptive_tighten_max_cents": 0.5,
+        "adaptive_widen_max_cents": 2.0,
+    }
+    bot.cfg["risk"] = {"max_inventory_usd_per_market": 30.0}
+    market = _market()
+    tracker = BookTracker([market.yes_token, market.no_token])
+    yes_book = tracker.books[market.yes_token]
+    yes_book.bids = {0.10: 100.0}
+    yes_book.asks = {0.12: 100.0}
+    bot.tracker = tracker
+
+    quotes = bot._escalated_recovery_quotes(
+        market, [], unpaired=-20.0, yes_book=yes_book,
+        exposure_usd=-2.5, max_inventory_usd=30.0,
+    )
+
+    assert [(q.token_id, q.price, q.size) for q in quotes] == [
+        (market.yes_token, 0.10, 20.0),
+    ]
     bot.metrics.close()
 
 

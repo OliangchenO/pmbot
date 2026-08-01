@@ -33,7 +33,7 @@ to market, and estimates liquidity-reward accrual. State is written to
 | `scan` | 扫描并展示当前符合条件的市场，不下单 | — |
 | `run` | 按配置启动机器人；`mode: paper` 为模拟成交，`mode: live` 才会真实下单 | — |
 | `report` | 展示全局每日 PnL、奖励、库存和回收统计 | — |
-| `performance` | 按市场查看成交、合并、对冲、markout、uptime 与估算净收益 | `--date YYYY-MM-DD`（UTC 日期） |
+| `performance` | 按市场查看成交、合并、对冲、markout、uptime 与估算净收益；末尾输出可复制的完整 CID | `--date YYYY-MM-DD`（UTC 日期） |
 | `trades` | 查看本地账本中的成交 | `--limit N`、`--hours N`、`--csv <文件>` |
 | `reward-calibration` | 查看逐市场、逐日的预估奖励与可归因实际奖励的校准情况 | `--days N` |
 | `recovery-history <condition_id>` | 梳理一个市场的补仓/强平决策链与最新库存状态 | 必填 `condition_id` |
@@ -55,6 +55,13 @@ python -m pmbot.main trades --hours 24 --csv data/trades-24h.csv
 `recovery-history` 中 `quote_placed` 只代表补单已挂出，
 `forced_hedge_filled` 代表本地收到吃单结果；两者都应结合“最新库存”确认
 是否最终配平。预估奖励和未配对库存 MTM 不是已实现现金收益。
+
+补单分两阶段：在 `risk.recovery_escalate_after_minutes`（当前 30 分钟）内，
+系统只挂不超过保本价的互补被动单；超时后进入 `market_center_recovery`，
+按当前盘口中枢、该市场的偏移/流量/库存策略计算互补方向价格，并且数量严格
+等于剩余未配平数量。该恢复单可高于保本价，但不会新增同向仓位；日志会同时
+记录中枢、策略价、成本基准和预期配对盈亏。主动强平仍要求成本加 taker fee
+不超过 `$1`。
 
 The fill simulation is deliberately pessimistic to make paper PnL a usable
 go-live signal (`paper:` section in `config.yaml`):

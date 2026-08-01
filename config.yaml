@@ -21,6 +21,18 @@ paper:
   reward_haircut: 0.7
 
 scanner:
+  # P2.1 is observational only: it records an economic shadow ranking but does
+  # not participate in ranking, sticky selection, quote prices, or order size.
+  net_shadow:
+    lookback_hours: 24
+    min_reward_samples: 2
+    min_uptime_samples: 10
+    min_markout_samples: 3
+    min_recovery_samples: 2
+    reward_realization_prior: 0.5
+    uptime_prior: 0.5
+    markout_cost_per_hour_prior: 0.02
+    recovery_cost_per_hour_prior: 0.02
   # How many markets to quote simultaneously. Keep this small relative to
   # capital_usd: a two-sided quote locks ~`size` dollars of collateral per
   # market (a filled YES+NO pair is worth $1), so N markets need ~N×size of

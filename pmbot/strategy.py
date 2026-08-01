@@ -85,6 +85,121 @@ def adaptive_offset(avg_markout: float | None, cfg: dict) -> float:
     return max(-tighten, min(widen, adj))
 
 
+def compute_net_shadow_score(
+    market: Market, market_inputs: dict[str, float | int], cfg: dict,
+) -> tuple[float, dict[str, object]]:
+    """Calculate P2.1's observational expected net reward per hour.
+
+    The return value is deliberately independent from quote generation and
+    scanner ranking.  Each missing or thin market-level measurement falls back
+    to an explicitly configured conservative prior and records why.
+    """
+    shadow = (cfg.get("scanner") or {}).get("net_shadow") or {}
+
+    def choose(name: str, sample_key: str, minimum_key: str,
+               prior_key: str, default: float) -> tuple[float, dict[str, object]]:
+        value = market_inputs.get(name)
+        samples = int(market_inputs.get(sample_key, 0) or 0)
+        minimum = int(shadow.get(minimum_key, 1) or 1)
+        if value is not None and samples >= minimum:
+            return float(value), {"value": float(value), "samples": samples,
+                                  "source": "market"}
+        prior = float(shadow.get(prior_key, default))
+        return prior, {"value": prior, "samples": samples, "source": "prior"}
+
+    realization, reward = choose("reward_realization", "reward_samples",
+                                 "min_reward_samples", "reward_realization_prior", 0.5)
+    uptime_ratio, uptime = choose("uptime_ratio", "uptime_samples",
+                                  "min_uptime_samples", "uptime_prior", 0.5)
+    markout_cost, markout = choose("markout_cost_per_hour", "markout_samples",
+                                   "min_markout_samples", "markout_cost_per_hour_prior", 0.0)
+    recovery_cost, recovery = choose("recovery_cost_per_hour", "recovery_samples",
+                                     "min_recovery_samples", "recovery_cost_per_hour_prior", 0.0)
+    fee = float(market_inputs.get("taker_fee_per_hour", 0.0) or 0.0)
+    fee_samples = int(market_inputs.get("taker_fee_samples", 0) or 0)
+    fee_audit = {"value": fee, "samples": fee_samples,
+                 "source": "market" if fee_samples else "missing"}
+    audit: dict[str, object] = {
+        "reward_realization": reward,
+        "uptime": uptime,
+        "markout_cost_per_hour": markout,
+        "recovery_cost_per_hour": recovery,
+        "taker_fee_per_hour": fee_audit,
+    }
+    audit["insufficient_sample"] = any(
+        entry["source"] == "prior" for entry in (reward, uptime, markout, recovery))
+    expected_reward = market.daily_pool / 24.0 * realization
+    return expected_reward * uptime_ratio - markout_cost - recovery_cost - fee, audit
+
+
+def compute_recovery_quote(
+    market: Market,
+    yes_book: Book,
+    net_yes_exposure_usd: float,
+    cfg: dict,
+    max_inventory_usd: float,
+    complement_token: str,
+    size: float,
+    fade_yes: float = 0.0,
+    fade_no: float = 0.0,
+    flow_imbalance: float = 0.0,
+    markout_avg: float | None = None,
+) -> tuple[Quote | None, dict[str, float | str]]:
+    """Return one inventory-reducing bid priced from the current market center.
+
+    This deliberately shares the normal strategy's fair-value and offset
+    calculation but omits ``scanner.mid_range``.  A held position still needs
+    a recovery quote when its market has moved into a tail price range.
+    """
+    mid = yes_book.mid
+    pricing: dict[str, float | str] = {
+        "recovery_path": "market_center_recovery",
+        "complement_token": complement_token,
+    }
+    if mid is None or yes_book.best_bid is None or yes_book.best_ask is None:
+        pricing["reason"] = "book_unavailable"
+        return None, pricing
+
+    q = cfg["quoting"]
+    band = market.max_spread_cents / 100.0
+    yes_microprice = microprice(yes_book)
+    fair = yes_microprice or mid
+    drift_max = float(q.get("flow_drift_max_cents", 1.0)) / 100.0
+    flow_drift = flow_imbalance * drift_max
+    fair += flow_drift
+    base_offset = max(band * q["offset_frac_of_max_spread"], market.tick)
+    adaptive = adaptive_offset(markout_avg, cfg)
+    offset = base_offset + adaptive
+    skew_frac = max(-1.0, min(1.0, net_yes_exposure_usd / max(max_inventory_usd, 1e-9)))
+    skew = skew_frac * q["skew_strength"] * offset
+    yes_bid = _round_tick(fair - offset - skew - fade_yes, market.tick)
+    no_bid = _round_tick((1.0 - fair) - offset + skew - fade_no, market.tick)
+    price = yes_bid if complement_token == market.yes_token else no_bid
+    pricing.update({
+        "yes_bid": yes_book.best_bid,
+        "yes_ask": yes_book.best_ask,
+        "yes_microprice": yes_microprice if yes_microprice is not None else mid,
+        "fair": fair,
+        "flow_imbalance": flow_imbalance,
+        "flow_drift": flow_drift,
+        "base_offset": base_offset,
+        "adaptive_offset": adaptive,
+        "offset": offset,
+        "net_yes_exposure_usd": net_yes_exposure_usd,
+        "max_inventory_usd": max_inventory_usd,
+        "skew": skew,
+        "fade_yes": fade_yes,
+        "fade_no": fade_no,
+        "yes_bid_quote": yes_bid,
+        "no_bid_quote": no_bid,
+        "strategy_price": price,
+    })
+    if not 0 < price < 1:
+        pricing["reason"] = "invalid_strategy_price"
+        return None, pricing
+    return Quote(complement_token, price, float(size)), pricing
+
+
 def compute_quotes(
     market: Market,
     yes_book: Book,

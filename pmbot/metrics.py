@@ -152,6 +152,20 @@ class MetricsStore:
                 ts REAL, event TEXT, reason TEXT, equity REAL,
                 smoothed_equity REAL, day_loss REAL, inventory_usd REAL
             );
+            CREATE TABLE IF NOT EXISTS net_shadow_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL, top_n INTEGER NOT NULL, config_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS net_shadow_candidates (
+                scan_id INTEGER NOT NULL, cid TEXT NOT NULL, market TEXT,
+                legacy_score REAL NOT NULL, shadow_score REAL NOT NULL,
+                legacy_rank INTEGER NOT NULL, shadow_rank INTEGER NOT NULL,
+                inputs_json TEXT NOT NULL,
+                PRIMARY KEY (scan_id, cid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_net_shadow_scans_ts ON net_shadow_scans (ts);
+            CREATE INDEX IF NOT EXISTS idx_net_shadow_candidates_scan_rank
+                ON net_shadow_candidates (scan_id, shadow_rank);
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
@@ -167,6 +181,120 @@ class MetricsStore:
                 self._conn.execute(
                     f"ALTER TABLE recovery_events ADD COLUMN {column} REAL")
         self._conn.commit()
+
+    def net_shadow_inputs(self, lookback_hours: float,
+                          now: float | None = None) -> dict[str, dict[str, float | int]]:
+        """Aggregate bounded, market-specific observations for P2.1 scoring."""
+        now = time.time() if now is None else now
+        hours = max(float(lookback_hours), 1e-6)
+        cutoff = now - hours * 3600.0
+        cids: set[str] = set()
+        for table, column, predicate in (
+            ("fills", "ts", ""), ("markouts", "ts", ""),
+            ("recovery_events", "ts", ""),
+        ):
+            cids.update(r[0] for r in self._conn.execute(
+                f"SELECT DISTINCT cid FROM {table} WHERE {column}>=? AND cid IS NOT NULL{predicate}",
+                (cutoff,)))
+        cids.update(r[0] for r in self._conn.execute(
+            "SELECT DISTINCT cid FROM uptime WHERE minute_ts>=? AND cid IS NOT NULL",
+            (int(cutoff) // 60,)))
+        cids.update(r[0] for r in self._conn.execute(
+            "SELECT DISTINCT cid FROM reward_samples WHERE minute_ts>=? AND cid IS NOT NULL",
+            (int(cutoff) // 60,)))
+        reward_dates = sorted({
+            datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+            for ts in (cutoff, now)
+        })
+        out: dict[str, dict[str, float | int]] = {}
+        for cid in cids:
+            maker_count = self._conn.execute(
+                "SELECT COUNT(*) FROM fills WHERE cid=? AND ts>=? AND taker=0 AND exit=0",
+                (cid, cutoff)).fetchone()[0]
+            fee_total, fee_samples = self._conn.execute(
+                "SELECT COALESCE(SUM(fee),0), COUNT(*) FROM fills "
+                "WHERE cid=? AND ts>=? AND taker=1", (cid, cutoff)).fetchone()
+            uptime_sum, uptime_samples = self._conn.execute(
+                "SELECT COALESCE(SUM(in_band),0), COUNT(*) FROM uptime "
+                "WHERE cid=? AND minute_ts>=?", (cid, int(cutoff) // 60)).fetchone()
+            rows = self._conn.execute(
+                "SELECT markout, horizon FROM markouts WHERE cid=? AND ts>=?",
+                (cid, cutoff)).fetchall()
+            highest_horizon = max((r[1] for r in rows), default=None)
+            marks = [float(r[0]) for r in rows if r[1] == highest_horizon]
+            avg_markout = sum(marks) / len(marks) if marks else 0.0
+            recovery_total, recovery_samples = self._conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN expected_pair_pnl < 0 "
+                "THEN -expected_pair_pnl ELSE 0 END),0), "
+                "COUNT(expected_pair_pnl) FROM recovery_events WHERE cid=? AND ts>=?",
+                (cid, cutoff)).fetchone()
+            estimate, reward_samples = self._conn.execute(
+                "SELECT COALESCE(SUM(est_usd),0), COUNT(*) FROM reward_samples "
+                "WHERE cid=? AND minute_ts>=?", (cid, int(cutoff) // 60)).fetchone()
+            date_placeholders = ",".join("?" for _ in reward_dates)
+            realized, realized_samples = self._conn.execute(
+                f"SELECT COALESCE(SUM(realized),0), COUNT(*) FROM market_rewards "
+                f"WHERE cid=? AND date IN ({date_placeholders})",
+                (cid, *reward_dates)).fetchone()
+            out[cid] = {
+                "maker_fill_count": int(maker_count),
+                "uptime_ratio": float(uptime_sum) / uptime_samples if uptime_samples else 0.0,
+                "uptime_samples": int(uptime_samples),
+                "markout_cost_per_hour": max(0.0, -avg_markout) * maker_count / hours,
+                "markout_samples": len(marks),
+                "recovery_cost_per_hour": float(recovery_total) / hours,
+                "recovery_samples": int(recovery_samples),
+                "taker_fee_per_hour": float(fee_total) / hours,
+                "taker_fee_samples": int(fee_samples),
+                "reward_realization": (float(realized) / float(estimate)
+                                       if estimate and realized_samples else 0.0),
+                "reward_samples": int(reward_samples) if realized_samples else 0,
+            }
+        return out
+
+    def record_net_shadow_snapshot(self, markets, scanned_at: float,
+                                   config: dict) -> None:
+        """Persist one passive scan with both rankings for later comparison."""
+        rows = list(markets)
+        legacy = sorted(rows, key=lambda m: (-m.score, m.condition_id))
+        shadow = sorted(rows, key=lambda m: (-m.net_shadow_score, m.condition_id))
+        legacy_rank = {m.condition_id: i + 1 for i, m in enumerate(legacy)}
+        shadow_rank = {m.condition_id: i + 1 for i, m in enumerate(shadow)}
+        top_n = int(config.get("top_n", len(rows)))
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO net_shadow_scans (ts,top_n,config_json) VALUES (?,?,?)",
+                (scanned_at, top_n, json.dumps(config, sort_keys=True)),
+            )
+            scan_id = cur.lastrowid
+            self._conn.executemany(
+                "INSERT INTO net_shadow_candidates "
+                "(scan_id,cid,market,legacy_score,shadow_score,legacy_rank,shadow_rank,inputs_json) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [(scan_id, m.condition_id, m.question, m.score, m.net_shadow_score,
+                  legacy_rank[m.condition_id], shadow_rank[m.condition_id],
+                  json.dumps(m.net_shadow_inputs, sort_keys=True)) for m in rows],
+            )
+            self._conn.commit()
+
+    def net_shadow_report(self, date: str) -> dict:
+        """Return the latest passive shadow scan for one UTC date."""
+        start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        scan = self._conn.execute(
+            "SELECT id,ts,top_n FROM net_shadow_scans WHERE ts>=? AND ts<? "
+            "ORDER BY ts DESC,id DESC LIMIT 1", (start, start + 86400)).fetchone()
+        if scan is None:
+            return {"status": "no_shadow_scan_data", "legacy_top": [], "shadow_top": []}
+        scan_id, ts, top_n = scan
+        rows = self._conn.execute(
+            "SELECT cid,market,legacy_score,shadow_score,legacy_rank,shadow_rank,inputs_json "
+            "FROM net_shadow_candidates WHERE scan_id=?", (scan_id,)).fetchall()
+        data = [{"cid": r[0], "market": r[1], "legacy_score": r[2],
+                 "net_shadow_score": r[3], "legacy_rank": r[4],
+                 "shadow_rank": r[5], "inputs": json.loads(r[6])} for r in rows]
+        return {"status": "ok", "ts": ts, "legacy_top": sorted(
+            data, key=lambda r: r["legacy_rank"])[:top_n], "shadow_top": sorted(
+            data, key=lambda r: r["shadow_rank"])[:top_n]}
 
     def _append_trades_log(self, entry: dict) -> None:
         if self._trades_log is None:
@@ -1332,7 +1460,8 @@ class MetricsStore:
             reverse=True,
         )
         summary = self.daily_report(date)
-        return {"date": date, "summary": summary, "markets": rows}
+        return {"date": date, "summary": summary, "markets": rows,
+                "shadow_selection": self.net_shadow_report(date)}
 
     def close(self) -> None:
         self._flush_uptime(int(time.time()) // 60)

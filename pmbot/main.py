@@ -351,6 +351,27 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         f"uptime {summary['uptime_pct']:.1f}%"
         + extra
     )
+    shadow = report["shadow_selection"]
+    if shadow["status"] == "no_shadow_scan_data":
+        console.print("[dim]Net shadow candidates: no shadow scan data for this UTC date.[/]")
+    else:
+        shadow_table = Table(title="Net shadow candidates (observation only)")
+        shadow_table.add_column("Legacy top N")
+        shadow_table.add_column("Score")
+        shadow_table.add_column("Shadow top N")
+        shadow_table.add_column("Expected net/hr")
+        legacy_top = shadow["legacy_top"]
+        shadow_top = shadow["shadow_top"]
+        for i in range(max(len(legacy_top), len(shadow_top))):
+            old = legacy_top[i] if i < len(legacy_top) else None
+            new = shadow_top[i] if i < len(shadow_top) else None
+            shadow_table.add_row(
+                (old["market"] or old["cid"][:12]) if old else "—",
+                f"{old['legacy_score']:.4f}" if old else "—",
+                (new["market"] or new["cid"][:12]) if new else "—",
+                f"${new['net_shadow_score']:+.4f}" if new else "—",
+            )
+        console.print(shadow_table)
     markets = report["markets"]
     if not markets:
         console.print("no per-market activity yet — run the bot in paper mode first")
@@ -401,6 +422,9 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
             reco,
         )
     console.print(table)
+    console.print("[bold]Condition IDs（可直接复制给 recovery-history）[/]")
+    for m in markets:
+        console.print(f"  {m['cid']}  {m['market'] or '—'}")
     console.print(
         "\n[dim]Est Net = trading cashflow + estimated reward; it excludes "
         "market-level realized rewards and inventory MTM. Account rewards are not "
@@ -548,6 +572,7 @@ class Bot:
         self._load_banned_cids()
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
+        self._recovery_pricing: dict[str, dict[str, float | str]] = {}
         self._scale = 1.0
         self._was_paused = False
         self._pause_day_active = False
@@ -954,6 +979,22 @@ class Bot:
                 log.warning("rescan found no markets; keeping current set")
             self._last_scan = time.time()
             return
+        # P2.1: calculate and persist a passive net-economic ranking.  This is
+        # intentionally after gamma's legacy scan: neither this calculation nor
+        # a failed SQLite write may influence eligibility or market selection.
+        shadow_cfg = (self.cfg.get("scanner") or {}).get("net_shadow") or {}
+        lookback_hours = float(shadow_cfg.get("lookback_hours", 24.0))
+        try:
+            inputs_by_cid = self.metrics.net_shadow_inputs(lookback_hours)
+            for market in ranked:
+                market.net_shadow_score, market.net_shadow_inputs = (
+                    strategy.compute_net_shadow_score(
+                        market, inputs_by_cid.get(market.condition_id, {}), self.cfg))
+            self.metrics.record_net_shadow_snapshot(
+                ranked, time.time(), {"top_n": self.cfg["scanner"]["top_n_markets"],
+                                      "net_shadow": shadow_cfg})
+        except Exception as exc:  # noqa: BLE001 - observation must fail open
+            log.warning("net shadow scan recording failed; legacy selection unchanged: %s", exc)
         # Teach the guards which event each candidate belongs to, then refuse to
         # enter a fresh bracket whose event has a sibling in guard cooldown —
         # correlated neg-risk brackets pick off makers together, so re-entering
@@ -1081,7 +1122,7 @@ class Bot:
     @staticmethod
     def _log_inventory_recovery_quote(
             market: gamma.Market, *, unpaired: float, quote: strategy.Quote,
-            yes_book: Book, no_book: Book, pricing: dict[str, float],
+            yes_book: Book, no_book: Book, pricing: dict[str, float | str],
             pair_cap: float | None = None, hard_cap: float | None = None,
             cost_basis: float | None = None,
             proposed_price: float | None = None,
@@ -1096,16 +1137,16 @@ class Bot:
         proposed_price = quote.price if proposed_price is None else proposed_price
         log.info(
             "INVENTORY_RECOVERY_QUOTE market='%s' held=%s %.0f "
-            "quote=BUY %s %.0f @ %.3f proposed=%.3f cost_basis=%s "
+            "quote=BUY %s %.0f @ %.3f path=%s proposed=%.3f cost_basis=%s "
             "effective_cap=%s hard_cap=%s fee_per_share=%.6f expected_pair_pnl=%s "
             "soft_expected_pair_pnl=%s "
             "yes_book=%.3fx%.0f/%.3fx%.0f no_book=%.3fx%.0f/%.3fx%.0f "
             "microprice=%.3f flow=%.3f drift=%+.4f fair=%.3f "
             "base_offset=%.4f adaptive=%+.4f offset=%.4f skew=%+.4f "
             "fade_yes=%.4f fade_no=%.4f normal=yes@%.3f,no@%.3f "
-            "说明=已检测裸仓；互补买单按成本、手续费与价格上限生成",
+            "说明=已检测裸仓；互补买单按当前策略价生成，预期配对盈亏仅作审计",
             market.question[:80], held, abs(unpaired), quote_token, quote.size,
-            quote.price, proposed_price,
+            quote.price, pricing.get("recovery_path", "normal"), proposed_price,
             "unknown" if cost_basis is None else f"{cost_basis:.3f}",
             "unknown" if pair_cap is None else f"{pair_cap:.3f}",
             "unknown" if hard_cap is None else f"{hard_cap:.3f}", fee,
@@ -1147,6 +1188,8 @@ class Bot:
             "no_complement_quote": "无互补报价",
             "below_current_clob_min_order_size": "低于当前最小挂单量",
             "strategy_no_quote": "策略无报价",
+            "book_unavailable": "恢复定价缺少有效盘口",
+            "invalid_strategy_price": "恢复策略价无效",
         }
         log.warning(
             "INVENTORY_RECOVERY_SKIPPED market='%s' reason=%s 原因=%s "
@@ -1248,12 +1291,46 @@ class Bot:
 
     def _escalated_recovery_quotes(self, m: gamma.Market,
                                     desired: list[strategy.Quote],
-                                    unpaired: float) -> list[strategy.Quote]:
-        """Phase 2: complement at fair-price, size = unpaired shares."""
+                                    unpaired: float, *,
+                                    yes_book: Book | None = None,
+                                    exposure_usd: float = 0.0,
+                                    max_inventory_usd: float | None = None,
+                                    fade_yes: float = 0.0,
+                                    fade_no: float = 0.0,
+                                    flow_imbalance: float = 0.0,
+                                    markout_avg: float | None = None) -> list[strategy.Quote]:
+        """Phase 2: one complement bid derived from the current book center.
+
+        The recovery calculation intentionally bypasses the normal market
+        selection range.  It never reuses ``desired``: a tail-priced held
+        market has no normal quote to filter, but still needs a reducing bid.
+        """
+        if abs(unpaired) < MIN_TAKER_SHARES:
+            return []
         complement = m.no_token if unpaired > 0 else m.yes_token
-        return [strategy.Quote(q.token_id, q.price, abs(unpaired))
-                for q in desired
-                if q.token_id == complement]
+        min_order_size = self._clob_min_order_size(complement)
+        if min_order_size is not None and abs(unpaired) < min_order_size:
+            self._recovery_pricing[m.condition_id] = {
+                "recovery_path": "market_center_recovery",
+                "reason": "below_current_clob_min_order_size",
+            }
+            return []
+        if yes_book is None and self.tracker is not None:
+            yes_book = self.tracker.books.get(m.yes_token)
+        if yes_book is None:
+            self._recovery_pricing[m.condition_id] = {
+                "recovery_path": "market_center_recovery", "reason": "book_unavailable",
+            }
+            return []
+        max_inventory_usd = (max_inventory_usd if max_inventory_usd is not None
+                             else float(self.cfg["risk"]["max_inventory_usd_per_market"]) * self._scale)
+        quote, pricing = strategy.compute_recovery_quote(
+            m, yes_book, exposure_usd, self.cfg, max_inventory_usd,
+            complement, abs(unpaired), fade_yes=fade_yes, fade_no=fade_no,
+            flow_imbalance=flow_imbalance, markout_avg=markout_avg,
+        )
+        self._recovery_pricing[m.condition_id] = pricing
+        return [quote] if quote is not None else []
 
     def _forced_hedge_allowed(self, market: gamma.Market, *, urgent: bool,
                               exposure_usd: float, threshold_usd: float,
@@ -1424,7 +1501,14 @@ class Bot:
                         and abs(unpaired) >= MIN_TAKER_SHARES and desired):
                     last_fill = self.broker.last_fill_ts(m.condition_id)
                     if last_fill is not None and now - last_fill >= escalate_secs:
-                        recovery_path = "escalated_recovery"
+                        desired = self._escalated_recovery_quotes(
+                            m, normal_desired, unpaired, yes_book=yes_book,
+                            exposure_usd=exposure, max_inventory_usd=eff_max_inv,
+                            fade_yes=fade_yes + widen + flow_yes,
+                            fade_no=fade_no + widen + flow_no,
+                            flow_imbalance=flow_imb, markout_avg=markout_avg)
+                        pricing = self._recovery_pricing.get(m.condition_id, pricing)
+                        recovery_path = "market_center_recovery"
             elif cooled_down:
                 desired = self._cooldown_recovery_quotes(m, desired, unpaired, now)
                 recovery_path = "cooldown_recovery"
@@ -1432,17 +1516,31 @@ class Bot:
                         and abs(unpaired) >= MIN_TAKER_SHARES and desired):
                     last_fill = self.broker.last_fill_ts(m.condition_id)
                     if last_fill is not None and now - last_fill >= escalate_secs:
-                        recovery_path = "escalated_recovery"
+                        desired = self._escalated_recovery_quotes(
+                            m, normal_desired, unpaired, yes_book=yes_book,
+                            exposure_usd=exposure, max_inventory_usd=eff_max_inv,
+                            fade_yes=fade_yes + widen + flow_yes,
+                            fade_no=fade_no + widen + flow_no,
+                            flow_imbalance=flow_imb, markout_avg=markout_avg)
+                        pricing = self._recovery_pricing.get(m.condition_id, pricing)
+                        recovery_path = "market_center_recovery"
             else:
                 desired = self._inventory_recovery_quotes(m, desired, unpaired, now)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     recovery_path = "inventory_recovery"
                 # Escalate to Phase 2 after the window, same as held-only / cooldown.
-                if escalate_secs > 0 and self.broker is not None and desired:
+                if (escalate_secs > 0 and self.broker is not None
+                        and abs(unpaired) >= MIN_TAKER_SHARES):
                     last_fill = self.broker.last_fill_ts(m.condition_id)
                     if last_fill is not None and now - last_fill >= escalate_secs:
-                        desired = self._escalated_recovery_quotes(m, normal_desired, unpaired)
-                        recovery_path = "escalated_recovery"
+                        desired = self._escalated_recovery_quotes(
+                            m, normal_desired, unpaired, yes_book=yes_book,
+                            exposure_usd=exposure, max_inventory_usd=eff_max_inv,
+                            fade_yes=fade_yes + widen + flow_yes,
+                            fade_no=fade_no + widen + flow_no,
+                            flow_imbalance=flow_imb, markout_avg=markout_avg)
+                        pricing = self._recovery_pricing.get(m.condition_id, pricing)
+                        recovery_path = "market_center_recovery"
                 desired = self._filter_quotes_for_side_guard(
                     desired, unpaired=unpaired, now=now)
             if needs_recovery and not desired:
@@ -1455,7 +1553,9 @@ class Bot:
                         and abs(unpaired) < min_order_size):
                     reason = "below_current_clob_min_order_size"
                 elif not normal_desired:
-                    reason = "strategy_no_quote"
+                    reason = (str(pricing.get("reason"))
+                              if recovery_path == "market_center_recovery"
+                              and pricing.get("reason") else "strategy_no_quote")
                 self._log_inventory_recovery_skip(
                     m, unpaired=unpaired, reason=reason, basis=basis,
                     yes_book=yes_book, no_book=no_book)
@@ -1473,7 +1573,7 @@ class Bot:
                     phase_label = {
                         "inventory_recovery": "Phase 1 (软窗口补单)",
                         "cooldown_recovery": "Phase 1 (冷却期补单)",
-                        "escalated_recovery": "Phase 2 (升级: 公允价补单)",
+                        "market_center_recovery": "Phase 2 (升级: 盘口中枢补单)",
                     }
                     log.warning("补单阶段 '%s': %s  敞口=%.0f",
                                 phase_label.get(recovery_path, recovery_path),
@@ -1483,7 +1583,7 @@ class Bot:
                 self._recovery_phase_logged.pop(m.condition_id, None)
             # Phase 2 (escalated recovery) only quotes one side — judge "in-band"
             # by whether the complement is present (not whether both sides are).
-            is_escalated = recovery_path == "escalated_recovery"
+            is_escalated = recovery_path == "market_center_recovery"
             if is_escalated:
                 complement = m.no_token if unpaired > 0 else m.yes_token
                 in_band = any(q.token_id == complement for q in final)
@@ -1505,9 +1605,9 @@ class Bot:
                     complement = m.no_token if unpaired > 0 else m.yes_token
                     recovery_quote = next((q for q in final if q.token_id == complement), None)
                     if recovery_quote is not None:
-                        proposed_price = (pricing["yes_bid_quote"]
-                                          if complement == m.yes_token
-                                          else pricing["no_bid_quote"])
+                        proposed_price = pricing.get(
+                            "yes_bid_quote" if complement == m.yes_token else "no_bid_quote",
+                            recovery_quote.price)
                         fee = m.fee_bps / 10_000.0 * (
                             recovery_quote.price * (1.0 - recovery_quote.price)) ** m.fee_exponent
                         expected = (1.0 - basis - recovery_quote.price - fee

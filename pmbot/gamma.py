@@ -45,6 +45,8 @@ class Market:
     score: float = field(default=0.0)
     density: float = field(default=0.0)   # raw pool/liquidity (always computed)
     capture: float = field(default=0.0)   # expected captured reward $/day (capture mode only)
+    net_shadow_score: float = field(default=0.0)  # expected net $/hour; observation only
+    net_shadow_inputs: dict[str, object] = field(default_factory=dict)
 
     @property
     def mid_hint(self) -> float:
@@ -262,7 +264,8 @@ def fetch_reward_markets() -> list[Market]:
 
 
 def scan(cfg: dict, exclude_cids: set[str] | None = None,
-         full: bool = False) -> list[Market]:
+         full: bool = False,
+         shadow_inputs: dict[str, dict[str, float | int]] | None = None) -> list[Market]:
     """Filter and rank reward markets per scanner config. Returns best first.
 
     `exclude_cids` skips specific markets before ranking, so the next-best
@@ -357,6 +360,15 @@ def scan(cfg: dict, exclude_cids: set[str] | None = None,
             m.score = density
 
         candidates.append(m)
+
+    # P2.1 is observational: compute a separate net-economic score only after
+    # legacy eligibility and score are settled.  The existing sort below must
+    # remain the sole selector until a separately approved future phase.
+    from .strategy import compute_net_shadow_score
+    inputs_by_cid = shadow_inputs or {}
+    for market in candidates:
+        market.net_shadow_score, market.net_shadow_inputs = compute_net_shadow_score(
+            market, inputs_by_cid.get(market.condition_id, {}), cfg)
 
     candidates.sort(key=lambda m: m.score, reverse=True)
     if full:

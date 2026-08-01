@@ -11,6 +11,8 @@ from pmbot.strategy import (
     adaptive_offset,
     book_feed_stale,
     book_is_quotable,
+    compute_net_shadow_score,
+    compute_recovery_quote,
     compute_quotes,
     microprice,
     reconcile_quotes,
@@ -88,6 +90,64 @@ CFG = {
         "adaptive_widen_max_cents": 2.0,
     },
 }
+
+
+def test_recovery_quote_uses_market_center_outside_normal_mid_range():
+    """超时补单不应被普通做市的中间价区间过滤挡住。"""
+    market = _market()
+    quote, pricing = compute_recovery_quote(
+        market, _book(bid=0.10, ask=0.12), net_yes_exposure_usd=2.5,
+        cfg=CFG, max_inventory_usd=30.0, complement_token=market.no_token,
+        size=20.0,
+    )
+
+    assert quote is not None
+    assert quote.token_id == market.no_token
+    assert quote.size == 20.0
+    assert quote.price == pytest.approx(0.88)
+    assert pricing["fair"] == pytest.approx(0.11)
+    assert pricing["recovery_path"] == "market_center_recovery"
+
+
+def test_net_shadow_score_uses_sufficient_market_inputs():
+    """P2.1 must score from this market's measured economics, not global data."""
+    market = _market(daily_pool=240.0)
+    cfg = {"scanner": {"net_shadow": {
+        "min_reward_samples": 2, "min_uptime_samples": 2,
+        "min_markout_samples": 2, "min_recovery_samples": 2,
+        "reward_realization_prior": 0.5, "uptime_prior": 0.5,
+        "markout_cost_per_hour_prior": 0.2,
+        "recovery_cost_per_hour_prior": 0.3,
+    }}}
+    score, audit = compute_net_shadow_score(market, {
+        "reward_realization": 0.8, "reward_samples": 3,
+        "uptime_ratio": 0.5, "uptime_samples": 3,
+        "markout_cost_per_hour": 1.0, "markout_samples": 3,
+        "recovery_cost_per_hour": 0.5, "recovery_samples": 3,
+        "taker_fee_per_hour": 0.25, "taker_fee_samples": 1,
+    }, cfg)
+
+    assert score == pytest.approx(2.25)
+    assert audit["reward_realization"]["source"] == "market"
+    assert audit["insufficient_sample"] is False
+
+
+def test_net_shadow_score_uses_conservative_priors_for_insufficient_market_data():
+    """A new market must be labelled uncertain rather than inheriting global results."""
+    market = _market(daily_pool=240.0)
+    cfg = {"scanner": {"net_shadow": {
+        "min_reward_samples": 2, "min_uptime_samples": 2,
+        "min_markout_samples": 2, "min_recovery_samples": 2,
+        "reward_realization_prior": 0.5, "uptime_prior": 0.5,
+        "markout_cost_per_hour_prior": 0.2,
+        "recovery_cost_per_hour_prior": 0.3,
+    }}}
+
+    score, audit = compute_net_shadow_score(market, {}, cfg)
+
+    assert score == pytest.approx(2.0)
+    assert audit["uptime"]["source"] == "prior"
+    assert audit["insufficient_sample"] is True
 
 
 def test_book_is_quotable_rejects_one_sided():
