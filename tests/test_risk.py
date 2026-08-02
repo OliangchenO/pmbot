@@ -175,3 +175,17 @@ def test_flow_pull_fires_side_block_callback():
     assert blocked == [m.no_token]
     g.check_flow(m, now)  # already blocked — no second fire
     assert blocked == [m.no_token]
+
+
+def test_flow_pull_log_explains_chinese_reason(caplog):
+    from collections import deque
+
+    g = MarketGuards(CFG)
+    m = _market()
+    now = time.time()
+    g._flow[m.condition_id] = deque([(now, 10.0)] * 25)
+
+    g.check_flow(m, now)
+
+    assert "单边流量失衡" in caplog.text
+    assert "NO" in caplog.text

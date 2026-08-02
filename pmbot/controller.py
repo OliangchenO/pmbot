@@ -100,7 +100,7 @@ class AdaptiveController:
         if changes:
             self.guards.reload(self.cfg)
             self.markouts.reload(self.cfg)
-            log.info("controller adjusted: %s", "  ".join(changes))
+        log.info("自适应控制器已调整：%s", "  ".join(changes))
 
     # ---------------------------------------------------------------- capital
 

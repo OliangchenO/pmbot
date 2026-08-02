@@ -820,7 +820,7 @@ def test_live_fill_keeps_state_when_dingtalk_notification_fails(caplog):
 
     assert stub.fills_log[-1]["size"] == 3.0
     assert stub._positions[market.condition_id]["yes"] == 3.0
-    assert "DingTalk fill notification failed" in caplog.text
+    assert "钉钉成交通知发送失败" in caplog.text
 
 
 def test_sync_clob_balance_builds_params_and_swallows_errors():

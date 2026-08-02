@@ -45,7 +45,7 @@ class MetricsStore:
             return datetime.strptime(self.inception_date, "%Y-%m-%d").replace(
                 tzinfo=timezone.utc).timestamp()
         except ValueError:
-            log.warning("invalid metrics.inception_date %r; ignoring",
+            log.warning("metrics.inception_date 无效：%r，已忽略",
                         self.inception_date)
             return None
 
@@ -302,7 +302,7 @@ class MetricsStore:
             with self._trades_log.open("a") as f:
                 f.write(json.dumps(entry, separators=(",", ":")) + "\n")
         except OSError as e:
-            log.warning("could not append trades log: %s", e)
+            log.warning("无法追加成交日志：%s", e)
 
     def record_fill(self, entry: dict) -> None:
         ts = entry.get("ts", time.time())
@@ -684,12 +684,12 @@ class MetricsStore:
             return 0
         fetch = getattr(client, "get_earnings_for_user_for_day", None)
         if fetch is None:
-            log.debug("market reward endpoint unavailable for %s", date)
+            log.debug("市场奖励接口不可用（%s）", date)
             return 0
         try:
             rows = fetch(date)
         except Exception as e:  # noqa: BLE001
-            log.debug("market rewards fetch failed for %s: %s", date, e)
+            log.debug("获取市场奖励失败（%s）：%s", date, e)
             return 0
         if isinstance(rows, dict):
             rows = rows.get("data") or rows.get("earnings") or []
@@ -798,7 +798,7 @@ class MetricsStore:
         try:
             rows = client.get_total_earnings_for_user_for_day(date)
         except Exception as e:  # noqa: BLE001
-            log.debug("realized rewards fetch failed for %s: %s", date, e)
+            log.debug("获取已实现奖励失败（%s）：%s", date, e)
             return 0.0
         total = self._sum_earnings(rows)
         self.record_realized_reward(date, total)

@@ -30,7 +30,7 @@ class AuditLogger:
                 f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 f.flush()
         except OSError as e:
-            log.warning("could not append audit event: %s", e)
+            log.warning("无法追加审计事件：%s", e)
 
     def recovery_bases(self) -> dict[str, tuple[float, float]]:
         """Load the latest verified recovery basis per market for restart safety."""
@@ -53,5 +53,5 @@ class AuditLogger:
                     if cid and 0.0 < basis < 1.0 and shares > 0.0:
                         bases[cid] = (basis, shares)
         except OSError as e:
-            log.warning("could not load recovery-basis audit cache: %s", e)
+            log.warning("无法加载补仓成本基准审计缓存：%s", e)
         return bases

@@ -52,7 +52,7 @@ class UserFeed:
                 async with websockets.connect(WS_USER_URL, ping_interval=None,
                                               ssl=SSL_CONTEXT) as ws:
                     await ws.send(json.dumps({"type": "user", "auth": self._auth}))
-                    log.info("user feed connected — real-time fill detection active")
+                    log.info("用户成交推送已连接，实时成交检测已启用")
                     self.broker.ws_fills_active = True
                     ping = asyncio.create_task(self._ping(ws))
                     try:
@@ -65,8 +65,8 @@ class UserFeed:
             except Exception as e:  # noqa: BLE001 — reconnect on any socket failure
                 if not self._stop:
                     self.broker.ws_fills_active = False
-                    log.warning("user feed dropped (%s); reconnecting in 3s "
-                                "(poll-based fill detection until then)", e)
+                    log.warning("用户成交推送已断开（%s），3 秒后重连"
+                                "（期间使用轮询方式检测成交）", e)
                     await asyncio.sleep(3)
 
     @staticmethod
@@ -91,7 +91,7 @@ class UserFeed:
             try:
                 self._handle_trade(ev)
             except Exception as e:  # noqa: BLE001 — never let one bad event kill the feed
-                log.warning("bad user-feed trade event: %s", e)
+                log.warning("用户成交推送事件格式异常：%s", e)
 
     def _handle_trade(self, ev: dict) -> None:
         taker_side = str(ev.get("side") or "").upper()

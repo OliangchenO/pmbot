@@ -159,7 +159,7 @@ class BookTracker:
                 async with websockets.connect(WS_URL, ping_interval=None, ssl=SSL_CONTEXT) as ws:
                     self._ws = ws
                     await ws.send(json.dumps({"type": "market", "assets_ids": list(self.books)}))
-                    log.info("WebSocket subscribed to %d tokens", len(self.books))
+                    log.info("WebSocket 已订阅 %d 个代币订单簿", len(self.books))
                     ping = asyncio.create_task(self._ping(ws))
                     try:
                         async for raw in ws:
@@ -176,7 +176,7 @@ class BookTracker:
                         # with the new asset list, no warning or backoff.
                         self._resubscribing = False
                         continue
-                    log.warning("WebSocket dropped (%s); reconnecting in 3s", e)
+                    log.warning("WebSocket 已断开（%s），3 秒后重连", e)
                     await asyncio.sleep(3)
             finally:
                 self._ws = None
@@ -240,7 +240,7 @@ class BookTracker:
                 if time.time() - b.updated_ts > WS_STALE_SECONDS
             ]
             if stale:
-                log.debug("REST refresh for %d stale books", len(stale))
+                log.debug("通过 REST 刷新 %d 个过期订单簿", len(stale))
                 await self._rest_refresh(stale)
 
     async def _rest_refresh_all(self) -> None:
@@ -258,4 +258,4 @@ class BookTracker:
                         data.get("min_order_size"),
                     )
                 except Exception as e:  # noqa: BLE001
-                    log.debug("REST book fetch failed for %s…: %s", token[:12], e)
+                    log.debug("REST 获取订单簿失败（%s…）：%s", token[:12], e)

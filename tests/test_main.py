@@ -218,6 +218,29 @@ def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     return broker
 
 
+def test_status_table_shows_unquoted_reason(tmp_path):
+    """未报价市场必须在运行表中说明当前首要阻断原因。"""
+    bot = _bot(tmp_path)
+    market = _market()
+    _setup(bot, tmp_path, market)
+    bot.tracker.books[market.yes_token].snapshot(
+        [{"price": "0.56", "size": "100"}],
+        [{"price": "0.58", "size": "100"}],
+    )
+    bot._quote_block_reasons = {
+        market.condition_id: "YES 买单：单边流量失衡，暂停 10 分钟",
+    }
+
+    with main.console.capture() as capture:
+        bot._print_status()
+
+    output = capture.get()
+    assert "未报价原因" in output
+    assert "单边" in output
+    assert "10 分钟" in output
+    bot.metrics.close()
+
+
 def test_refresh_reward_min_size_updates_selected_market(tmp_path, monkeypatch):
     """已选市场的奖励门槛变化必须更新内存报价依据。"""
     from pmbot import gamma as gamma_mod

@@ -116,7 +116,7 @@ def fetch_market(condition_id: str) -> Market | None:
             resp.raise_for_status()
             payload = resp.json()
     except Exception as e:  # noqa: BLE001
-        log.warning("held-market lookup failed for %s…: %s", condition_id[:12], e)
+        log.warning("查询持仓市场失败（%s…）：%s", condition_id[:12], e)
         return None
 
     rows = payload if isinstance(payload, list) else [payload]
@@ -125,7 +125,7 @@ def fetch_market(condition_id: str) -> Market | None:
             parsed = _parse_market(raw, require_rewards=False)
             if parsed and parsed.condition_id == condition_id:
                 return parsed
-    log.warning("held-market lookup returned no usable market for %s…", condition_id[:12])
+    log.warning("持仓市场查询未返回可用市场（%s…）", condition_id[:12])
     return None
 
 
@@ -167,7 +167,7 @@ def _fetch_market_fees(
             last_err = e
             if i + 1 < attempts:
                 time.sleep(backoff * (i + 1))
-    log.warning("clob-markets fee fetch failed for %s… after %d tries (%s); "
+    log.warning("查询 CLOB 手续费失败（%s…），已重试 %d 次（%s）；"
                 "assuming 0bps taker fee (makers pay no fee, so we still quote)",
                 condition_id[:12], attempts, last_err)
     result = (0, 1.0)
@@ -251,7 +251,7 @@ def fetch_reward_markets() -> list[Market]:
                     resp.raise_for_status()
                     batch = resp.json()
                 except Exception as e:  # noqa: BLE001
-                    log.debug("gamma fetch failed (order=%s page=%d): %s", order, page, e)
+                    log.debug("Gamma 市场列表请求失败（排序=%s，页=%d）：%s", order, page, e)
                     break
                 if not batch:
                     break

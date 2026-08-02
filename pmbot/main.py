@@ -80,7 +80,7 @@ def _build_live_notifier(cfg: dict):
         return None
     webhook_url = os.environ.get("DINGTALK_WEBHOOK_URL", "").strip()
     if not webhook_url:
-        log.warning("DingTalk is enabled but DINGTALK_WEBHOOK_URL is unset")
+        log.warning("钉钉通知已启用，但 DINGTALK_WEBHOOK_URL 未配置")
         return None
     from .dingtalk import DingTalkNotifier
     return DingTalkNotifier(webhook_url, os.environ.get("DINGTALK_SECRET") or None)
@@ -573,6 +573,7 @@ class Bot:
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
         self._recovery_pricing: dict[str, dict[str, float | str]] = {}
+        self._quote_block_reasons: dict[str, str] = {}
         self._scale = 1.0
         self._was_paused = False
         self._pause_day_active = False
@@ -620,8 +621,8 @@ class Bot:
                 self._last_pos_refresh = time.time()
                 await self._ensure_held_market_books()
             await self._manage_inventory(time.time())
-            log.warning("scanner found no eligible markets — retrying in %.0fs "
-                        "(loosen config filters to match more markets)",
+            log.warning("扫描器未找到符合条件的市场，%.0f 秒后重试"
+                        "（可适当放宽配置筛选条件）",
                         SCAN_RETRY_SECONDS)
             await asyncio.sleep(SCAN_RETRY_SECONDS)
         assert self.broker and self.risk
@@ -731,7 +732,7 @@ class Bot:
                     self._print_status()
                     self._last_status = now
         finally:
-            log.info("shutting down — cancelling all orders")
+            log.info("正在退出，撤销全部订单")
             for task in list(self._pull_tasks):
                 task.cancel()
             if self._pull_tasks:
@@ -776,7 +777,7 @@ class Bot:
                    if token not in self.tracker.books]
         if not missing:
             return
-        log.warning("subscribing %d held-position token(s) for inventory management",
+        log.warning("为库存管理订阅 %d 个持仓代币订单簿",
                     len(missing))
         await self.tracker.resubscribe([*self.tracker.books, *missing])
 
@@ -829,7 +830,7 @@ class Bot:
         async with self._market_lock(cid):
             if not self.broker.open_quotes(m):
                 return
-            log.warning("guard trip — pulling quotes from '%s' now", m.question[:45])
+            log.warning("市场风控触发，立即撤下“%s”的报价", m.question[:45])
             self.metrics.record_guard_event(
                 cid, "market", "market_guard_pull")
             self.metrics.sample_uptime(cid, False)
@@ -847,9 +848,9 @@ class Bot:
             remaining = [q for q in current if q.token_id != token_id]
             if len(remaining) == len(current):
                 return
-            log.warning("side block — pulling %s bid in '%s' now",
-                        "YES" if token_id == m.yes_token else "NO",
-                        m.question[:45])
+            log.warning("单边保护触发，立即撤下“%s”的 %s 买单",
+                        m.question[:45],
+                        "YES" if token_id == m.yes_token else "NO")
             self.metrics.record_guard_event(
                 m.condition_id, "side", "side_guard_pull")
             await self._broker_call(self.broker.set_quotes, m, remaining)
@@ -964,12 +965,12 @@ class Bot:
         exclude = set() if initial else self._rotatable_tripped_cids()
         # P1.3: 把 markout-ban 的 cid 也排除，确保 banned 市场不会被重新扫入。
         exclude |= self._banned_cids
-        log.info("scanning for reward markets…%s",
+        log.info("正在扫描奖励市场…%s",
                  f" (rotating out {len(exclude)} tripped)" if exclude else "")
         ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
         if not ranked:
             if not initial:
-                log.warning("rescan found no markets; keeping current set")
+                log.warning("重新扫描未找到市场，保留当前市场集合")
             self._last_scan = time.time()
             return
         # P2.1: calculate and persist a passive net-economic ranking.  This is
@@ -987,7 +988,7 @@ class Bot:
                 ranked, time.time(), {"top_n": self.cfg["scanner"]["top_n_markets"],
                                       "net_shadow": shadow_cfg})
         except Exception as exc:  # noqa: BLE001 - observation must fail open
-            log.warning("net shadow scan recording failed; legacy selection unchanged: %s", exc)
+            log.warning("净收益影子扫描记录失败，原有选择不变：%s", exc)
         # Teach the guards which event each candidate belongs to, then refuse to
         # enter a fresh bracket whose event has a sibling in guard cooldown —
         # correlated neg-risk brackets pick off makers together, so re-entering
@@ -1004,8 +1005,7 @@ class Bot:
             ]
             if not ranked:
                 if not initial:
-                    log.warning("rescan found only cooled-down markets; "
-                                "keeping current set")
+                    log.warning("重新扫描仅找到冷却中的市场，保留当前市场集合")
                 self._last_scan = time.time()
                 return
         locked = self._locked_inventory_markets(self.markets)
@@ -1019,7 +1019,7 @@ class Bot:
         set_changed = new_cids != old_cids
 
         for m in markets:
-            log.info("quoting: %s  (pool $%.0f/day, score %.3f)",
+            log.info("开始报价：%s（奖励池 $%.0f/天，评分 %.3f）",
                      m.question[:60], m.daily_pool, m.score)
 
         self.markets = markets
@@ -1419,6 +1419,7 @@ class Bot:
         # markets late in the iteration aren't quoted on stale books while
         # earlier ones complete their REST round trips.
         updates: list[tuple[gamma.Market, list[strategy.Quote], dict[str, dict] | None]] = []
+        self._quote_block_reasons.clear()
 
         selected_cids = {m.condition_id for m in self.markets}
         for m in all_markets:
@@ -1426,6 +1427,7 @@ class Bot:
             needs_recovery = abs(unpaired) >= MIN_TAKER_SHARES
             h = hours_to_end(m, now)
             if h is not None and h <= exit_h:
+                self._quote_block_reasons[m.condition_id] = "临近结算，已停止新增报价"
                 if needs_recovery:
                     self._log_inventory_recovery_skip(
                         m, unpaired=unpaired, reason="near_resolution")
@@ -1443,6 +1445,8 @@ class Bot:
             feed_age = self.tracker.feed_age(now)
             book_age = now - min(yes_book.updated_ts, no_book.updated_ts)
             if strategy.book_feed_stale(feed_age, book_age, max_stale):
+                self._quote_block_reasons[m.condition_id] = (
+                    f"行情或订单簿过期（行情 {feed_age:.0f} 秒，订单簿 {book_age:.0f} 秒）")
                 self.metrics.sample_uptime(m.condition_id, False)
                 if needs_recovery:
                     self._log_inventory_recovery_skip(
@@ -1462,6 +1466,7 @@ class Bot:
                 self.cfg["quoting"].get("max_book_spread_mult_of_band", 3.0))
             if (not strategy.book_is_quotable(yes_book, band, max_spread_mult)
                     or not strategy.book_is_quotable(no_book, band, max_spread_mult)):
+                self._quote_block_reasons[m.condition_id] = "YES/NO 订单簿不可报价"
                 self.metrics.sample_uptime(m.condition_id, False)
                 if needs_recovery:
                     self._log_inventory_recovery_skip(
@@ -1477,6 +1482,7 @@ class Bot:
                 continue
             cooled_down = not self.guards.allow(m.condition_id, now)
             if not self.risk.theme_quoting_ok(m, all_markets, net_exp, self._scale):
+                self._quote_block_reasons[m.condition_id] = "主题仓位达到上限，暂停新增报价"
                 self.metrics.sample_uptime(m.condition_id, False)
                 if needs_recovery:
                     self._log_inventory_recovery_skip(
@@ -1577,6 +1583,9 @@ class Bot:
                     desired, unpaired=unpaired, now=now,
                     recovery_token=(m.no_token if unpaired > 0 else m.yes_token)
                     if needs_recovery else None)
+            if not desired:
+                self._quote_block_reasons.setdefault(
+                    m.condition_id, "策略未生成可提交报价（价格、规模或仓位约束未满足）")
             if needs_recovery and not desired:
                 basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
                 basis = basis_fn(m) if basis_fn else None
@@ -1916,17 +1925,29 @@ class Bot:
 
     def _print_status(self) -> None:
         table = Table(title=f"pmbot — {'PAPER' if self.paper else 'LIVE'}")
-        for col in ("Market", "Mid", "Our bid YES", "Our bid NO", "Net exposure"):
+        for col in ("Market", "Mid", "Our bid YES", "Our bid NO", "未报价原因", "Net exposure"):
             table.add_column(col)
+        now = time.time()
         for m in self.markets:
             book = self.tracker.books[m.yes_token]
             quotes = {q.token_id: q for q in self.broker.open_quotes(m)}
             yq, nq = quotes.get(m.yes_token), quotes.get(m.no_token)
+            reason = "—"
+            if not yq or not nq:
+                blocked = []
+                for label, token in (("YES", m.yes_token), ("NO", m.no_token)):
+                    remaining = self.guards.side_block_remaining(token, now)
+                    if remaining > 0:
+                        blocked.append(
+                            f"{label} 买单：单边流量失衡，暂停 {math.ceil(remaining / 60):.0f} 分钟")
+                reason = "；".join(blocked) or self._quote_block_reasons.get(
+                    m.condition_id, "等待本轮报价诊断")
             table.add_row(
                 m.question[:45],
                 f"{book.mid:.3f}" if book.mid else "—",
                 f"{yq.price:.3f} × {yq.size:.0f}" if yq else "—",
                 f"{nq.price:.3f} × {nq.size:.0f}" if nq else "—",
+                reason,
                 f"${self.broker.net_yes_exposure_usd(m):+.2f}",
             )
         console.print(table)

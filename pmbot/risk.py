@@ -49,11 +49,11 @@ class RiskManager:
     def check(self, equity: float, total_inventory_usd: float,
               scale: float = 1.0) -> RiskAction:
         if equity != equity:
-            log.warning("equity unknown — pausing quotes until balance/positions refresh")
+            log.warning("权益未知，暂停报价直到账户余额和持仓刷新完成")
             return RiskAction.PAUSE_QUOTES
         if self.day_start_equity != self.day_start_equity:
             self.day_start_equity = equity
-            log.info("equity baseline set: $%.2f", equity)
+            log.info("权益基准已设置：$%.2f", equity)
 
         today = self._today()
         if today != self.day:
@@ -61,7 +61,7 @@ class RiskManager:
             self.day_start_equity = equity
             self._equity_history.clear()
             if self.paused:
-                log.info("new UTC day — resuming after pause")
+                log.info("新的 UTC 日开始，恢复此前暂停的报价")
                 self.paused = False
 
         smoothed = self._smoothed_equity(equity)
@@ -73,19 +73,19 @@ class RiskManager:
             "inventory_usd": total_inventory_usd,
         }
         if day_loss >= self.cfg["hard_kill_loss_usd"]:
-            log.error("HARD KILL: daily loss $%.2f >= $%.2f",
+            log.error("HARD KILL：当日亏损 $%.2f >= $%.2f，停止运行",
                       day_loss, self.cfg["hard_kill_loss_usd"])
             return RiskAction.KILL
         if day_loss >= self.cfg["daily_loss_limit_usd"]:
             if not self.paused:
-                log.warning("daily loss limit hit ($%.2f) — pausing until next UTC day", day_loss)
+                log.warning("达到当日亏损限额（$%.2f），暂停至下一个 UTC 日", day_loss)
                 self.paused = True
             return RiskAction.PAUSE_DAY
         if self.paused:
             return RiskAction.PAUSE_DAY
 
         if total_inventory_usd > self.cfg["max_total_inventory_usd"] * scale:
-            log.warning("total inventory $%.0f over cap — pausing new quotes",
+            log.warning("总库存 $%.0f 超过上限，暂停新增报价",
                         total_inventory_usd)
             return RiskAction.PAUSE_QUOTES
         return RiskAction.OK
@@ -232,7 +232,7 @@ class MarketGuards:
         # cooldown (from a sibling) is already in effect.
         newly_tripped = now >= self._paused_until.get(cid, 0.0)
         if newly_tripped:
-            log.warning("guard tripped (%s) — pausing '%s' for %.0f min",
+            log.warning("市场风控触发（%s），暂停“%s” %.0f 分钟",
                         reason, question[:50], self.cooldown / 60)
         self._paused_until[cid] = now + self.cooldown
         ev = self._event_of.get(cid)
@@ -255,6 +255,10 @@ class MarketGuards:
 
     def allow_side(self, token_id: str, now: float) -> bool:
         return now >= self._side_blocked_until.get(token_id, 0.0)
+
+    def side_block_remaining(self, token_id: str, now: float) -> float:
+        """返回单边报价保护剩余秒数；未保护时为零。"""
+        return max(0.0, self._side_blocked_until.get(token_id, 0.0) - now)
 
     def trip_market(self, cid: str, now: float, reason: str, question: str) -> None:
         self._trip(cid, now, reason, question)
@@ -289,7 +293,7 @@ class MarketGuards:
                 blocked = market.no_token if token_id == market.yes_token else market.yes_token
             newly_blocked = self.allow_side(blocked, now)
             if newly_blocked:
-                log.warning("directional flow (%d × %s) — pulling one bid in '%s' for %.0f min",
+                log.warning("方向性成交流（连续 %d 笔 %s），撤下“%s”的一侧买单 %.0f 分钟",
                             self.dir_consec, s, market.question[:45], self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
             if newly_blocked and self.on_side_block is not None:
@@ -328,10 +332,10 @@ class MarketGuards:
             blocked = market.no_token if endangered_no else market.yes_token
             newly_blocked = self.allow_side(blocked, now)
             if newly_blocked:
-                log.warning("flow imbalance %.0f%% on %.0f shares — pulling %s bid "
-                            "in '%s' for %.0f min", imbalance * 100, volume,
-                            "NO" if endangered_no else "YES",
-                            market.question[:45], self.side_cooldown / 60)
+                log.warning("单边流量失衡 %.0f%%（%.0f 股），暂停“%s”的 %s 买单 "
+                            "%.0f 分钟", imbalance * 100, volume,
+                            market.question[:45], "NO" if endangered_no else "YES",
+                            self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
             if newly_blocked and self.on_side_block is not None:
                 self.on_side_block(blocked)

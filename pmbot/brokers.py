@@ -52,8 +52,8 @@ def _with_retry(label: str, fn, attempts: int = 3, base_delay: float = 0.3):
             if i == attempts - 1 or not _is_transient(e):
                 raise
             delay = base_delay * (2 ** i)
-            log.warning("%s transient error (%s); retry %d/%d in %.1fs",
-                        label, e, i + 1, attempts - 1, delay)
+            log.warning("%s 出现临时错误（%s），%.1f 秒后重试 %d/%d",
+                        label, e, delay, i + 1, attempts - 1)
             time.sleep(delay)
     assert last is not None
     raise last
@@ -182,7 +182,7 @@ class PaperBroker:
                 str(k): float(v) for k, v in data.get("unpaired_since", {}).items()
             }
         except (json.JSONDecodeError, OSError, ValueError) as e:
-            log.warning("could not load persisted state: %s", e)
+            log.warning("无法加载持久化状态：%s", e)
 
     def _fee_usd(self, market: Market, price: float, size: float) -> float:
         """Taker fee for a fill: rate × (p·(1−p))^exponent × shares.
@@ -409,7 +409,7 @@ class PaperBroker:
             self.metrics.record_fill(entry)
             if merged:
                 self.metrics.record_merge(market.condition_id, merged)
-        log.info("FILL %s %s %.0f @ %.3f (merged %.0f pairs)",
+        log.info("成交：%s %s %.0f 股 @ %.3f（已合并 %.0f 对）",
                  market.question[:40], side, size, q.price, merged)
         self._persist()
 
@@ -440,7 +440,7 @@ class PaperBroker:
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
-        log.info("EXIT FILL %s sold %.0f %s @ %.3f",
+        log.info("退出成交：%s 卖出 %.0f 股 %s @ %.3f",
                  market.question[:40], size, side, q.price)
         self._persist()
 
@@ -491,7 +491,7 @@ class PaperBroker:
             self.metrics.record_hedge(market.condition_id, avg, filled)
             if merged:
                 self.metrics.record_merge(market.condition_id, merged)
-        log.info("TAKER %s %s %.0f @ %.3f (merged %.0f pairs%s)",
+        log.info("吃单成交：%s %s %.0f 股 @ %.3f（已合并 %.0f 对%s）",
                  market.question[:40], side, filled, avg, merged,
                  f", fee ${fee:.2f}" if fee > 0 else "")
         self._persist()
@@ -592,7 +592,7 @@ class PaperBroker:
                 "unpaired_since": getattr(self, "unpaired_since", {}),
             }, indent=2))
         except OSError as e:
-            log.warning("could not persist state: %s", e)
+            log.warning("无法持久化状态：%s", e)
 
 
 def _notify_live_fill(notifier, entry: dict, order_side: str) -> None:
@@ -606,7 +606,7 @@ def _notify_live_fill(notifier, entry: dict, order_side: str) -> None:
             f"{entry['size']:.2f} @ {entry['price']:.3f}"
         )
     except Exception as exc:  # noqa: BLE001 - notifications are best-effort
-        log.warning("DingTalk fill notification failed: %s", exc)
+        log.warning("钉钉成交通知发送失败：%s", exc)
 
 
 class LiveBroker:
@@ -702,8 +702,8 @@ class LiveBroker:
                     builder_creds=builder_creds,
                     audit_event=self.audit.record)
             except Exception as e:  # noqa: BLE001
-                log.warning("on-chain merger unavailable: %s", e)
-        log.info("live client ready (signature_type=%d, address=%s)", sig_type, self.address)
+                log.warning("链上合并器不可用：%s", e)
+        log.info("LIVE 客户端已就绪（signature_type=%d，地址=%s）", sig_type, self.address)
 
     def _gtd_expiration(self, ttl_secs: int | None = None) -> int:
         ttl = self.order_ttl if ttl_secs is None else ttl_secs
@@ -844,7 +844,7 @@ class LiveBroker:
                 self._record_order_event("ORDER_PLACED", quote=q, side="BUY", order_id=oid)
                 return ro
         except Exception as e:  # noqa: BLE001
-            log.error("order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+            log.error("订单提交失败（%s @ %.3f）：%s", q.token_id[:12], q.price, e)
             self._record_order_event("ORDER_POST_FAILED", quote=q, side="BUY", reason=str(e))
         return None
 
@@ -870,7 +870,7 @@ class LiveBroker:
                 self._record_order_event("ORDER_PLACED", market, q, "SELL", oid)
                 return ro
         except Exception as e:  # noqa: BLE001
-            log.error("exit order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+            log.error("退出订单提交失败（%s @ %.3f）：%s", q.token_id[:12], q.price, e)
             self._record_order_event("ORDER_POST_FAILED", quote=q, side="SELL", reason=str(e))
         return None
 
@@ -905,7 +905,7 @@ class LiveBroker:
                         audit=(audit_contexts or {}).get(oid))
                 except Exception as fallback_error:  # noqa: BLE001
                     ok = False
-                    log.warning("cancel failed %s: %s", oid[:16], fallback_error)
+                    log.warning("撤单失败（%s）：%s", oid[:16], fallback_error)
                     market, quote, side = self._resting_order_context(oid)
                     self._record_order_event("ORDER_CANCEL_FAILED", market, quote,
                                              side, oid, str(fallback_error))
@@ -944,7 +944,7 @@ class LiveBroker:
                 cancel_now.append(ro.order_id)
 
         if not self._batch_cancel(cancel_now):
-            log.warning("cancel failed in '%s' — reconciling before posting replacements",
+            log.warning("“%s”撤单失败，先对账再提交替换订单",
                         market.question[:45])
             self.reconcile_orders()
             return
@@ -965,7 +965,7 @@ class LiveBroker:
                     batch_args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTD))
                     order_map.append(q)
                 except Exception as e:  # noqa: BLE001
-                    log.error("order build failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
+                    log.error("构建订单失败（%s @ %.3f）：%s", q.token_id[:12], q.price, e)
                     self._record_order_event("ORDER_POST_FAILED", market, q, "BUY",
                                              reason=str(e))
             if batch_args:
@@ -997,13 +997,13 @@ class LiveBroker:
                             q = order_map[i]
                             reason = (item.get("errorMsg") or item.get("error")
                                       or "empty orderID (no reason given)")
-                            log.warning("order rejected %s @ %.3f×%.0f in '%s': %s",
+                            log.warning("订单被拒绝（%s @ %.3f×%.0f，市场“%s”）：%s",
                                         q.token_id[:12], q.price, q.size,
                                         market.question[:35], reason)
                             self._record_order_event("ORDER_POST_FAILED", market, q,
                                                      "BUY", reason=reason)
                 except Exception as e:  # noqa: BLE001
-                    log.error("batch post failed; reconciling instead of retrying blindly: %s", e)
+                    log.error("批量提交失败，先对账而不盲目重试：%s", e)
                     for q in order_map:
                         self._record_order_event("ORDER_POST_FAILED", market, q,
                                                  "BUY", reason=str(e))
@@ -1018,7 +1018,7 @@ class LiveBroker:
                         # shape so an unexpected wrapper is diagnosable from logs.
                         self._logged_post_shape = True
                         keys = sorted(resp.keys()) if isinstance(resp, dict) else type(resp).__name__
-                        log.warning("post_orders returned no parseable order IDs; "
+                        log.warning("post_orders 未返回可解析的订单 ID；"
                                     "response shape: %s", keys)
                     self.reconcile_orders()
                     return
@@ -1028,7 +1028,7 @@ class LiveBroker:
         # failed post never leaves a side off the book — the old order stays.
         if cancel_after and not self._batch_cancel(
                 cancel_after, reason="expiry_refresh", audit_contexts=refresh_audits):
-            log.warning("refresh overlap: stale-order cancel failed in '%s' — "
+            log.warning("刷新重叠：“%s”的旧订单撤销失败，"
                         "reconciling", market.question[:45])
             self.reconcile_orders()
             return
@@ -1044,7 +1044,7 @@ class LiveBroker:
                 self.client.cancel_all()
         except Exception as e:  # noqa: BLE001
             ok = False
-            log.error("cancel_all failed: %s", e)
+            log.error("撤销全部订单失败：%s", e)
             self._record_order_event("ORDER_CANCEL_ALL", reason=str(e))
         if ok:
             self._record_order_event("ORDER_CANCEL_ALL")
@@ -1101,7 +1101,7 @@ class LiveBroker:
         ro = self._place_sell(quote)
         if ro:
             self._exit_orders[cid] = ro
-            log.info("EXIT SELL resting in '%s': %.0f @ %.3f",
+            log.info("退出卖单已挂出：“%s” %.0f 股 @ %.3f",
                      market.question[:40], quote.size, quote.price)
 
     def exit_quote(self, market: Market) -> Quote | None:
@@ -1202,7 +1202,7 @@ class LiveBroker:
                         if pending is not None:
                             pending.notified = True
         except Exception as e:  # noqa: BLE001
-            log.error("taker order failed %s @ %.3f: %s", token_id[:12], max_price, e)
+            log.error("吃单订单失败（%s @ %.3f）：%s", token_id[:12], max_price, e)
             return 0.0
         if filled > 0 and self.metrics:
             self.metrics.record_hedge(market.condition_id, max_price, filled)
@@ -1280,7 +1280,7 @@ class LiveBroker:
         self.fills_log = self.fills_log[-500:]
         if self.metrics:
             self.metrics.record_fill(entry)
-        log.info("LIVE FILL (ws) %s %s %s %.1f @ %.3f",
+        log.info("LIVE FILL（WebSocket）：%s %s %s %.1f 股 @ %.3f",
                  market.question[:40], side, entry["side"], size, price)
         context = LiveBroker._order_audit_context(self, order_id) if order_id else {}
         if taker and not context:
@@ -1306,7 +1306,7 @@ class LiveBroker:
         try:
             remote = _with_retry("order reconcile", _do_fetch)
         except Exception as e:  # noqa: BLE001
-            log.warning("order reconcile failed: %s", e)
+            log.warning("订单对账失败：%s", e)
             return
         by_cid: dict[str, list[RestingOrder]] = {}
         exit_by_cid: dict[str, RestingOrder] = {}
