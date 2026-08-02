@@ -890,29 +890,16 @@ class Bot:
         """
         sc = self.cfg["scanner"]
         top_n = int(sc["top_n_markets"])
-        locked = list(locked or [])
-        # A small, still-manageable residual cannot earn rewards until it reaches
-        # this market's rewardsMinSize. Keep it on the recovery path without
-        # spending a normal scan slot; once it reaches min_size it occupies one.
-        ranked_cids = {m.condition_id for m in ranked}
-        # A locked market that is still in ranked would survive via sticky
-        # selection on its own score — it doesn't need to occupy a slot.
-        # Only markets that depend SOLELY on inventory to stay (not in
-        # ranked) count as occupying.
-        occupying = [
-            m for m in locked
-            if (abs(self.broker.unpaired_shares(m)) >= m.min_size
-                and m.condition_id not in ranked_cids)
-        ][:top_n]
-        occupying_cids = {m.condition_id for m in occupying}
-        free_locked = [m for m in locked if m.condition_id not in occupying_cids]
-        locked_cids = occupying_cids | {m.condition_id for m in free_locked}
-        slots = top_n - len(occupying)
-        if slots <= 0:
-            return occupying + free_locked
+        # Inventory is managed through ``broker.held_markets()`` even when a
+        # market leaves the quote set.  It must not bypass ranked/sticky
+        # selection and become a normal two-sided market merely because it has
+        # a recovery order outstanding.  Keep the argument temporarily for
+        # callers on older revisions, but deliberately do not use it here.
+        del locked
+        locked_cids: set[str] = set()
+        slots = top_n
         if not bool(sc.get("sticky_swap", True)):
-            return (occupying + free_locked
-                    + [m for m in ranked if m.condition_id not in locked_cids][:slots])
+            return [m for m in ranked if m.condition_id not in locked_cids][:slots]
         margin = float(sc.get("swap_score_margin", 0.0))
         by_cid = {m.condition_id: m for m in ranked}
         held = [m.condition_id for m in self.markets if m.condition_id not in locked_cids]
@@ -961,7 +948,7 @@ class Bot:
                 chosen.append(cand)
                 chosen_cids = (chosen_cids - {weak.condition_id}) | {cand.condition_id}
                 survivor_cids.discard(weak.condition_id)
-        return occupying + free_locked + chosen
+        return chosen
 
     async def _rescan(self, initial: bool = False, rotate: bool = False) -> None:
         self._rotate_pending = False
@@ -1124,8 +1111,7 @@ class Bot:
             yes_book: Book, no_book: Book, pricing: dict[str, float | str],
             pair_cap: float | None = None, hard_cap: float | None = None,
             cost_basis: float | None = None,
-            proposed_price: float | None = None,
-            soft_expected_pair_pnl: float | None = None) -> None:
+            proposed_price: float | None = None) -> None:
         """Log the quote inputs needed to reconstruct a complement bid."""
         held = "YES" if unpaired > 0 else "NO"
         quote_token = "YES" if quote.token_id == market.yes_token else "NO"
@@ -1138,7 +1124,6 @@ class Bot:
             "INVENTORY_RECOVERY_QUOTE market='%s' held=%s %.0f "
             "quote=BUY %s %.0f @ %.3f path=%s proposed=%.3f cost_basis=%s "
             "effective_cap=%s hard_cap=%s fee_per_share=%.6f expected_pair_pnl=%s "
-            "soft_expected_pair_pnl=%s "
             "yes_book=%.3fx%.0f/%.3fx%.0f no_book=%.3fx%.0f/%.3fx%.0f "
             "microprice=%.3f flow=%.3f drift=%+.4f fair=%.3f "
             "base_offset=%.4f adaptive=%+.4f offset=%.4f skew=%+.4f "
@@ -1150,8 +1135,6 @@ class Bot:
             "unknown" if pair_cap is None else f"{pair_cap:.3f}",
             "unknown" if hard_cap is None else f"{hard_cap:.3f}", fee,
             "unknown" if expected is None else f"{expected:+.6f}",
-            "not_applicable" if soft_expected_pair_pnl is None
-            else f"{soft_expected_pair_pnl:+.6f}",
             yes_book.best_bid, yes_book.bids.get(yes_book.best_bid, 0.0),
             yes_book.best_ask, yes_book.asks.get(yes_book.best_ask, 0.0),
             no_book.best_bid, no_book.bids.get(no_book.best_bid, 0.0),
@@ -1202,12 +1185,7 @@ class Bot:
                                    desired: list[strategy.Quote],
                                    unpaired: float,
                                    now: float | None = None) -> list[strategy.Quote]:
-        """Keep only a capped complement bid while a market is unpaired.
-
-        The strict fee-inclusive break-even cap always limits the passive
-        bid.  ``recovery_max_loss_cents`` remains an audit-only estimate of
-        the fill probability trade-off; it must never silently raise a quote.
-        """
+        """第一阶段补单：只保留受配对成本上限约束的互补买单。"""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return desired
         complement = m.no_token if unpaired > 0 else m.yes_token
@@ -1222,6 +1200,31 @@ class Bot:
         return [strategy.Quote(q.token_id, min(q.price, max_price), abs(unpaired))
                 for q in desired
                 if q.token_id == complement]
+
+    def _selected_market_recovery_quotes(self, m: gamma.Market,
+                                         normal: list[strategy.Quote],
+                                         unpaired: float) -> list[strategy.Quote]:
+        """Keep selected markets two-sided and add the recovery gap to its complement.
+
+        The ordinary quote sizes remain strategy-controlled.  Only the
+        inventory-reducing complement receives the extra shares, at the same
+        fee-inclusive pair cap used by held-only recovery quotes.
+        """
+        if abs(unpaired) < MIN_TAKER_SHARES:
+            return normal
+        recovery = self._inventory_recovery_quotes(m, normal, unpaired)
+        if not recovery:
+            return []
+        complement = m.no_token if unpaired > 0 else m.yes_token
+        recovery_quote = next((q for q in recovery if q.token_id == complement), None)
+        if recovery_quote is None:
+            return []
+        return [
+            strategy.Quote(q.token_id, recovery_quote.price,
+                           q.size + recovery_quote.size)
+            if q.token_id == complement else q
+            for q in normal
+        ]
 
     def _clob_min_order_size(self, token_id: str) -> float | None:
         """Current CLOB quantity floor, populated from `/book` snapshots."""
@@ -1245,11 +1248,11 @@ class Bot:
         }}
 
     def _filter_quotes_for_side_guard(self, desired: list[strategy.Quote], *,
-                                      unpaired: float, now: float) -> list[strategy.Quote]:
+                                      unpaired: float, now: float,
+                                      recovery_token: str | None = None) -> list[strategy.Quote]:
         """Keep a pair-capped recovery bid even if its normal quote side is paused."""
-        if abs(unpaired) >= MIN_TAKER_SHARES:
-            return desired
-        return [q for q in desired if self.guards.allow_side(q.token_id, now)]
+        return [q for q in desired
+                if q.token_id == recovery_token or self.guards.allow_side(q.token_id, now)]
 
     def _cooldown_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
@@ -1474,8 +1477,9 @@ class Bot:
             markout_avg = self.markouts.market_avg(m.condition_id)
             size_factor = self._size_factors.get(m.condition_id, 1.0)
             pricing: dict[str, float] = {}
-            quote_cfg = (self._quote_cfg_for_inventory_recovery(unpaired)
-                         if needs_recovery else self.cfg)
+            selected = m.condition_id in selected_cids
+            quote_cfg = (self.cfg if selected else
+                         self._quote_cfg_for_inventory_recovery(unpaired))
             desired = strategy.compute_quotes(
                 m, yes_book, exposure, quote_cfg, eff_max_inv,
                 fade_yes=fade_yes + widen + flow_yes,
@@ -1485,7 +1489,8 @@ class Bot:
                 markout_avg=markout_avg,
                 size_factor=size_factor,
                 pricing=pricing,
-                min_quote_size=abs(unpaired) if needs_recovery else None,
+                min_quote_size=(abs(unpaired)
+                                if needs_recovery and not selected else None),
             )
             normal_desired = desired
             recovery_path = "normal"
@@ -1524,7 +1529,7 @@ class Bot:
                         pricing = self._recovery_pricing.get(m.condition_id, pricing)
                         recovery_path = "market_center_recovery"
             else:
-                desired = self._inventory_recovery_quotes(m, desired, unpaired, now)
+                desired = self._selected_market_recovery_quotes(m, desired, unpaired)
                 if abs(unpaired) >= MIN_TAKER_SHARES:
                     recovery_path = "inventory_recovery"
                 # Escalate to Phase 2 after the window, same as held-only / cooldown.
@@ -1541,7 +1546,9 @@ class Bot:
                         pricing = self._recovery_pricing.get(m.condition_id, pricing)
                         recovery_path = "market_center_recovery"
                 desired = self._filter_quotes_for_side_guard(
-                    desired, unpaired=unpaired, now=now)
+                    desired, unpaired=unpaired, now=now,
+                    recovery_token=(m.no_token if unpaired > 0 else m.yes_token)
+                    if needs_recovery else None)
             if needs_recovery and not desired:
                 basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
                 basis = basis_fn(m) if basis_fn else None
@@ -1611,26 +1618,11 @@ class Bot:
                             recovery_quote.price * (1.0 - recovery_quote.price)) ** m.fee_exponent
                         expected = (1.0 - basis - recovery_quote.price - fee
                                     if basis is not None else None)
-                        soft_expected = None
-                        if basis is not None and cap is not None:
-                            risk_cfg = self.cfg.get("risk") or {}
-                            soft_window = float(risk_cfg.get(
-                                "recovery_soft_window_minutes", 0)) * 60.0
-                            soft_loss = float(risk_cfg.get(
-                                "recovery_max_loss_cents", 0)) / 100.0
-                            last_fill = self.broker.last_fill_ts(m.condition_id)
-                            if (soft_window > 0 and soft_loss > 0 and last_fill is not None
-                                    and now - last_fill <= soft_window):
-                                soft_price = min(1.0 - m.tick, cap + soft_loss)
-                                soft_fee = m.fee_bps / 10_000.0 * (
-                                    soft_price * (1.0 - soft_price)) ** m.fee_exponent
-                                soft_expected = 1.0 - basis - soft_price - soft_fee
                         self._log_inventory_recovery_quote(
                             m, unpaired=unpaired, quote=recovery_quote,
                             yes_book=yes_book, no_book=no_book, pricing=pricing,
                             pair_cap=cap, hard_cap=cap, cost_basis=basis,
-                            proposed_price=proposed_price,
-                            soft_expected_pair_pnl=soft_expected)
+                            proposed_price=proposed_price)
                         if self.metrics:
                             self.metrics.record_recovery_event(
                                 m.condition_id, "quote_placed", unpaired,
@@ -1638,8 +1630,7 @@ class Bot:
                                 quote_price=recovery_quote.price,
                                 pair_cap=cap, proposed_price=proposed_price,
                                 cost_basis=basis, fee_per_share=fee,
-                                expected_pair_pnl=expected,
-                                soft_expected_pair_pnl=soft_expected, hard_cap=cap)
+                                expected_pair_pnl=expected, hard_cap=cap)
                 audit_context = {}
                 for q in final:
                     fee = m.fee_bps / 10_000.0 * (q.price * (1.0 - q.price)) ** m.fee_exponent

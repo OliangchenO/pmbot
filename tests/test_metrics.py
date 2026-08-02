@@ -668,18 +668,17 @@ def test_recovery_event_persists_pair_economics_for_audit(tmp_path):
         reason="over_hard_cap", recovery_path="forced_hedge",
         quote_price=0.53, pair_cap=0.50, proposed_price=0.53,
         cost_basis=0.49, fee_per_share=0.003, expected_pair_pnl=-0.023,
-        soft_expected_pair_pnl=-0.038,
         ts=1_700_000_000.0,
     )
     row = store._conn.execute(
         "SELECT event,reason,unpaired,quote_price,pair_cap,proposed_price,"
-        "cost_basis,fee_per_share,expected_pair_pnl,soft_expected_pair_pnl,ts FROM recovery_events "
+        "cost_basis,fee_per_share,expected_pair_pnl,ts FROM recovery_events "
         "WHERE cid='cid1'").fetchone()
     store.close()
 
     assert row == (
         "forced_hedge_deferred", "over_hard_cap", 12.0, 0.53, 0.50, 0.53,
-        0.49, 0.003, -0.023, -0.038, 1_700_000_000.0,
+        0.49, 0.003, -0.023, 1_700_000_000.0,
     )
 
 

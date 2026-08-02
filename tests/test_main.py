@@ -511,8 +511,8 @@ def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_
     asyncio.run(scenario())
 
 
-def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch):
-    """扫描器不得换出仍有未配对库存的市场。"""
+def test_rescan_removes_unpaired_inventory_market_from_quote_set(tmp_path, monkeypatch):
+    """未进前 N 的补单市场留给持仓管理，不能占用正常报价席位。"""
     from pmbot import gamma as gamma_mod
     from pmbot.books import BookTracker
 
@@ -544,18 +544,17 @@ def test_rescan_keeps_unpaired_inventory_market_until_flat(tmp_path, monkeypatch
         held.min_size = 10.0
         ranked["value"] = [held, flat, fresh]
         await bot._rescan(initial=True)
-        # A manageable 5-share NO position is below rewardsMinSize (10), so
-        # it stays managed without consuming either of the two scan slots.
+        # 补单市场依然参与排名；它未排进前二时退出正常报价集合。
         bot.broker.state.positions[held.condition_id] = Position(no_shares=5.0)
 
         ranked["value"] = [flat, fresh]
         await bot._rescan()
-        assert {m.condition_id for m in bot.markets} == {"held", "flat", "fresh"}
+        assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
 
-        # At exactly rewardsMinSize the position consumes one scan slot.
+        # 补单份数达到原奖励最小量，也不能绕过排名抢占正常报价席位。
         bot.broker.state.positions[held.condition_id] = Position(no_shares=10.0)
         await bot._rescan()
-        assert {m.condition_id for m in bot.markets} == {"held", "flat"}
+        assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
 
         bot.broker.state.positions[held.condition_id] = Position()
         await bot._rescan()
@@ -588,7 +587,8 @@ def test_unpaired_no_keeps_capped_yes_recovery_bid_when_yes_side_is_blocked(tmp_
 
     recovery = bot._inventory_recovery_quotes(
         market, [Quote(market.yes_token, 0.38, 20.0)], unpaired=-9.67)
-    quotes = bot._filter_quotes_for_side_guard(recovery, unpaired=-9.67, now=time.time())
+    quotes = bot._filter_quotes_for_side_guard(
+        recovery, unpaired=-9.67, now=time.time(), recovery_token=market.yes_token)
 
     assert quotes == [Quote(market.yes_token, 0.38, 9.67)]
     bot.metrics.close()
@@ -641,6 +641,50 @@ def test_inventory_quote_only_buys_no_for_excess_yes_and_keeps_flat_quotes(tmp_p
     assert [(q.token_id, q.size) for q in excess_yes] == [(market.no_token, 12.0)]
     assert [(q.token_id, q.size) for q in flat] == [
         (market.yes_token, 30.0), (market.no_token, 30.0)]
+    bot.metrics.close()
+
+
+def test_ranked_inventory_market_must_win_a_top_n_slot(tmp_path):
+    """补单市场不能因持仓而绕过排名直接进入正常报价集合。"""
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": False}
+    held = _scored("held", 1.0)
+
+    chosen = bot._select_markets([_scored("winner", 2.0), held], locked=[held])
+
+    assert [m.condition_id for m in chosen] == ["winner"]
+    bot.metrics.close()
+
+
+def test_selected_market_adds_recovery_shares_to_complement_quote(tmp_path):
+    """入选市场保留正常双边报价，只把补单加到互补方向。"""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.45)
+    market = _market()
+    normal = [Quote(market.yes_token, 0.47, 30.0),
+              Quote(market.no_token, 0.50, 30.0)]
+
+    quotes = bot._selected_market_recovery_quotes(market, normal, unpaired=12.0)
+
+    assert quotes == [Quote(market.yes_token, 0.47, 30.0),
+                      Quote(market.no_token, 0.50, 42.0)]
+    bot.metrics.close()
+
+
+def test_selected_market_adds_no_recovery_without_bypassing_other_side_guard(tmp_path):
+    """补 YES 时只豁免 YES 的补单，普通 NO 仍须通过方向保护。"""
+    bot = _bot(tmp_path)
+    bot.broker = _RecoveryBasisBroker(0.45)
+    market = _market()
+    normal = [Quote(market.yes_token, 0.47, 30.0),
+              Quote(market.no_token, 0.50, 30.0)]
+    bot.guards.allow_side = MagicMock(side_effect=lambda token, _now: token == market.yes_token)
+
+    combined = bot._selected_market_recovery_quotes(market, normal, unpaired=-12.0)
+    quotes = bot._filter_quotes_for_side_guard(
+        combined, unpaired=-12.0, now=time.time(), recovery_token=market.yes_token)
+
+    assert quotes == [Quote(market.yes_token, 0.47, 42.0)]
     bot.metrics.close()
 
 
@@ -804,16 +848,12 @@ def test_inventory_recovery_clamps_quote_above_pair_cost_cap(tmp_path):
     bot.metrics.close()
 
 
-def test_soft_recovery_window_records_tolerance_without_raising_hard_cap(tmp_path):
-    """A soft-loss setting must not silently turn a passive recovery bid into a loss."""
+def test_first_phase_recovery_keeps_the_pair_cap(tmp_path):
+    """第一阶段补单不得超过配对成本上限。"""
     bot = _bot(tmp_path)
     broker = _RecoveryBasisBroker(0.669)
     broker.last_fill_ts = lambda _cid: 100.0
     bot.broker = broker
-    bot.cfg["risk"] = {
-        "recovery_soft_window_minutes": 30,
-        "recovery_max_loss_cents": 1.5,
-    }
     market = _market()
 
     quotes = bot._inventory_recovery_quotes(

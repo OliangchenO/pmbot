@@ -124,8 +124,7 @@ class MetricsStore:
                 unpaired REAL, recovery_path TEXT,
                 quote_price REAL, pair_cap REAL, proposed_price REAL,
                 cost_basis REAL, fee_per_share REAL,
-                expected_pair_pnl REAL, soft_expected_pair_pnl REAL,
-                hard_cap REAL
+                expected_pair_pnl REAL, hard_cap REAL
             );
             CREATE TABLE IF NOT EXISTS inventory_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +175,7 @@ class MetricsStore:
         if "pair_cap" not in rec_cols:
             self._conn.execute("ALTER TABLE recovery_events ADD COLUMN pair_cap REAL")
         for column in ("proposed_price", "cost_basis", "fee_per_share",
-                       "expected_pair_pnl", "soft_expected_pair_pnl", "hard_cap"):
+                       "expected_pair_pnl", "hard_cap"):
             if column not in rec_cols:
                 self._conn.execute(
                     f"ALTER TABLE recovery_events ADD COLUMN {column} REAL")
@@ -381,7 +380,6 @@ class MetricsStore:
                               cost_basis: float | None = None,
                               fee_per_share: float | None = None,
                               expected_pair_pnl: float | None = None,
-                              soft_expected_pair_pnl: float | None = None,
                               hard_cap: float | None = None,
                               ts: float | None = None) -> None:
         """Log one inventory-recovery lifecycle event for monitoring.
@@ -398,10 +396,10 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO recovery_events (ts,cid,event,reason,unpaired,recovery_path,"
                 "quote_price,pair_cap,proposed_price,cost_basis,fee_per_share,"
-                "expected_pair_pnl,soft_expected_pair_pnl,hard_cap) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "expected_pair_pnl,hard_cap) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time() if ts is None else ts, cid, event, reason, unpaired,
                  recovery_path, quote_price, pair_cap, proposed_price, cost_basis,
-                 fee_per_share, expected_pair_pnl, soft_expected_pair_pnl, hard_cap),
+                 fee_per_share, expected_pair_pnl, hard_cap),
             )
             self._conn.commit()
 
@@ -1134,16 +1132,15 @@ class MetricsStore:
         """Return one market's recovery decision timeline without side effects."""
         rows = self._conn.execute(
             "SELECT ts,event,reason,unpaired,recovery_path,quote_price,pair_cap,"
-            "proposed_price,cost_basis,fee_per_share,expected_pair_pnl,"
-            "soft_expected_pair_pnl,hard_cap FROM recovery_events "
+            "proposed_price,cost_basis,fee_per_share,expected_pair_pnl,hard_cap "
+            "FROM recovery_events "
             "WHERE cid=? ORDER BY ts,id", (cid,)).fetchall()
         events = [
             {
                 "ts": r[0], "event": r[1], "reason": r[2], "unpaired": r[3],
                 "recovery_path": r[4], "quote_price": r[5], "pair_cap": r[6],
                 "proposed_price": r[7], "cost_basis": r[8],
-                "fee_per_share": r[9], "expected_pair_pnl": r[10],
-                "soft_expected_pair_pnl": r[11], "hard_cap": r[12],
+                "fee_per_share": r[9], "expected_pair_pnl": r[10], "hard_cap": r[11],
             }
             for r in rows
         ]
