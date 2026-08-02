@@ -1,6 +1,7 @@
 """Tests for Bot event-driven quote pulls (main.py)."""
 
 import asyncio
+import copy
 import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -216,6 +217,104 @@ def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     bot.markets = [market]
     bot._token_market = {market.yes_token: market, market.no_token: market}
     return broker
+
+
+def _quote_loop_bot_with_empty_strategy(tmp_path, unpaired: float = 0.0):
+    """Build a real paper quote loop whose strategy boundary returns no quote."""
+    cfg = copy.deepcopy(main.load_config("config.debug.yaml"))
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    bot = Bot(cfg)
+    market = _market()
+    broker = _setup(bot, tmp_path, market)
+    bot.risk = main.RiskManager(cfg, broker.equity())
+    bot.tracker.last_msg_ts = time.time()
+    bot.tracker.books[market.yes_token].snapshot(
+        [{"price": "0.50", "size": "100"}],
+        [{"price": "0.51", "size": "100"}],
+    )
+    bot.tracker.books[market.no_token].snapshot(
+        [{"price": "0.49", "size": "100"}],
+        [{"price": "0.50", "size": "100"}],
+    )
+    if unpaired:
+        broker.state.positions[market.condition_id] = Position(
+            yes_shares=unpaired, yes_cost=unpaired * 0.50)
+    return bot, market
+
+
+def test_quote_all_rescans_flat_selected_market_without_submittable_quotes(
+        tmp_path, monkeypatch):
+    """Removing the empty-quote replacement must leave the selected slot idle."""
+    async def scenario():
+        bot, _ = _quote_loop_bot_with_empty_strategy(tmp_path)
+        calls = []
+
+        async def record_rescan(*, initial=False, rotate=False):
+            calls.append((initial, rotate))
+
+        monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(bot, "_rescan", record_rescan)
+        await bot._quote_all()
+
+        assert calls == [(False, True)]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_quote_all_keeps_held_empty_quote_market_out_of_replacement_rescan(
+        tmp_path, monkeypatch):
+    """A held market must remain on its recovery path, not trigger a slot swap."""
+    async def scenario():
+        bot, _ = _quote_loop_bot_with_empty_strategy(tmp_path, main.MIN_TAKER_SHARES)
+        calls = []
+
+        async def record_rescan(*, initial=False, rotate=False):
+            calls.append((initial, rotate))
+
+        monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(bot, "_rescan", record_rescan)
+        await bot._quote_all()
+
+        assert calls == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_quote_all_batches_flat_empty_markets_into_one_replacement_rescan(
+        tmp_path, monkeypatch):
+    """Moving the rescan into the market loop would rescan once per empty slot."""
+    async def scenario():
+        bot, _ = _quote_loop_bot_with_empty_strategy(tmp_path)
+        market = Market(
+            question="Will it be windy tomorrow?", condition_id="cid2",
+            yes_token="y2", no_token="n2", min_size=10,
+            max_spread_cents=3, daily_pool=50, liquidity=1000,
+            volume_24h=500, tick=0.01, end_date=None, neg_risk=False,
+        )
+        for token, bid, ask in ((market.yes_token, "0.50", "0.51"),
+                                (market.no_token, "0.49", "0.50")):
+            book = Book(token)
+            book.snapshot([{"price": bid, "size": "100"}],
+                          [{"price": ask, "size": "100"}])
+            bot.tracker.books[token] = book
+        bot.markets.append(market)
+        bot._token_market[market.yes_token] = market
+        bot._token_market[market.no_token] = market
+        calls = []
+
+        async def record_rescan(*, initial=False, rotate=False):
+            calls.append((initial, rotate))
+
+        monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(bot, "_rescan", record_rescan)
+        await bot._quote_all()
+
+        assert calls == [(False, True)]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
 
 
 def test_status_table_shows_unquoted_reason(tmp_path):

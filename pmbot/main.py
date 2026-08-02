@@ -1419,6 +1419,7 @@ class Bot:
         # markets late in the iteration aren't quoted on stale books while
         # earlier ones complete their REST round trips.
         updates: list[tuple[gamma.Market, list[strategy.Quote], dict[str, dict] | None]] = []
+        empty_selected_flat_cids: set[str] = set()
         self._quote_block_reasons.clear()
 
         selected_cids = {m.condition_id for m in self.markets}
@@ -1586,6 +1587,8 @@ class Bot:
             if not desired:
                 self._quote_block_reasons.setdefault(
                     m.condition_id, "策略未生成可提交报价（价格、规模或仓位约束未满足）")
+                if m.condition_id in selected_cids and not needs_recovery:
+                    empty_selected_flat_cids.add(m.condition_id)
             if needs_recovery and not desired:
                 basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
                 basis = basis_fn(m) if basis_fn else None
@@ -1683,6 +1686,11 @@ class Bot:
         if updates:
             await asyncio.gather(
                 *(self._set_quotes_locked(m, q, audit) for m, q, audit in updates))
+        if (empty_selected_flat_cids
+                and now - self._last_rotate >= ROTATE_MIN_INTERVAL_SECS):
+            log.info("%d 个空仓市场未生成可提交报价，重新扫描以补足报价槽位",
+                     len(empty_selected_flat_cids))
+            await self._rescan(rotate=True)
 
     async def _manage_inventory(self, now: float) -> None:
         quoted = {m.condition_id for m in self.markets}
