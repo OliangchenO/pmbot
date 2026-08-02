@@ -218,6 +218,56 @@ def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     return broker
 
 
+def test_refresh_reward_min_size_updates_selected_market(tmp_path, monkeypatch):
+    """已选市场的奖励门槛变化必须更新内存报价依据。"""
+    from pmbot import gamma as gamma_mod
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        market = _market()
+        market.min_size = 20.0
+        _setup(bot, tmp_path, market)
+        refreshed = _market()
+        refreshed.min_size = 50.0
+        monkeypatch.setattr(gamma_mod, "fetch_market", lambda cid: refreshed)
+
+        await bot._refresh_reward_min_sizes()
+
+        assert bot.markets[0].min_size == 50.0
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_reward_min_size_increase_replaces_resting_quote(tmp_path, monkeypatch):
+    """20 股奖励挂单在门槛升至 50 股后必须被 50 股订单替换。"""
+    from pmbot import gamma as gamma_mod
+    from pmbot import strategy as strategy_mod
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        market = _market()
+        market.min_size = 20.0
+        broker = _setup(bot, tmp_path, market)
+        old_quote = Quote(market.yes_token, 0.47, 20.0)
+        broker.set_quotes(market, [old_quote])
+
+        refreshed = _market()
+        refreshed.min_size = 50.0
+        monkeypatch.setattr(gamma_mod, "fetch_market", lambda cid: refreshed)
+        await bot._refresh_reward_min_sizes()
+
+        desired = Quote(market.yes_token, 0.47, market.min_size)
+        final = strategy_mod.reconcile_quotes(
+            broker.open_quotes(market), [desired], move_cents=0.4)
+        broker.set_quotes(market, final)
+
+        assert [(q.price, q.size) for q in broker.open_quotes(market)] == [(0.47, 50.0)]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_inventory_sample_records_current_unpaired_paper_position(tmp_path):
     bot = _bot(tmp_path)
     market = _market()

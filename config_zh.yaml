@@ -1,0 +1,455 @@
+# Polymarket 做市机器人配置文件。
+# mode: paper（模拟）| live（实盘）
+mode: live
+
+# 可选：实盘成交钉钉通知。凭据保留在 .env 文件中。
+notifications:
+  dingtalk:
+    enabled: true
+
+# 机器人可使用的总资金（美元）。
+capital_usd: 340
+
+paper:
+  # 模拟的下单/撤单延迟。新报价需经过此延迟后才可成交；
+  # 被替换的报价在模拟撤单抵达前仍然可成交（存在被抢跑风险），
+  # 以匹配典型的 CLOB HTTP 往返时间。
+  order_latency_ms: 300
+  # 预估奖励累积的折扣系数：奖励估算器只能看到展示出来的竞争，
+  # 并假设完整的排队/资格，因此会高估我们的份额。
+  # 上线后根据实际奖励数据校准。
+  reward_haircut: 0.7
+
+scanner:
+  # P2.1 为纯观测模式：记录经济影子排名，但不参与排名、
+  # 粘性选择、报价价格或订单大小。
+  net_shadow:
+    lookback_hours: 24
+    min_reward_samples: 2
+    min_uptime_samples: 10
+    min_markout_samples: 3
+    min_recovery_samples: 2
+    reward_realization_prior: 0.5
+    uptime_prior: 0.5
+    markout_cost_per_hour_prior: 0.02
+    recovery_cost_per_hour_prior: 0.02
+  # 同时报价的市场数量。相对于 capital_usd 保持较小值：
+  # 一个双边报价在每个市场锁定约 `size` 美元的抵押品
+  # （成交一对 YES+NO 价值 $1），因此 N 个市场需要约 N×size
+  # 的可用余额。在 $100 资金下，1-2 个市场较实际；
+  # 仅在增加资金后才提高此值。
+  top_n_markets: 2
+  # 忽略每日奖励池低于此值的市场（美元/天）。从 75 上调：
+  # 一个薄池（如 $82/天的票房竞猜市场）以我们的规模只能赚几分钱奖励，
+  # 却要承担完整的被抢跑/强制对冲风险——这是一笔赔本买卖。
+  # 宁可集中报价一个优质市场，也不要用一个有毒的低池市场填充第二个坑位。
+  # 仅在扫描器无市场可选时才下调此值。
+  min_pool_per_day: 120
+  # 盘口流动性的绝对下限（美元）。下方的奖励密度排名
+  # （池÷流动性）在结构上偏向薄盘口，而这些薄盘口随后会触发
+  # 波动率/盘口不可报价保护，导致在线率崩盘（例如 $431 的盘口
+  # 做双边报价）。此值过滤掉太浅而无法安全操作的盘口。
+  # 0 = 禁用。根据 `scan` 输出调参——过高会导致扫描器无市场可选。
+  min_liquidity: 5000
+  # 忽略要求报价大于此值的市场（股数）——控制每个市场的资金占用。
+  max_min_size_shares: 100
+  # 最低奖励池与盘口流动性比率。越高 = 奖励金额越不拥挤。
+  # 0.01 表示每 $100 盘口流动性有 $1/天的奖励。
+  # 从 0.01 下调：在 0.01 时，此门槛与 min_liquidity:5000（深盘口下限）
+  # 冲突，仅剩薄盘口符合条件——因此策略偏好的深度、低毒性政治初选市场
+  # 全部因密度略低于门槛而被拒绝，而唯一通过门槛的薄盘口则反复抢跑我们。
+  # 0.005 接纳了那些深度初选市场（在那里我们每股捕获的奖励更少——
+  # 更深的池子里更小的鱼——但坑位本来也是空的，而安全性/在线率的提升
+  # 才是真正的 PnL 驱动力，参见 REPORT_reward_selection.md）。
+  min_pool_to_liquidity: 0.005
+  # 市场选择排名（方案 C）。这些参数仅对已通过上述过滤器的市场
+  # 重新排序（资格判定使用原始奖励密度），因此不会导致扫描器无市场可选。
+  # 当 ranking_mode = “density” 时忽略；仅在 ranking_mode = “capture” 时生效。
+  #   toxicity_turnover_penalty: 对 24h 成交量相对于挂单流动性较大的市场
+  #     进行降权（快速/知情资金流抢跑做市商）。score *= 1/(1+w * volume24h/liquidity）。
+  #   band_room_bonus: 偏好更宽的奖励区间（更多空间在区间内报价，
+  #     并仍能在 $1.00 附近合并配对）。score *= 1+w * (max_spread_cents-1）。
+  toxicity_turnover_penalty: 0.15
+  band_room_bonus: 0.5
+  # 市场手续费率上限（基点），以 CLOB /fee-rate 接口返回值为准。
+  # 在 Polymarket 上，做市商从不被收取手续费，因此我们的挂单奖励报价
+  # 无论此值为多少都不产生费用——唯一的手续费成本是跨价差合并/退出时（taker_buy）。
+  # 因此此上限仅用于防范病态市场；保持高位，避免不必要地跳过
+  # 我们仍可获利的收费市场。
+  max_fee_bps: 1000
+  # 在评分中对收费市场进行轻微降权，反映 taker 合并/退出成本更高
+  # （0.5 = 在 100bps 时将惩罚项减半）。仅对通过 max_fee_bps 的市场生效。
+  fee_penalty_mult: 0.5
+  # 仅报价中枢价在此范围内的市场。超出此范围时，
+  # 奖励同样要求双边深度，且尾部风险更严重。
+  # 从 [0.15, 0.85] 收窄：在极低/极高中枢价下，几个 tick 的波动
+  # 就是大幅美分波动，因此极端价位的盘口会持续触发 3c 波动率保护。
+  mid_range: [0.25, 0.75]
+  # 跳过距结算时间少于此小时数的市场。保持此值不低于
+  # risk.derisk_hours_before_end，以避免新扫入的市场
+  # 一进入就已处于降险/退出窗口内（此时会以缩紧的上限和扩大的价差
+  # 报价，仅维持几个小时就被强制退出）。
+  min_hours_to_end: 14
+  # 按此频率重新运行扫描器以轮换到新市场。
+  refresh_minutes: 15
+  # 检查已选市场的奖励最小数量，不重新排名也不重新订阅盘口。
+  # 设为 0 禁用此轻量刷新。
+  reward_min_size_refresh_seconds: 60
+  # 粘性选择（对奖励农民友好）。启用后，已在报价的市场
+  # 在重新扫描时只要仍符合条件就保留——不会因为池÷流动性排名
+  # 重新洗牌就更换集合。离开一个市场会损失订阅/报价间隙和队列位置，
+  # 因此对于奖励农民，粘性优于追逐排名略高的市场。
+  # 保护触发（毒性/成交滑点/波动率/资金流）仍然通过正常风险路径
+  # 轮换市场；此选项仅抑制因评分波动而换市场。
+  sticky_swap: true
+  # 一个新候选市场只有在评分比我们已持有的最差市场至少高出
+  # 此比例（0.25 = 好 25%）且该持有市场表现不佳（见下）时，
+  # 才能将其替换。越高 = 越粘（≈ “仅在风险触发或好得多的市场时才换”）；
+  # 0 = 绝不因评分而替换持有市场。
+  swap_score_margin: 0.25
+  # 一个持有市场仅在近期在线率低于此百分比时，才允许因评分被替换——
+  # 即它并没有实际赚到其排名所暗示的奖励。报价良好高于此值的市场
+  # 受保护，无论排名如何洗牌都不会被换掉。历史数据太少（刚进入）的
+  # 市场视为表现良好并受保护。
+  underperform_uptime_pct: 60
+  underperform_lookback_minutes: 30
+  # 当市场触发保护时（如 45 分钟波动率冷却），不要等到下次刷新
+  # 才让报价坑位闲置——立即重新扫描并轮换到下一个最佳符合条件的市场。
+  # 仅配平（无持仓）的触发市场被轮换；仍持有库存的市场保留，
+  # 由退出路径管理。由 ROTATE_MIN_INTERVAL_SECS 防抖以避免盘口订阅抖动。
+  rotate_on_trip: true
+  # 市场排名模式：
+  #   “density” = 当前行为：按池÷流动性排名（纯密度，忽略毒性/区间权重；
+  #               与当前排名方式一致）
+  #   “capture”  = 按预期捕获奖励排名：pool × share(our_size, competition），
+  #                毒性/区间乘数生效
+  ranking_mode: “capture”
+  # 捕获模型的竞争乘数。γ × liquidity 是市场中参与竞争的
+  # 预估在线评分。根据实际份额数据校准（Polymarket 奖励池约 0.027）。
+  # 仅在 ranking_mode = “capture” 时使用。
+  competition_gamma: 0.027
+  # 盘口流动性绝对下限（美元）。过滤太浅而无法安全做双边报价
+  # 而不被抢跑的盘口。0 = 禁用。
+  min_liquidity: 2000
+  # 跳过问题包含以下任一关键词的市场（不区分大小写）。
+  # 事件驱动/观测驱动的盘口：保护会持续触发，
+  # 且相关市场的库存会叠加累积（伊朗日期、首尔温度等）。
+  exclude_keywords:
+    - iran
+    - airspace
+    - israel
+    - gaza
+    - ukraine
+    - ceasefire
+    - temperature
+    - highest temp
+    - lowest temp
+    - “°c”
+    - “°f”
+    - spx
+    - s&p
+    - nasdaq
+    - up or down
+    - gold
+    - xauusd
+    # 大宗商品与加密货币价格追踪类盘口：中枢价跟随外部实时价格，
+    # 做市商挂单被抢跑的速度比撤单更快——与上述 spx/gold 条目风险特征相同。
+    # 在收费市场变为可选后，由扫描结果发现（WTI 原油、天然气）。
+    - crude
+    - wti
+    - brent
+    - natural gas
+    - nat gas
+    - bitcoin
+    - btc
+    - ethereum
+    - solana
+    # 估值追踪类盘口（如 “SpaceX 市值在 $2.5T 到 $3T 之间”）
+    # 会因离散的融资/IPO 新闻跳变，抢跑挂单。
+    - market cap
+    # IPO 时机类盘口因离散的融资/上市公告而结算——
+    # 与市值类盘口相同的头条抢跑风险（Anthropic IPO 亏损 -$5.75）。
+    - ipo
+    # 票房竞猜类盘口：中枢价跟踪外部观测值（首周末票房），
+    # 知情交易者定价速度快于我们撤单。这是单一最大亏损来源
+    #（Toy Story 5，三个竞猜合计 -$49.61），却从未被关键词排除——
+    # 参见 scripts/backtest.py。
+    - box office
+    - toy story
+    # 价格触碰/障碍类盘口，措辞为 “... hit (LOW)/(HIGH) $X”：
+    # 一个持续的外部价格跨越固定水平对做市商而言是纯粹的逆向选择。
+    - “hit (low）”
+    - “hit (high）”
+    # 事件/公告驱动类盘口：单条头条新闻推动中枢价的速度
+    # 快于撤单速度，做市商成交被抢跑，强制对冲还要多付钱。
+    # 这类市场造成了约 75% 的实盘交易亏损（见会话复盘）。
+    # 仅在资金大幅增加且报价大幅放宽后才重新启用。
+    - trump
+    - elon
+    - musk
+    - announce
+    - blockade
+    - starmer
+
+quoting:
+  # 在奖励区间内的报价位置，以 max_incentive_spread 的比例表示。
+  # 0.35 = 区间内从中枢价向外 35% 的位置。
+  # 扫描器的 capture 排名也使用此值（α = (1-offset_frac)²）。
+  # 越低 = 越贴近中枢价 = 奖励评分越高但成交越多。
+  offset_frac_of_max_spread: 0.35
+  # 单边保持容忍度：挂单报价在目标价格漂移超过此美分数
+  # 或数量漂移超过 10% 之前予以保留（保留其队列优先级）。
+  # 仅替换变化的那一侧。
+  requote_move_cents: 0.4
+  # 报价数量为市场 min_incentive_size 的倍数。
+  size_mult_of_min: 1.0
+  # 任意单个市场的资金硬上限（美元）。两个约束：
+  #   - 扫描器会跳过最低报价数量（股数）超过此值的市场，
+  #     因此它必须 ≥ 你想要的市场 min_incentive_size（约 50 股），
+  #   - 保持 max_capital_per_market × top_n_markets ≤ capital_usd，
+  #     以防止繁忙市场超额占用钱包余额。
+  # 在 $100 资金、50 股市场下，50 是最佳值（50×2=100）。
+  max_capital_per_market: 50
+  # 对累积库存进行报价偏斜的激进程度（0..1）。
+  skew_strength: 0.6
+  # GTD 订单有效期（秒）。订单在崩溃时自动过期；报价循环
+  # 在到期前会刷新它们。更长的 TTL = 更少的取消/重新发布次数
+  #（每次循环都是一次网络往返，在不稳定链路上可能卡住，造成短暂的奖励评分缺口），
+  # 代价是如果机器人崩溃，会有更多的挂单暴露（订单最多存活 ttl+60 秒）。
+  # 180 秒是小规模盘口的良好平衡；死机开关仍能足够快地触发。
+  order_ttl_secs: 180
+  # 消除每次刷新时的奖励缺口：当挂单报价仅需续期（同价格/同数量）时，
+  # 在取消旧订单之前先发布其替换订单，这样在 Polymarket 为奖励评分
+  # 采样盘口时，该侧始终在册。代价是取消落地前有亚秒级的双倍数量重叠——
+  # 对奖励农民而言，这比评分缺口更值得。价格/数量变化仍先取消。
+  # 设为 false 恢复为普通的先取消后重新发布。
+  refresh_overlap: true
+  # 仅在盘口价差 ≤ 此值的奖励区间倍数时才报价。
+  max_book_spread_mult_of_band: 3.0
+  # 由带符号资金流不平衡引起的报价中枢最大漂移（美分）。
+  flow_drift_max_cents: 1.0
+  # 基于成交滑点数据的每个市场自适应偏移。
+  adaptive_markout_gain: 1.0
+  adaptive_tighten_max_cents: 0.5
+  adaptive_widen_max_cents: 2.0
+  # 风险调整后的深度分配（compute_size_factors）。每个市场的数量乘数
+  # 按毒性对其奖励/资本效率进行折价，使资金层级向深度/慢速市场
+  # 分配更多数量，向薄/快速市场分配更少数量，而非每个市场均匀放大。
+  # 惩罚公式：
+  #   penalty = size_turnover_penalty·（volume24h/liquidity)
+  #           + size_markout_penalty·max(0, -markout_cents)
+  # factor = 1/(1+penalty），在持有市场中归一化均值为 1.0，
+  # 并限制在 [0.5, 2.0] 范围内。两者均设为 0 恢复为纯奖励分配。
+  # turnover 惩罚对标扫描器的 toxicity_turnover_penalty（0.15）；
+  # markout 惩罚为每美分成交后逆向漂移（0.5 = 相比良性同类市场，
+  # 持续 -2c markout 的市场其分配深度约减半）。
+  size_turnover_penalty: 0.15
+  size_markout_penalty: 0.5
+
+guards:
+  # 当市场中枢价在窗口内移动超过此美分数时撤回报价——
+  # 单向波动通常意味着知情资金流（如每日天气市场实时结算）。
+  vol_window_secs: 60
+  vol_max_move_cents: 3.0
+  # 在窗口内同一侧成交超过此次数后停止报价该市场——
+  # 有人在反复向我们的偏斜报价卸货。
+  max_same_side_fills: 3
+  same_side_window_minutes: 15
+  # 触发保护的市场停止报价的时长。
+  market_cooldown_minutes: 45
+  # 交易速度断路器：窗口内成交笔数超过此值时，
+  # 整个市场撤单（新闻在交易中）。
+  velocity_window_secs: 10
+  velocity_max_trades: 8
+  # 方向性资金流：某个 token 连续同向 taker 成交达到此次数时，
+  # 仅撤掉受威胁一侧的报价（非对称防御）。
+  directional_consecutive: 5
+  side_cooldown_minutes: 10
+  # 报价衰减：窗口中我们的每次成交将该侧下一次报价
+  # 再推离中枢价此美分数（逐步升级，有上限）。
+  fade_cents_per_fill: 0.5
+  fade_window_minutes: 5
+  fade_max_cents: 2.0
+  # 延迟终止：绝不在此时间以上的旧盘口上报价——直接撤单。
+  max_book_staleness_secs: 25
+  # 成交滑点：成交后在这些时间窗口上的价格漂移直接衡量逆向选择。
+  # 如果某市场在最长窗口上的平均 markout 在窗口内至少 min_samples 笔成交中
+  # 降至/低于触发水平（美分，负值 = 我们被抢跑），市场触发标准冷却。
+  markout_horizons_secs: [30, 300]
+  markout_window_minutes: 120
+  markout_min_samples: 5
+  markout_trip_cents: -1.5
+  # markout trip 后除 45 分钟冷却外，是否将市场加入禁止名单（持久化到磁盘，重启后仍然有效）。
+  # 开启后：一次 markout trip → 直接 ban 掉该市场，持久化到 data/banned_markets.json
+  # 避免反复被同一个有毒市场反向套利。若需手动清除 banned 市场，删除该 JSON 文件或编辑其中的 cid 列表。
+  # 关闭后：保持原有行为，冷却 45 分钟后该市场仍可被重新扫入选入。
+  # P1.3 — markout 联动自动退出市场。
+  markout_ban_on_trip: true
+  # 资金流不平衡（VPIN-lite）：滚动窗口内带符号的 taker 成交量，
+  # 以 YES 等价股数计。超过 widen 阈值时，受威胁一侧的报价逐步衰减
+  #（上限为 flow_widen_max_cents）；超过 pull 阈值时该侧撤单
+  # 并进入 side_cooldown_minutes 冷却。低于最低成交量时忽略（薄流量为噪音）。
+  flow_window_secs: 300
+  flow_min_volume_shares: 200
+  flow_widen_threshold: 0.6
+  flow_pull_threshold: 0.85
+  flow_widen_max_cents: 2.0
+
+risk:
+  # 按权益比例调整规模：报价数量、库存上限和强制对冲阈值
+  # 均按 （当前权益/capital_usd) 比例缩放。存入更多资金，
+  # 机器人自动放大规模；回撤则自动缩小。设有上下限，
+  # 防止一次糟糕的 mark 或单个亏损日剧烈波动。
+  # 以下美元值均以 capital_usd 为基准校准。亏损限制保持不变。
+  scale_with_equity: true
+  scale_min: 0.5
+  scale_max: 10.0
+  # 单个市场停止增加库存的上限（按当前价格计算的美元值）。
+  max_inventory_usd_per_market: 60
+  # 总库存超过此值后停止在所有市场报价（美元）。
+  max_total_inventory_usd: 250
+  # 当日权益跌幅超过此值后暂停报价直至 UTC 日结束。
+  daily_loss_limit_usd: 25
+  # 权益跌幅超过此值后撤销所有订单并退出进程。
+  hard_kill_loss_usd: 50
+  # 强制对冲：如果单向敞口超过阈值并持续此时长
+  #（偏斜报价未能使其均值回归），则在对侧盘口跨价差
+  # 补全 YES+NO 配对——以已知小损失替代开放式二元风险。
+  flatten_threshold_usd: 15
+  flatten_after_secs: 90
+  # 补单持续超过该时间仍未成交时，改用盘口中枢计算的单边互补买单。
+  # 升级后的报价不受配对成本上限限制，但仍不会恢复另一方向的普通报价。
+  recovery_escalate_after_minutes: 30
+  # 跨共享主题关键词市场的合并 |净敞口| 上限
+  #（例如三个伊朗日期市场各不超过单市场配平阈值但叠加到 $40）。
+  # 与其他美元限制一样随权益缩放。
+  theme_max_inventory_usd: 25
+  theme_groups:
+    iran: [iran, airspace]
+    weather: [temperature, highest temp, lowest temp, “°c”， “°f”]
+    equities: [s&p, spx, nasdaq, “up or down”]
+    gold: [gold, xauusd]
+  # 被动退出：在等待 flatten_after_secs 期间（以及每当
+  # 对侧盘口价差过大无法对冲时），在多余 token 上挂一个
+  # 仅限卖出的 reduce-only 订单贴到其卖价——零成本的做市商退出。
+  # 上述强制对冲仍作为未成交时的升级手段。
+  passive_exit: true
+  # 被动退出订单在队列中保持的时间比普通报价更长；
+  # GTD 过期仍会在崩溃后清除。绝不使用无期限/GTC 退出订单。
+  exit_order_ttl_secs: 600
+  # 不跨价差大于此值的对侧盘口（避免向虚空倾泻）；
+  # 重试直到价差收窄。
+  flatten_max_spread_cents: 4.0
+  # 结算感知的降险：在此窗口内，逐步缩小库存上限
+  # 并放宽报价（结算临近时事件风险急剧上升）。
+  derisk_hours_before_end: 12
+  derisk_widen_cents: 2.0
+  # 在此窗口内：停止报价并强制配平单向库存。
+  exit_hours_before_end: 2
+
+live:
+  # 0 = 普通 EOA 钱包，1 = email/Magic 代理，2 = 浏览器钱包（Gnosis Safe），
+  # 3 = POLY_1271 存款钱包（CLOB V2 新增）。类型 1/2/3 将资金保存在
+  # 独立钱包中，需要 POLYMARKET_FUNDER。V2 后端会拒绝做市商地址并提示
+  # “请使用存款钱包流程”，除非此值匹配出资钱包的实际部署方式——
+  # 已通过 scripts/sigtype_probe.py 确认此账户为类型 3。
+  signature_type: 3
+  # 链上合并 YES+NO 配对回 $1 pUSD（回收锁定资金）。
+  #   类型 0/1（EOA、代理）：自行提交交易；签名钱包需少量 POL 作 gas 费
+  #     （每次合并约零点几美分）。
+  #   类型 3（存款钱包）：通过 Polymarket 中继器免 gas 费——
+  #     需在 .env 中配置 builder API 密钥凭据（POLYMARKET_BUILDER_API_KEY/_SECRET/
+  #     _PASSPHRASE，来自 polymarket.com 的 Builders 页面）。若无凭据，
+  #     类型 3 合并自动禁用，配对在结算时赎回。
+  #   类型 2（Gnosis Safe）：自动禁用；配对在结算时赎回。
+  merge_enabled: true
+  # 仅当市场中累积至少此数量的配对后才触发合并。
+  # 越低越早回收资金（每次合并是一次免 gas 的中继往返）；
+  # 10 适合约 $100 的小型账户。
+  merge_min_pairs: 10
+  # 任意公共 Polygon RPC 节点均可（需支持 eth_call/eth_sendRawTransaction）。
+  rpc_url: https://polygon-bor-rpc.publicnode.com
+  # Polymarket 中继器，用于免 gas 的存款钱包（类型 3）合并。
+  relayer_url: https://relayer-v2.polymarket.com
+
+# 自适应控制器：根据实时权益和滚动 markout（成交后价格漂移 = 逆向选择）
+# 就地下重写以下参数。两层机制：
+#   1. 资金层级——匹配钱包规模的结构性上限。激活的层级
+#      是 min_equity_usd ≤ 当前权益的最高层级。
+#   2. 毒性响应——根据近期成交被抢跑的严重程度，
+#      在 `calm` 和 `toxic` 锚点之间插值调整报价/对冲参数。
+# 控制器写入的每个值都受此处的锚点限制，因此它只能在
+# 操作员定义的范围内移动。更改在下一个循环 tick 生效
+#（无需重启）。设置 enabled: false 将参数固定在静态值上。
+controller:
+  enabled: true
+  # 重新评估的频率（首次评估在启动时运行）。从 10 分钟缩短：
+  # 在 10 分钟节奏下，控制器在整个被抢跑事件期间一直停留在 calm 锚点
+  #（实盘中观察到在 -12c markout 下仍以 offset 0.30 紧贴报价）。
+  # 5 分钟让它在资金流仍具毒性时就放宽报价/延长对冲时间；
+  # `smoothing` 仍能保持每一步渐进。
+  interval_minutes: 5
+  # 每次评估中参数向目标值移动的缺口比例（0..1）。
+  # 越低 = 越平滑/越慢的自适应；1.0 = 直接跳到目标值。
+  smoothing: 0.5
+  # 滚动长周期 markout（美分）锚点。在 calm 及以上使用
+  # `calm` 参数组；在 toxic 及以下使用 `toxic` 参数组；之间线性插值。
+  markout_calm_cents: 0.0
+  markout_toxic_cents: -3.0
+  # 窗口内成交至少达到此次数后才启用 markout 信号。
+  # 从 4 下调：一次毒性爆发通常只有几笔成交，等待 4 笔
+  # 导致控制器在已被 -12c 抢跑时（n=2）仍读为“毒性 0%”。
+  # 2 可在早期证据上反应；`smoothing` 和单市场 markout 保护
+  # 仍能抑制过度反应。
+  min_markout_samples: 2
+  # 平缓资金流：紧贴报价、快速对冲、捕获奖励份额。
+  calm:
+    offset_frac_of_max_spread: 0.30
+    flatten_after_secs: 120
+    flatten_max_spread_cents: 4.0
+    markout_trip_cents: -1.5
+    markout_min_samples: 5
+  # 毒性资金流：放宽报价、等待被动退出、快速放弃有毒市场。
+  toxic:
+    offset_frac_of_max_spread: 0.60
+    flatten_after_secs: 360
+    flatten_max_spread_cents: 2.0
+    markout_trip_cents: -0.8
+    markout_min_samples: 2
+  # 资金层级（升序）。钱包越大 → 先放大仓位，再增加市场数量
+  #（深度优先，参见 REPORT_reward_selection.md §4-5：奖励约与我们的规模
+  # 成线性关系，而每增加一个市场就喂养逆向选择尾部，
+  # 因此我们优先扩展 size_mult_of_min + max_capital_per_market，
+  # 再扩展 top_n_markets，且始终至少报价 2 个市场以实现分散化）。
+  # 回撤会自动降至较低层级并收紧所有参数。
+  #   size_mult_of_min       → 报价数量为每个市场最低数量的倍数
+  #   max_capital_per_market → 每个市场硬上限（股数 ≈ 美元）；数量受此限制
+  capital_tiers:
+    - min_equity_usd: 0
+      top_n_markets: 2
+      size_mult_of_min: 1.0
+      max_capital_per_market: 50
+      max_inventory_usd_per_market: 30
+      daily_loss_limit_usd: 8
+      hard_kill_loss_usd: 20
+    - min_equity_usd: 250
+      top_n_markets: 2
+      size_mult_of_min: 2.0
+      max_capital_per_market: 100
+      max_inventory_usd_per_market: 60
+      daily_loss_limit_usd: 20
+      hard_kill_loss_usd: 50
+    - min_equity_usd: 750
+      top_n_markets: 3
+      size_mult_of_min: 3.5
+      max_capital_per_market: 175
+      max_inventory_usd_per_market: 120
+      daily_loss_limit_usd: 50
+      hard_kill_loss_usd: 120
+    - min_equity_usd: 2000
+      top_n_markets: 3
+      size_mult_of_min: 6.0
+      max_capital_per_market: 300
+      max_inventory_usd_per_market: 250
+      daily_loss_limit_usd: 120
+      hard_kill_loss_usd: 300

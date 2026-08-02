@@ -97,7 +97,10 @@ scanner:
   # cap and widened spread for only a couple of hours before forced exit).
   min_hours_to_end: 14
   # Re-run the scanner this often to rotate into fresh markets.
-  refresh_minutes: 30
+  refresh_minutes: 15
+  # Check the selected markets' reward minimum size without re-ranking or
+  # resubscribing books.  Set to 0 to disable this lightweight refresh.
+  reward_min_size_refresh_seconds: 60
   # Sticky selection (reward-farmer friendly). When true, markets we are
   # already quoting are KEPT across rescans as long as they stay eligible —
   # we don't churn the set just because the pool÷liquidity ranking reshuffled.

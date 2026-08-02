@@ -551,6 +551,7 @@ class Bot:
         self._token_market: dict[str, gamma.Market] = {}
         self._size_factors: dict[str, float] = {}
         self._last_scan = 0.0
+        self._last_reward_min_size_refresh = 0.0
         self._last_rotate = 0.0
         self._rotate_pending = False
         self._last_reward_sample = 0.0
@@ -642,6 +643,12 @@ class Bot:
                 elif (self._rotate_pending
                       and now - self._last_rotate > ROTATE_MIN_INTERVAL_SECS):
                     await self._rescan(rotate=True)
+                min_size_refresh = float(
+                    self.cfg["scanner"].get("reward_min_size_refresh_seconds", 60.0))
+                if (min_size_refresh > 0
+                        and now - self._last_reward_min_size_refresh >= min_size_refresh):
+                    self._last_reward_min_size_refresh = now
+                    await self._refresh_reward_min_sizes()
                 self.broker.check_crossed_books()
                 if not self.paper and now - self._last_pos_refresh >= POSITION_REFRESH_SECONDS:
                     await asyncio.to_thread(self.broker.refresh_state)
@@ -1087,6 +1094,27 @@ class Bot:
         if not self.paper:
             await self._ensure_held_market_books()
         self._compute_size_factors()
+
+    async def _refresh_reward_min_sizes(self) -> None:
+        """轻量刷新已选市场的奖励最小份数，不改变市场选择或盘口订阅。"""
+        markets = list(self.markets)
+        if not markets:
+            return
+        refreshed = await asyncio.gather(*(
+            asyncio.to_thread(gamma.fetch_market, market.condition_id)
+            for market in markets
+        ), return_exceptions=True)
+        for market, latest in zip(markets, refreshed):
+            if isinstance(latest, Exception):
+                log.warning("奖励门槛查询失败，保留 %.0f 股：%s (%s)",
+                            market.min_size, market.question[:45], latest)
+                continue
+            if latest is None or abs(latest.min_size - market.min_size) < 1e-9:
+                continue
+            old_min_size = market.min_size
+            market.min_size = latest.min_size
+            log.info("奖励最小份数更新：%s %.0f → %.0f 股",
+                     market.question[:45], old_min_size, market.min_size)
 
     def _compute_size_factors(self) -> None:
         if not self.tracker:
