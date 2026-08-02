@@ -1800,17 +1800,17 @@ class Bot:
             reason = ("not_escalated" if not escalated else
                       "over_hard_cap" if cap is not None and ask > cap + 1e-9 else
                       "unknown_cost_basis" if basis is None else "rejected")
-            log.warning(
-                "FORCED_HEDGE_DEFERRED market='%s' reason=%s unpaired=%.0f "
-                "urgent=%s exposure=%.4f threshold=%.4f waited=%.0fs/%.0fs "
-                "bid=%.3f ask=%.3f cost_basis=%s hard_cap=%s fee_per_share=%.6f "
-                "expected_pair_pnl=%s detail=%s "
-                "说明=未提交吃单；风险条件或单对经济约束未满足",
-                m.question[:45], reason, unpaired, urgent, exposure, threshold,
-                now - start, wait, bid, ask,
-                "unknown" if basis is None else f"{basis:.3f}",
-                "unknown" if cap is None else f"{cap:.3f}", fee,
-                "unknown" if expected is None else f"{expected:+.6f}", detail)
+            # log.warning(
+            #     "FORCED_HEDGE_DEFERRED market='%s' reason=%s unpaired=%.0f "
+            #     "urgent=%s exposure=%.4f threshold=%.4f waited=%.0fs/%.0fs "
+            #     "bid=%.3f ask=%.3f cost_basis=%s hard_cap=%s fee_per_share=%.6f "
+            #     "expected_pair_pnl=%s detail=%s "
+            #     "说明=未提交吃单；风险条件或单对经济约束未满足",
+            #     m.question[:45], reason, unpaired, urgent, exposure, threshold,
+            #     now - start, wait, bid, ask,
+            #     "unknown" if basis is None else f"{basis:.3f}",
+            #     "unknown" if cap is None else f"{cap:.3f}", fee,
+            #     "unknown" if expected is None else f"{expected:+.6f}", detail)
             if self.metrics:
                 self.metrics.record_recovery_event(
                     cid, "forced_hedge_deferred", unpaired, reason=reason,
