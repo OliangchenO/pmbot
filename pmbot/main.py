@@ -981,9 +981,21 @@ class Bot:
         # orders remain untouched by the bot.
         manual_hold = self._manual_hold_cids()
         exclude |= manual_hold
+        recovery_cids: set[str] = set()
+        if self.broker is not None:
+            recovery_cids = {
+                market.condition_id for market in self.broker.held_markets()
+                if abs(self.broker.unpaired_shares(market)) >= MIN_TAKER_SHARES
+            }
+            # Inventory remains managed through held_markets() in _quote_all(),
+            # but an unpaired market must release its normal reward quote slot.
+            exclude |= recovery_cids
         log.info("正在扫描奖励市场…%s",
                  f" (rotating out {len(exclude)} tripped)" if exclude else "")
         ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
+        if recovery_cids:
+            ranked = [market for market in ranked
+                      if market.condition_id not in recovery_cids]
         if not ranked:
             if not initial:
                 log.warning("重新扫描未找到市场，保留当前市场集合")
@@ -1053,7 +1065,8 @@ class Bot:
         if self.broker and not initial:
             for old_m in old_markets:
                 if (old_m.condition_id in old_cids - new_cids
-                        and old_m.condition_id not in manual_hold):
+                        and old_m.condition_id not in manual_hold
+                        and old_m.condition_id not in recovery_cids):
                     async with self._market_lock(old_m.condition_id):
                         if hasattr(self.broker, "cancel_quotes_for_market"):
                             await self._broker_call(

@@ -844,7 +844,7 @@ def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_
 
 
 def test_rescan_removes_unpaired_inventory_market_from_quote_set(tmp_path, monkeypatch):
-    """未进前 N 的补单市场留给持仓管理，不能占用正常报价席位。"""
+    """未配平市场立即退出候选竞争，但保留已有互补补单。"""
     from pmbot import gamma as gamma_mod
     from pmbot.books import BookTracker
 
@@ -858,8 +858,13 @@ def test_rescan_removes_unpaired_inventory_market_from_quote_set(tmp_path, monke
     monkeypatch.setattr(BookTracker, "start", fake_start)
     monkeypatch.setattr(BookTracker, "resubscribe", fake_resubscribe)
     ranked = {"value": []}
-    monkeypatch.setattr(gamma_mod, "scan",
-                        lambda cfg, exclude=None, full=False: list(ranked["value"]))
+    scan_excludes = []
+
+    def fake_scan(cfg, exclude=None, full=False):
+        scan_excludes.append(set(exclude or ()))
+        return list(ranked["value"])
+
+    monkeypatch.setattr(gamma_mod, "scan", fake_scan)
 
     async def scenario():
         bot = _bot(tmp_path)
@@ -876,21 +881,21 @@ def test_rescan_removes_unpaired_inventory_market_from_quote_set(tmp_path, monke
         held.min_size = 10.0
         ranked["value"] = [held, flat, fresh]
         await bot._rescan(initial=True)
-        # 补单市场依然参与排名；它未排进前二时退出正常报价集合。
-        bot.broker.state.positions[held.condition_id] = Position(no_shares=5.0)
+        old_recovery = Quote(held.yes_token, 0.45, 10.0)
+        bot.broker.set_quotes(held, [old_recovery])
 
-        ranked["value"] = [flat, fresh]
-        await bot._rescan()
-        assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
-
-        # 补单份数达到原奖励最小量，也不能绕过排名抢占正常报价席位。
+        # 即使得分最高且原本受 sticky 保护，10 股 NO 敞口也必须释放报价席位。
         bot.broker.state.positions[held.condition_id] = Position(no_shares=10.0)
         await bot._rescan()
         assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
+        assert bot.broker.open_quotes(held) == [old_recovery]
 
+        # 归零后下一轮扫描不再向 Gamma 传入 held 的排除 CID。
         bot.broker.state.positions[held.condition_id] = Position()
         await bot._rescan()
         assert {m.condition_id for m in bot.markets} == {"flat", "fresh"}
+        assert held.condition_id in scan_excludes[1]
+        assert held.condition_id not in scan_excludes[-1]
         bot.metrics.close()
 
     asyncio.run(scenario())
