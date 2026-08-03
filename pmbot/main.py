@@ -606,6 +606,14 @@ class Bot:
         except OSError as e:
             log.warning("无法持久化 banned_markets.json: %s", e)
 
+    def _manual_hold_cids(self) -> set[str]:
+        """Return markets that the bot must leave entirely to manual handling."""
+        risk_cfg = self.cfg.get("risk") or {}
+        return {
+            hex(cid) if isinstance(cid, int) else str(cid)
+            for cid in risk_cfg.get("manual_hold_cids") or []
+        }
+
     async def run(self) -> None:
         if not self.paper:
             await self._bootstrap_live_broker()
@@ -769,12 +777,14 @@ class Bot:
         """Subscribe position-only markets before routing them to inventory logic."""
         if self.paper or self.broker is None or self.tracker is None:
             return
-        held = self.broker.held_markets()
+        manual_hold = self._manual_hold_cids()
+        held = [m for m in self.broker.held_markets() if m.condition_id not in manual_hold]
         for market in held:
             self._token_market[market.yes_token] = market
             self._token_market[market.no_token] = market
+        held_tokens = {token for market in held for token in (market.yes_token, market.no_token)}
         missing = [token for token in self.broker.position_tokens()
-                   if token not in self.tracker.books]
+                   if token in held_tokens and token not in self.tracker.books]
         if not missing:
             return
         log.warning("为库存管理订阅 %d 个持仓代币订单簿",
@@ -967,6 +977,10 @@ class Bot:
         exclude |= exclude_cids or set()
         # P1.3: 把 markout-ban 的 cid 也排除，确保 banned 市场不会被重新扫入。
         exclude |= self._banned_cids
+        # Manual-hold markets are excluded from selection; their inventory and
+        # orders remain untouched by the bot.
+        manual_hold = self._manual_hold_cids()
+        exclude |= manual_hold
         log.info("正在扫描奖励市场…%s",
                  f" (rotating out {len(exclude)} tripped)" if exclude else "")
         ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
@@ -1038,7 +1052,8 @@ class Bot:
         carry_books: dict = {}
         if self.broker and not initial:
             for old_m in old_markets:
-                if old_m.condition_id in old_cids - new_cids:
+                if (old_m.condition_id in old_cids - new_cids
+                        and old_m.condition_id not in manual_hold):
                     async with self._market_lock(old_m.condition_id):
                         if hasattr(self.broker, "cancel_quotes_for_market"):
                             await self._broker_call(
@@ -1055,7 +1070,15 @@ class Bot:
                 if t in self.tracker.books
             }
             if self.broker:
+                manual_tokens = {
+                    token
+                    for market in self.broker.held_markets()
+                    if market.condition_id in manual_hold
+                    for token in (market.yes_token, market.no_token)
+                }
                 for t in self.broker.position_tokens():
+                    if t in manual_tokens:
+                        continue
                     if t not in token_ids:
                         token_ids.append(t)
 
@@ -1425,7 +1448,10 @@ class Bot:
         self._quote_block_reasons.clear()
 
         selected_cids = {m.condition_id for m in self.markets}
+        manual_hold = self._manual_hold_cids()
         for m in all_markets:
+            if m.condition_id in manual_hold:
+                continue
             unpaired = self.broker.unpaired_shares(m)
             needs_recovery = abs(unpaired) >= MIN_TAKER_SHARES
             h = hours_to_end(m, now)
@@ -1695,10 +1721,12 @@ class Bot:
             await self._rescan(rotate=True, exclude_cids=empty_selected_flat_cids)
 
     async def _manage_inventory(self, now: float) -> None:
-        quoted = {m.condition_id for m in self.markets}
-        managed = {m.condition_id: m for m in self.markets}
+        manual_hold = self._manual_hold_cids()
+        quoted = {m.condition_id for m in self.markets if m.condition_id not in manual_hold}
+        managed = {m.condition_id: m for m in self.markets if m.condition_id not in manual_hold}
         for m in self.broker.held_markets():
-            managed.setdefault(m.condition_id, m)
+            if m.condition_id not in manual_hold:
+                managed.setdefault(m.condition_id, m)
         if not managed:
             return
         # Exits/hedges on different markets are independent — run them
@@ -1917,9 +1945,11 @@ class Bot:
         """Record current per-market inventory facts without affecting decisions."""
         if self.broker is None:
             return
-        managed = {m.condition_id: m for m in self.markets}
+        manual_hold = self._manual_hold_cids()
+        managed = {m.condition_id: m for m in self.markets if m.condition_id not in manual_hold}
         for market in self.broker.held_markets():
-            managed.setdefault(market.condition_id, market)
+            if market.condition_id not in manual_hold:
+                managed.setdefault(market.condition_id, market)
         basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
         for market in managed.values():
             unpaired = self.broker.unpaired_shares(market)

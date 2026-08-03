@@ -314,6 +314,10 @@ guards:
   flow_widen_max_cents: 2.0
 
 risk:
+  # Markets listed here are held entirely by the operator.  The bot neither
+  # selects, quotes, recovers, hedges, nor cancels orders for them.
+  manual_hold_cids:
+    - "0xa1a4a8b493cd978b359c3deab56955d80a4b0b14c806beea6bd37b4b3a3e4415"
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
   # hedge threshold all scale by (current equity / capital_usd). Deposit more
   # and the bot sizes up automatically; draw down and it sizes down. Clamped

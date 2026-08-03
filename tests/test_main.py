@@ -316,6 +316,51 @@ def test_quote_all_keeps_held_empty_quote_market_out_of_replacement_rescan(
     asyncio.run(scenario())
 
 
+def test_quote_all_leaves_manual_hold_market_completely_untouched(tmp_path):
+    """人工持仓市场不得被报价循环撤单、补单或强制对冲。"""
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(
+            tmp_path, main.MIN_TAKER_SHARES)
+        broker = bot.broker
+        old_quote = Quote(market.yes_token, 0.45, main.MIN_TAKER_SHARES)
+        broker.set_quotes(market, [old_quote])
+        bot.cfg["risk"]["manual_hold_cids"] = [market.condition_id]
+
+        await bot._quote_all()
+
+        assert broker.open_quotes(market) == [old_quote]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_manual_hold_cids_normalizes_yaml_hex_integer(tmp_path):
+    """Unquoted 0x CIDs in YAML must still match the exchange hex CID."""
+    cid = "0xa1a4a8b493cd978b359c3deab56955d80a4b0b14c806beea6bd37b4b3a3e4415"
+    bot = _bot(tmp_path)
+    bot.cfg["risk"] = {"manual_hold_cids": [int(cid, 16)]}
+
+    assert bot._manual_hold_cids() == {cid}
+
+    bot.metrics.close()
+
+
+def test_manage_inventory_does_not_force_hedge_manual_hold_market(tmp_path):
+    """独立库存管理路径也不得为人工持仓市场提交互补吃单。"""
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(
+            tmp_path, main.MIN_TAKER_SHARES)
+        bot.cfg["risk"]["manual_hold_cids"] = [market.condition_id]
+        bot.cfg["risk"]["flatten_threshold_usd"] = 0.1
+
+        await bot._manage_inventory(time.time())
+
+        assert bot.broker.unpaired_shares(market) == main.MIN_TAKER_SHARES
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_quote_all_batches_flat_empty_markets_into_one_replacement_rescan(
         tmp_path, monkeypatch):
     """Moving the rescan into the market loop would rescan once per empty slot."""
@@ -682,6 +727,40 @@ def test_rescan_is_sticky_and_swaps_incrementally(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_rescan_excludes_manual_hold_market_without_cancelling_orders(tmp_path, monkeypatch):
+    """人工持仓市场离开正常选择集合时，原订单必须保持不动。"""
+    from pmbot import gamma as gamma_mod
+    from pmbot.books import Book, BookTracker
+
+    async def fake_resubscribe(self, token_ids, carry=None):
+        self.books = {token: self.books.get(token) or Book(token) for token in token_ids}
+
+    async def scenario():
+        bot, manual = _quote_loop_bot_with_empty_strategy(tmp_path)
+        bot.cfg["risk"]["manual_hold_cids"] = [manual.condition_id]
+        bot.cfg["scanner"]["top_n_markets"] = 1
+        old_quote = Quote(manual.yes_token, 0.45, 10.0)
+        bot.broker.set_quotes(manual, [old_quote])
+        scan_excludes = []
+        replacement = _scored("replacement", 2.0)
+
+        def fake_scan(_cfg, exclude=None, full=False):
+            scan_excludes.append(set(exclude or ()))
+            return [replacement]
+
+        monkeypatch.setattr(BookTracker, "resubscribe", fake_resubscribe)
+        monkeypatch.setattr(gamma_mod, "scan", fake_scan)
+
+        await bot._rescan()
+
+        assert scan_excludes == [{manual.condition_id}]
+        assert [market.condition_id for market in bot.markets] == [replacement.condition_id]
+        assert bot.broker.open_quotes(manual) == [old_quote]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_path, monkeypatch):
     """Passive P2.1 instrumentation must not make the shadow winner tradable."""
     from pmbot import gamma as gamma_mod
@@ -988,6 +1067,28 @@ def test_held_market_tokens_are_subscribed_for_inventory_management(tmp_path):
         assert calls == [[market.yes_token, market.no_token]]
         assert bot._token_market == {market.yes_token: market, market.no_token: market}
         bot.metrics.close()
+    asyncio.run(scenario())
+
+
+def test_manual_hold_market_tokens_are_not_subscribed(tmp_path):
+    """完全人工持仓不得因库存管理而维持其行情订阅。"""
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.paper = False
+        market = _market()
+        bot.cfg["risk"] = {"manual_hold_cids": [market.condition_id]}
+        bot.broker = MagicMock()
+        bot.broker.held_markets.return_value = [market]
+        bot.broker.position_tokens.return_value = [market.yes_token, market.no_token]
+        bot.tracker = BookTracker([])
+        bot.tracker.resubscribe = AsyncMock()
+
+        await bot._ensure_held_market_books()
+
+        bot.tracker.resubscribe.assert_not_awaited()
+        assert bot._token_market == {}
+        bot.metrics.close()
+
     asyncio.run(scenario())
 
 
