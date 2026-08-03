@@ -1265,6 +1265,22 @@ class Bot:
             return []
         return recovery
 
+    def _can_retain_recovery_quote(self, m: gamma.Market,
+                                   current: list[strategy.Quote],
+                                   unpaired: float) -> bool:
+        """Keep one safe, equal-size complement bid in its existing queue position."""
+        if abs(unpaired) < MIN_TAKER_SHARES or len(current) != 1:
+            return False
+        quote = current[0]
+        complement = m.no_token if unpaired > 0 else m.yes_token
+        if quote.token_id != complement or abs(quote.size - abs(unpaired)) > 1e-6:
+            return False
+        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+        basis = basis_fn(m) if basis_fn else None
+        if basis is None:
+            return False
+        return quote.price <= self._forced_hedge_max_price(m, basis) + 1e-9
+
     def _clob_min_order_size(self, token_id: str) -> float | None:
         """Current CLOB quantity floor, populated from `/book` snapshots."""
         if self.tracker is None:
@@ -1624,8 +1640,11 @@ class Bot:
                         m.condition_id, "skip", unpaired,
                         reason=reason, recovery_path=recovery_path)
             current = self.broker.open_quotes(m)
-            final = strategy.reconcile_quotes(
-                current, desired, self.cfg["quoting"]["requote_move_cents"])
+            if self._can_retain_recovery_quote(m, current, unpaired):
+                final = current
+            else:
+                final = strategy.reconcile_quotes(
+                    current, desired, self.cfg["quoting"]["requote_move_cents"])
             # ── log phase transitions (debounced) ──
             if needs_recovery and recovery_path != "normal":
                 prev = self._recovery_phase_logged.get(m.condition_id)

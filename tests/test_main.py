@@ -242,6 +242,53 @@ def _quote_loop_bot_with_empty_strategy(tmp_path, unpaired: float = 0.0):
     return bot, market
 
 
+def test_quote_all_keeps_safe_recovery_order_at_original_price(tmp_path, monkeypatch):
+    """补单价格仍在硬上限内时，普通报价刷新不得丢失其队列位置。"""
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path, 12.0)
+        bot.cfg["quoting"]["requote_move_cents"] = 0.4
+        old = Quote(market.no_token, 0.33, 12.0)
+        bot.broker.set_quotes(market, [old])
+        monkeypatch.setattr(bot, "_log_inventory_recovery_quote", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            strategy, "compute_quotes",
+            lambda *_args, **_kwargs: [
+                Quote(market.yes_token, 0.65, 12.0),
+                Quote(market.no_token, 0.34, 12.0),
+            ],
+        )
+
+        await bot._quote_all()
+
+        assert bot.broker.open_quotes(market) == [old]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_quote_all_replaces_recovery_order_above_hard_cap(tmp_path, monkeypatch):
+    """补单价格超过当前配对成本硬上限时，必须撤换为受限价格。"""
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path, 12.0)
+        old = Quote(market.no_token, 0.51, 12.0)
+        bot.broker.set_quotes(market, [old])
+        monkeypatch.setattr(bot, "_log_inventory_recovery_quote", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            strategy, "compute_quotes",
+            lambda *_args, **_kwargs: [
+                Quote(market.yes_token, 0.65, 12.0),
+                Quote(market.no_token, 0.34, 12.0),
+            ],
+        )
+
+        await bot._quote_all()
+
+        assert bot.broker.open_quotes(market) == [Quote(market.no_token, 0.34, 12.0)]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_quote_all_rescans_flat_selected_market_without_submittable_quotes(
         tmp_path, monkeypatch):
     """Removing the empty-quote replacement must leave the selected slot idle."""
