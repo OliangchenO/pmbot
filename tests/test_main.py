@@ -249,14 +249,48 @@ def test_quote_all_rescans_flat_selected_market_without_submittable_quotes(
         bot, _ = _quote_loop_bot_with_empty_strategy(tmp_path)
         calls = []
 
-        async def record_rescan(*, initial=False, rotate=False):
-            calls.append((initial, rotate))
+        async def record_rescan(*, initial=False, rotate=False, exclude_cids=None):
+            calls.append((initial, rotate, set(exclude_cids or ())))
 
         monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(bot, "_rescan", record_rescan)
         await bot._quote_all()
 
-        assert calls == [(False, True)]
+        assert calls == [(False, True, {"cid1"})]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_quote_all_replaces_flat_selected_market_without_submittable_quotes(
+        tmp_path, monkeypatch):
+    """A flat selected market with no final quotes must free its quote slot."""
+    from pmbot import gamma as gamma_mod
+    from pmbot.books import Book, BookTracker
+
+    async def fake_resubscribe(self, token_ids, carry=None):
+        self.books = {token: self.books.get(token) or Book(token)
+                      for token in token_ids}
+
+    async def scenario():
+        bot, selected = _quote_loop_bot_with_empty_strategy(tmp_path)
+        bot.cfg["scanner"]["top_n_markets"] = 1
+        replacement = _scored("replacement", 2.0)
+        scan_excludes = []
+
+        def fake_scan(_cfg, exclude=None, full=False):
+            scan_excludes.append(set(exclude or ()))
+            return [market for market in (selected, replacement)
+                    if market.condition_id not in (exclude or set())]
+
+        monkeypatch.setattr(BookTracker, "resubscribe", fake_resubscribe)
+        monkeypatch.setattr(gamma_mod, "scan", fake_scan)
+        monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
+
+        await bot._quote_all()
+
+        assert scan_excludes == [{selected.condition_id}]
+        assert [market.condition_id for market in bot.markets] == ["replacement"]
         bot.metrics.close()
 
     asyncio.run(scenario())
@@ -269,7 +303,7 @@ def test_quote_all_keeps_held_empty_quote_market_out_of_replacement_rescan(
         bot, _ = _quote_loop_bot_with_empty_strategy(tmp_path, main.MIN_TAKER_SHARES)
         calls = []
 
-        async def record_rescan(*, initial=False, rotate=False):
+        async def record_rescan(*, initial=False, rotate=False, exclude_cids=None):
             calls.append((initial, rotate))
 
         monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
@@ -304,14 +338,14 @@ def test_quote_all_batches_flat_empty_markets_into_one_replacement_rescan(
         bot._token_market[market.no_token] = market
         calls = []
 
-        async def record_rescan(*, initial=False, rotate=False):
-            calls.append((initial, rotate))
+        async def record_rescan(*, initial=False, rotate=False, exclude_cids=None):
+            calls.append((initial, rotate, set(exclude_cids or ())))
 
         monkeypatch.setattr(strategy, "compute_quotes", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(bot, "_rescan", record_rescan)
         await bot._quote_all()
 
-        assert calls == [(False, True)]
+        assert calls == [(False, True, {"cid1", "cid2"})]
         bot.metrics.close()
 
     asyncio.run(scenario())

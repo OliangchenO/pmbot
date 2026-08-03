@@ -958,11 +958,13 @@ class Bot:
                 survivor_cids.discard(weak.condition_id)
         return chosen
 
-    async def _rescan(self, initial: bool = False, rotate: bool = False) -> None:
+    async def _rescan(self, initial: bool = False, rotate: bool = False,
+                      exclude_cids: set[str] | None = None) -> None:
         self._rotate_pending = False
         if rotate:
             self._last_rotate = time.time()
         exclude = set() if initial else self._rotatable_tripped_cids()
+        exclude |= exclude_cids or set()
         # P1.3: 把 markout-ban 的 cid 也排除，确保 banned 市场不会被重新扫入。
         exclude |= self._banned_cids
         log.info("正在扫描奖励市场…%s",
@@ -1690,7 +1692,7 @@ class Bot:
                 and now - self._last_rotate >= ROTATE_MIN_INTERVAL_SECS):
             log.info("%d 个空仓市场未生成可提交报价，重新扫描以补足报价槽位",
                      len(empty_selected_flat_cids))
-            await self._rescan(rotate=True)
+            await self._rescan(rotate=True, exclude_cids=empty_selected_flat_cids)
 
     async def _manage_inventory(self, now: float) -> None:
         quoted = {m.condition_id for m in self.markets}
