@@ -458,6 +458,47 @@ def test_gtd_refresh_margin_covers_security_threshold():
     assert GTD_REFRESH_MARGIN_SECS > GTD_SECURITY_THRESHOLD_SECS
 
 
+def test_live_recovery_order_ttl_uses_recovery_audit_context():
+    """库存互补补单必须有独立且更长的 GTD 生命周期。"""
+    stub = _order_book_stub()
+    stub.order_ttl = 180
+    stub.recovery_order_ttl = 900
+
+    assert LiveBroker._buy_order_ttl(stub, {"recovery_order": True}) == 900
+    assert LiveBroker._buy_order_ttl(stub, {}) == 180
+    stub.recovery_order_ttl = stub.order_ttl
+    assert LiveBroker._buy_order_ttl(stub, {"recovery_order": True}) == 180
+
+
+def test_live_recovery_order_uses_extended_gtd_expiration(monkeypatch):
+    """签名 GTD 和本地 RestingOrder 必须使用同一补单到期时间。"""
+    from pmbot.brokers import GTD_SECURITY_THRESHOLD_SECS
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.refresh_overlap = True
+    stub.metrics = None
+    stub._markets = {}
+    stub._logged_post_shape = False
+    stub.order_ttl = 180
+    stub.recovery_order_ttl = 900
+    stub._gtd_expiration = LiveBroker._gtd_expiration.__get__(stub, LiveBroker)
+    stub.reconcile_orders = MagicMock()
+    stub._batch_cancel = lambda ids, **_kwargs: True
+    stub.client.create_order.return_value = object()
+    stub.client.post_orders.return_value = [{"orderID": "recovery-1"}]
+    now = 1_700_000_000
+    monkeypatch.setattr("pmbot.brokers.time.time", lambda: now)
+
+    q = Quote("no1", 0.34, 12)
+    LiveBroker.set_quotes(stub, _market(), [q], {q.token_id: {"recovery_order": True}})
+
+    expected = now + 900 + GTD_SECURITY_THRESHOLD_SECS
+    assert stub.client.create_order.call_args.args[0].expiration == expected
+    assert stub._open_orders["cid1"][0].expiration == expected
+
+
 def _order_book_stub():
     """LiveBroker order-tracking methods exercised without a CLOB client."""
     class Stub:

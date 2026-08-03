@@ -266,6 +266,34 @@ def test_quote_all_keeps_safe_recovery_order_at_original_price(tmp_path, monkeyp
     asyncio.run(scenario())
 
 
+def test_quote_all_marks_complement_recovery_order_for_extended_ttl(tmp_path, monkeypatch):
+    """只有等敞口互补买单能申请更长的补单 TTL。"""
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path, 12.0)
+        sent = []
+
+        async def record_set_quotes(_market, quotes, audit_context=None):
+            sent.append((quotes, audit_context))
+
+        monkeypatch.setattr(bot, "_set_quotes_locked", record_set_quotes)
+        monkeypatch.setattr(bot, "_log_inventory_recovery_quote", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            strategy, "compute_quotes",
+            lambda *_args, **_kwargs: [
+                Quote(market.yes_token, 0.65, 12.0),
+                Quote(market.no_token, 0.34, 12.0),
+            ],
+        )
+
+        await bot._quote_all()
+
+        assert sent[0][0] == [Quote(market.no_token, 0.34, 12.0)]
+        assert sent[0][1][market.no_token]["recovery_order"] is True
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_quote_all_replaces_recovery_order_above_hard_cap(tmp_path, monkeypatch):
     """补单价格超过当前配对成本硬上限时，必须撤换为受限价格。"""
     async def scenario():

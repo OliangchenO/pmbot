@@ -1727,6 +1727,9 @@ class Bot:
                         "strike_pair_cap": cap,
                         "expected_pair_pnl": 1.0 - basis - q.price - fee if basis is not None else None,
                     }
+                    if (abs(unpaired) >= MIN_TAKER_SHARES
+                            and q.token_id == (m.no_token if unpaired > 0 else m.yes_token)):
+                        audit_context[q.token_id]["recovery_order"] = True
                 updates.append((m, final, audit_context))
 
         if updates:

@@ -231,6 +231,11 @@ quoting:
   # crashes (orders rest up to ttl+60s before self-expiring). 180s is a good
   # balance for a small book; the dead-man switch still fires quickly enough.
   order_ttl_secs: 180
+  # Inventory-recovery bids keep their queue position longer because they only
+  # reduce an existing YES/NO imbalance. Their GTD expiry is this value plus
+  # the CLOB's 60-second safety threshold; price, size, or risk-cap changes
+  # still replace them immediately.
+  recovery_order_ttl_secs: 900
   # Close the per-refresh reward gap: when a resting quote is only expiring
   # (same price/size), post its replacement BEFORE cancelling the old order so
   # the side is never off the book when Polymarket samples the book for reward

@@ -631,6 +631,8 @@ class LiveBroker:
         self.audit = AuditLogger(metrics_cfg.get("audit_log", "data/audit.jsonl"))
         self._recovery_basis_cache = self.audit.recovery_bases()
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
+        self.recovery_order_ttl = int(cfg["quoting"].get(
+            "recovery_order_ttl_secs", self.order_ttl))
         self.exit_order_ttl = int(cfg["risk"].get("exit_order_ttl_secs", 600))
         # Refresh resting quotes by posting the replacement BEFORE cancelling
         # the expiring order, so a pure GTD refresh never leaves the side off
@@ -708,6 +710,10 @@ class LiveBroker:
     def _gtd_expiration(self, ttl_secs: int | None = None) -> int:
         ttl = self.order_ttl if ttl_secs is None else ttl_secs
         return int(time.time()) + ttl + GTD_SECURITY_THRESHOLD_SECS
+
+    def _buy_order_ttl(self, audit: dict | None) -> int:
+        """Use the longer GTD lifetime only for inventory-reducing recovery bids."""
+        return self.recovery_order_ttl if (audit or {}).get("recovery_order") else self.order_ttl
 
     def _erc20_balance(self, token_address: str, owner: str) -> float:
         import httpx
@@ -952,18 +958,21 @@ class LiveBroker:
         placed: list[RestingOrder] = []
         if desired:
             batch_args = []
-            order_map: list[Quote] = []
+            order_map: list[tuple[Quote, int]] = []
             options = PartialCreateOrderOptions(neg_risk=market.neg_risk)
             for q in desired.values():
                 try:
-                    expiration = self._gtd_expiration()
+                    context = (audit_context or {}).get(q.token_id, {})
+                    expiration = (self._gtd_expiration(LiveBroker._buy_order_ttl(self, context))
+                                  if context.get("recovery_order")
+                                  else self._gtd_expiration())
                     with self._client_lock:
                         signed = self.client.create_order(OrderArgs(
                             price=q.price, size=q.size, side=Side.BUY, token_id=q.token_id,
                             expiration=expiration,
                         ), options)
                     batch_args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTD))
-                    order_map.append(q)
+                    order_map.append((q, expiration))
                 except Exception as e:  # noqa: BLE001
                     log.error("构建订单失败（%s @ %.3f）：%s", q.token_id[:12], q.price, e)
                     self._record_order_event("ORDER_POST_FAILED", market, q, "BUY",
@@ -983,10 +992,10 @@ class LiveBroker:
                         oid = (item.get("orderID") or item.get("orderId")
                                or item.get("id") or "")
                         if oid:
-                            q = order_map[i]
+                            q, expiration = order_map[i]
                             context = (audit_context or {}).get(q.token_id, {})
                             placed.append(RestingOrder(
-                                oid, q, now, self._gtd_expiration(), context))
+                                oid, q, now, expiration, context))
                             self._record_order_event("ORDER_PLACED", market, q, "BUY", oid,
                                                      audit=context)
                         else:
@@ -994,7 +1003,7 @@ class LiveBroker:
                             # REJECTIONS: orderID comes back empty with the reason
                             # in errorMsg. Surface it — a swallowed empty orderID is
                             # why a quote never rests (and rewards never accrue).
-                            q = order_map[i]
+                            q, _ = order_map[i]
                             reason = (item.get("errorMsg") or item.get("error")
                                       or "empty orderID (no reason given)")
                             log.warning("订单被拒绝（%s @ %.3f×%.0f，市场“%s”）：%s",
@@ -1004,7 +1013,7 @@ class LiveBroker:
                                                      "BUY", reason=reason)
                 except Exception as e:  # noqa: BLE001
                     log.error("批量提交失败，先对账而不盲目重试：%s", e)
-                    for q in order_map:
+                    for q, _ in order_map:
                         self._record_order_event("ORDER_POST_FAILED", market, q,
                                                  "BUY", reason=str(e))
                     self.reconcile_orders()
