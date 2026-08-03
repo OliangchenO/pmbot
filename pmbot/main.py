@@ -1257,27 +1257,13 @@ class Bot:
     def _selected_market_recovery_quotes(self, m: gamma.Market,
                                          normal: list[strategy.Quote],
                                          unpaired: float) -> list[strategy.Quote]:
-        """Keep selected markets two-sided and add the recovery gap to its complement.
-
-        The ordinary quote sizes remain strategy-controlled.  Only the
-        inventory-reducing complement receives the extra shares, at the same
-        fee-inclusive pair cap used by held-only recovery quotes.
-        """
+        """Quote only the equal-size complement while selected inventory is unpaired."""
         if abs(unpaired) < MIN_TAKER_SHARES:
             return normal
         recovery = self._inventory_recovery_quotes(m, normal, unpaired)
         if not recovery:
             return []
-        complement = m.no_token if unpaired > 0 else m.yes_token
-        recovery_quote = next((q for q in recovery if q.token_id == complement), None)
-        if recovery_quote is None:
-            return []
-        return [
-            strategy.Quote(q.token_id, recovery_quote.price,
-                           q.size + recovery_quote.size)
-            if q.token_id == complement else q
-            for q in normal
-        ]
+        return recovery
 
     def _clob_min_order_size(self, token_id: str) -> float | None:
         """Current CLOB quantity floor, populated from `/book` snapshots."""
