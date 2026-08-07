@@ -909,6 +909,38 @@ def test_held_position_is_hydrated_and_included_in_inventory(monkeypatch):
     assert LiveBroker.total_inventory_usd(stub) == pytest.approx(2.6)
 
 
+@pytest.mark.parametrize("yes, no", [(4.0, 0.0), (4.0, 4.0)])
+def test_held_position_below_five_net_shares_is_not_hydrated(
+        monkeypatch, yes, no):
+    """Tiny or fully offsetting positions are not inventory exposure."""
+    from pmbot import brokers
+
+    market = _market()
+    stub = _live_stub()
+    stub._markets = {}
+    stub._positions = {market.condition_id: {"yes": yes, "no": no, "value": 0.0}}
+    fetched = []
+    monkeypatch.setattr(brokers.gamma, "fetch_market", lambda cid: fetched.append(cid))
+
+    assert LiveBroker._hydrate_held_markets(stub, {market.condition_id}) == []
+    assert fetched == []
+    assert LiveBroker.held_markets(stub) == []
+
+
+def test_held_position_with_five_net_shares_is_hydrated(monkeypatch):
+    """Exactly five unpaired shares is the managed-exposure boundary."""
+    from pmbot import brokers
+
+    market = _market()
+    stub = _live_stub()
+    stub._markets = {}
+    stub._positions = {market.condition_id: {"yes": 5.0, "no": 0.0, "value": 0.0}}
+    monkeypatch.setattr(brokers.gamma, "fetch_market", lambda cid: market)
+
+    assert LiveBroker._hydrate_held_markets(stub, {market.condition_id}) == [market]
+    assert LiveBroker.held_markets(stub) == [market]
+
+
 def test_live_unpaired_cost_basis_uses_exchange_average_price():
     market = _market()
     stub = _live_stub()

@@ -20,6 +20,7 @@ import math
 import os
 import queue
 import time
+import tomllib
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
@@ -577,6 +578,11 @@ class Bot:
         self._scale = 1.0
         self._was_paused = False
         self._pause_day_active = False
+        # TOML file for persisting new market slugs discovered by the scanner.
+        self._markets_toml: Path | None = None
+        scanner_cfg = cfg.get("scanner") or {}
+        if scanner_cfg.get("markets_toml"):
+            self._markets_toml = Path(scanner_cfg["markets_toml"])
         # Event-driven quote pulls: guards fire these between loop ticks so we
         # don't stay quoted on an endangered side for up to LOOP_SECONDS.
         self._pull_tasks: set[asyncio.Task] = set()
@@ -605,6 +611,41 @@ class Bot:
             }, indent=2))
         except OSError as e:
             log.warning("无法持久化 banned_markets.json: %s", e)
+
+    def _sync_markets_toml(self, markets: list[gamma.Market]) -> None:
+        """Append newly discovered market slugs to the TOML file if not already present."""
+        if self._markets_toml is None:
+            return
+        try:
+            existing_slugs: set[str] = set()
+            if self._markets_toml.exists():
+                raw = self._markets_toml.read_text(encoding="utf-8")
+                try:
+                    data = tomllib.loads(raw)
+                except Exception:
+                    log.warning("无法解析 %s，跳过 TOML 同步", self._markets_toml)
+                    return
+                for entry in data.get("markets", []):
+                    slug = entry.get("slug", "")
+                    if slug:
+                        existing_slugs.add(str(slug))
+            new_entries: list[str] = []
+            for m in markets:
+                if m.slug and m.slug not in existing_slugs:
+                    new_entries.append(
+                        f"\n[[markets]]\n"
+                        f'slug    = "{m.slug}"\n'
+                        f'profile = "newsom-mm"\n'
+                        f"enabled = true\n"
+                    )
+                    existing_slugs.add(m.slug)
+            if new_entries:
+                with self._markets_toml.open("a", encoding="utf-8") as f:
+                    for entry in new_entries:
+                        f.write(entry)
+                log.info("已将 %d 个新市场 slug 写入 %s", len(new_entries), self._markets_toml)
+        except OSError as e:
+            log.warning("无法写入 %s：%s", self._markets_toml, e)
 
     def _manual_hold_cids(self) -> set[str]:
         """Return markets that the bot must leave entirely to manual handling."""
@@ -1049,6 +1090,9 @@ class Bot:
         for m in markets:
             log.info("开始报价：%s（奖励池 $%.0f/天，评分 %.3f）",
                      m.question[:60], m.daily_pool, m.score)
+
+        # 将新增市场的 slug 写入 TOML 配置，供人工监督或其他程序使用
+        self._sync_markets_toml(markets)
 
         self.markets = markets
         self._token_market = {}

@@ -1510,6 +1510,11 @@ class LiveBroker:
         added: list[Market] = []
         unresolved: set[str] = set()
         for cid in condition_ids:
+            position = self._positions.get(cid, {})
+            net_shares = abs(float(position.get("yes", 0.0))
+                             - float(position.get("no", 0.0)))
+            if net_shares < 5:
+                continue
             if cid in self._markets:
                 continue
             market = gamma.fetch_market(cid)

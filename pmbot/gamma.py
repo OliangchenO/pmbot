@@ -34,6 +34,7 @@ class Market:
     end_date: datetime | None
     neg_risk: bool
     event_id: str | None = None
+    slug: str = ""
     # Taker fee rate in bps (fd.r × 10000) and its exponent (fd.e), from the
     # CLOB clob-markets endpoint. Makers are never charged on Polymarket, so
     # this only prices crossing the spread on a merge/exit.
@@ -102,6 +103,7 @@ def _parse_market(m: dict, require_rewards: bool = True) -> Market | None:
         end_date=end_date,
         neg_risk=bool(m.get("negRisk")),
         event_id=event_id or None,
+        slug=str(m.get("slug") or ""),
         best_bid=_f("bestBid"),
         best_ask=_f("bestAsk"),
         last_trade=_f("lastTradePrice"),

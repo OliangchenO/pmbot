@@ -21,6 +21,9 @@ paper:
   reward_haircut: 0.7
 
 scanner:
+  # TOML file where newly discovered market slugs are persisted for supervised
+  # trading sessions. Set to null or omit to skip TOML sync.
+  markets_toml: "E:\\testWorkspace\\poly-maker\\config\\markets.toml"
   # P2.1 is observational only: it records an economic shadow ranking but does
   # not participate in ranking, sticky selection, quote prices, or order size.
   net_shadow:
