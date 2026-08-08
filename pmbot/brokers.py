@@ -236,6 +236,14 @@ class PaperBroker:
                 self._start_dying(cid, st, now)
         self._quotes.clear()
 
+    def cancel_quotes_for_market(self, market: Market) -> None:
+        """Paper equivalent of LiveBroker's confirmed market-local cancellation."""
+        cid = market.condition_id
+        now = time.time()
+        for state in self._quotes.get(cid, []):
+            self._start_dying(cid, state, now)
+        self._quotes.pop(cid, None)
+
     def open_quotes(self, market: Market) -> list[Quote]:
         return [s.quote for s in self._quotes.get(market.condition_id, [])]
 

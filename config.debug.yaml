@@ -295,6 +295,28 @@ guards:
   flow_pull_threshold: 0.85
   flow_widen_max_cents: 2.0
 
+exit_strategy:
+  # Paper/debug only: collect fee-inclusive executable opportunities without
+  # changing orders. Active mode remains disabled in config.yaml.
+  enabled: true
+  mode: shadow
+  min_shares: 5.0
+  same_side_target: 0.01
+  complement_target: 0.01
+  complement_taker_enabled: true
+  min_exit_price: 0.05
+  max_exit_price: 0.95
+  progressive:
+    enabled: true
+    phases:
+      - max_hours: 2
+        same_side_target: 0.01
+      - max_hours: 8
+        same_side_target: 0.005
+      - max_hours: 24
+        same_side_target: 0.0
+    max_loss_cents: 1.0
+
 risk:
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
   # hedge threshold all scale by (current equity / capital_usd). Deposit more

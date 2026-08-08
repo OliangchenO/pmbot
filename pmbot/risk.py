@@ -391,7 +391,10 @@ class MarkoutTracker:
             if f["ts"] <= self._seen_ts:
                 continue
             newest = max(newest, f["ts"])
-            if f.get("taker") or f.get("exit") or "token" not in f or "price" not in f:
+            # Replay every confirmed fill, including FAK hedges and EXIT SELLs.
+            # The fills table retains the side/taker/exit facts; this tracker
+            # adds the post-fill market-price path for later review.
+            if "token" not in f or "price" not in f:
                 continue
             self._pending.append({
                 "ts": f["ts"], "cid": f["cid"], "token": f["token"],

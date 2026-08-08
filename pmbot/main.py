@@ -35,6 +35,7 @@ from . import gamma, strategy
 from .books import Book, BookTracker
 from .brokers import LiveBroker, PaperBroker
 from .controller import AdaptiveController
+from .exit_strategy import ExitDecision, evaluate_exit
 from .metrics import MetricsStore
 from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
@@ -574,6 +575,7 @@ class Bot:
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
         self._recovery_pricing: dict[str, dict[str, float | str]] = {}
+        self._exit_state: dict[str, dict] = {}  # cid -> 价格感知退出策略状态
         self._quote_block_reasons: dict[str, str] = {}
         self._scale = 1.0
         self._was_paused = False
@@ -1800,6 +1802,132 @@ class Bot:
             self._manage_market_inventory(cid, m, managed, quoted, now)
             for cid, m in managed.items()))
 
+    # ── 价格感知退出策略 ──────────────────────────────────────────────
+
+    def _get_current_exit_target(self, cid: str, basis: float, now: float) -> float:
+        """根据持仓时长返回当前盈利目标（绝对价格）。
+
+        正数 = 高于成本的目标（盈利），负数 = 接受不超过此金额的亏损。
+        返回 basis + 目标偏移量（如 0.55 + 0.01 = 0.56）。
+        """
+        es_cfg: dict = self.cfg.get("exit_strategy", {})
+        if not es_cfg:
+            return basis + 0.01  # 默认：要求 +1c 利润
+
+        start = self._over_since.get(cid, now)
+        elapsed_hours = (now - start) / 3600.0
+
+        progressive: dict = es_cfg.get("progressive", {})
+        if not progressive.get("enabled", False):
+            return basis + float(es_cfg.get("same_side_target", 0.01))
+
+        phases: list[dict] = progressive.get("phases", [])
+        target = float(es_cfg.get("same_side_target", 0.01))
+
+        for phase in phases:
+            if elapsed_hours <= phase["max_hours"]:
+                target = float(phase.get("same_side_target", target))
+                break
+        else:
+            # 超过所有阶段后：接受小额亏损
+            max_loss = float(progressive.get("max_loss_cents", 1.0)) / 100.0
+            target = -max_loss
+
+        return basis + target
+
+    def _record_exit_event(self, cid: str, market: gamma.Market, *, decision_id: str,
+                           event: str, decision: ExitDecision, basis: float,
+                           unpaired: float, filled_size: float = 0.0,
+                           reason: str | None = None) -> None:
+        if self.metrics:
+            self.metrics.record_exit_event(
+                cid, market.question, decision_id=decision_id, event=event,
+                action=decision.action, reason=reason or decision.reason,
+                requested_size=decision.requested_size, filled_size=filled_size,
+                remaining_size=max(0.0, abs(unpaired) - filled_size), basis=basis,
+                target_offset=decision.target_offset, limit_price=decision.limit_price,
+                expected_net_pnl_per_share=decision.expected_net_pnl_per_share,
+                phase=decision.phase,
+                mode=(self.cfg.get("exit_strategy") or {}).get("mode", "active"),
+            )
+
+    async def _prepare_complement_taker(self, market: gamma.Market) -> bool:
+        """Cancel local conflicting orders and verify before a complement FAK."""
+        await self._broker_call(self.broker.set_exit, market, None)
+        await self._broker_call(self.broker.cancel_quotes_for_market, market)
+        return self.broker.exit_quote(market) is None and not self.broker.open_quotes(market)
+
+    async def _exit_strategy_check(
+        self, m: gamma.Market, cid: str, unpaired: float,
+        basis: float | None, now: float, urgent: bool,
+    ) -> str | None:
+        """Run at most one fee-inclusive price exit; never infer a fill."""
+        es_cfg: dict = self.cfg.get("exit_strategy", {})
+        if not es_cfg or not es_cfg.get("enabled", False) or urgent or basis is None:
+            return None
+        if abs(unpaired) < float(es_cfg.get("min_shares", MIN_TAKER_SHARES)):
+            return None
+        if self.tracker is None or self.broker is None:
+            return None
+        excess_token = m.yes_token if unpaired > 0 else m.no_token
+        complement_token = m.no_token if unpaired > 0 else m.yes_token
+        excess_book = self.tracker.books.get(excess_token)
+        complement_book = self.tracker.books.get(complement_token)
+        minimum = max(
+            float(getattr(excess_book, "min_order_size", 0.0) or 0.0),
+            float(getattr(complement_book, "min_order_size", 0.0) or 0.0),
+        )
+        elapsed = (now - self._over_since.get(cid, now)) / 3600.0
+        decision = evaluate_exit(m, unpaired, basis, elapsed, excess_book, complement_book,
+                                 minimum, es_cfg)
+        if decision.action == "none":
+            return None
+        if decision.action == "complement_buy" and not es_cfg.get("complement_taker_enabled", False):
+            return None
+        decision_id = f"{cid}:{decision.action}:{decision.limit_price:.6f}:{abs(unpaired):.2f}"
+        state = self._exit_state.get(cid)
+        if state and state.get("decision_id") == decision_id:
+            if state.get("status") == "SHADOW":
+                return "shadow"
+            if state.get("status") in {"SAME_SIDE_EXIT_OPEN", "PENDING_RECONCILE"}:
+                return "pending_reconcile"
+        mode = es_cfg.get("mode", "active")
+        self._record_exit_event(cid, m, decision_id=decision_id, event="decision",
+                                decision=decision, basis=basis, unpaired=unpaired)
+        if mode == "shadow":
+            self._exit_state[cid] = {"decision_id": decision_id, "status": "SHADOW"}
+            return "shadow"
+        if decision.action == "same_side_sell":
+            await self._update_exit_sell(m, unpaired, target_price=decision.limit_price)
+            self._exit_state[cid] = {"decision_id": decision_id,
+                                     "status": "SAME_SIDE_EXIT_OPEN"}
+            self._record_exit_event(cid, m, decision_id=decision_id, event="order_submitted",
+                                    decision=decision, basis=basis, unpaired=unpaired)
+            return "same_side_exit_open"
+        if not await self._prepare_complement_taker(m):
+            self._record_exit_event(cid, m, decision_id=decision_id, event="skipped",
+                                    decision=decision, basis=basis, unpaired=unpaired,
+                                    reason="conflicting_orders_not_confirmed_cancelled")
+            return "conflicting_orders"
+        if self.paper:
+            filled = self.broker.taker_buy(m, complement_token, abs(unpaired), decision.limit_price)
+        else:
+            audit_ctx = {"path": "exit_strategy_complement", "unpaired_cost": basis}
+            filled = await asyncio.to_thread(self.broker.taker_buy, m, complement_token,
+                                             abs(unpaired), decision.limit_price, audit_ctx)
+        if filled <= 0:
+            self._exit_state[cid] = {"decision_id": decision_id, "status": "IDLE"}
+            self._record_exit_event(cid, m, decision_id=decision_id, event="zero_fill",
+                                    decision=decision, basis=basis, unpaired=unpaired)
+            return "zero_fill"
+        self._exit_state[cid] = {"decision_id": decision_id, "status": "PENDING_RECONCILE",
+                                 "filled_size": filled}
+        event = "partial_fill" if filled < abs(unpaired) - 1e-9 else "pending_reconcile"
+        self._record_exit_event(cid, m, decision_id=decision_id, event=event,
+                                decision=decision, basis=basis, unpaired=unpaired,
+                                filled_size=filled)
+        return "pending_reconcile"
+
     async def _manage_market_inventory(self, cid: str, m: gamma.Market,
                                        managed: dict[str, gamma.Market],
                                        quoted: set[str], now: float) -> None:
@@ -1818,6 +1946,7 @@ class Bot:
         unpaired = self.broker.unpaired_shares(m)
         if abs(unpaired) < MIN_TAKER_SHARES:
             self._over_since.pop(cid, None)
+            self._exit_state.pop(cid, None)
             if hasattr(self.broker, "unpaired_since"):
                 self.broker.unpaired_since.pop(cid, None)
             await self._broker_call(self.broker.set_exit, m, None)
@@ -1845,6 +1974,14 @@ class Bot:
             persist_fn = getattr(self.broker, "_persist_unpaired_since", None)
             if persist_fn is not None:
                 persist_fn()
+        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+        basis = basis_fn(m) if basis_fn else None
+        # Price exits are evaluated before complement-book guards. A safe same-side
+        # exit must not depend on the complementary book being quotable.
+        if not urgent:
+            es_result = await self._exit_strategy_check(m, cid, unpaired, basis, now, urgent)
+            if es_result in {"same_side_exit_open", "pending_reconcile", "shadow"}:
+                return
         if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
             await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:
@@ -1871,8 +2008,6 @@ class Bot:
                     reason="book_unavailable_or_wide", recovery_path="forced_hedge",
                     proposed_price=ask)
             return
-        basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
-        basis = basis_fn(m) if basis_fn else None
         if not self._forced_hedge_allowed(
                 m, urgent=urgent, exposure_usd=exposure, threshold_usd=threshold,
                 risk_since=start, now=now, wait_secs=wait, basis=basis, ask=ask):
@@ -1950,17 +2085,28 @@ class Bot:
                 m.question[:45], filled, "NO" if excess_yes else "YES", price,
                 exposure, expected)
 
-    async def _update_exit_sell(self, m: gamma.Market, unpaired: float) -> None:
+    async def _update_exit_sell(self, m: gamma.Market, unpaired: float,
+                                target_price: float | None = None) -> None:
         token = m.yes_token if unpaired > 0 else m.no_token
         book = self.tracker.books.get(token)
         mid = book.mid if book else None
         ask = book.best_ask if book else None
         size = float(int(abs(unpaired)))
-        if mid is None or ask is None or size < MIN_TAKER_SHARES:
+        if size < MIN_TAKER_SHARES or (target_price is None and (mid is None or ask is None)):
             await self._broker_call(self.broker.set_exit, m, None)
             return
-        price = strategy._round_tick(max(ask, mid + m.tick), m.tick)
-        price = min(price, strategy._round_tick(1.0 - m.tick, m.tick))
+        if target_price is not None:
+            # Price-aware exits preserve the fee-inclusive profit floor. A
+            # marketable limit gets price improvement; a remainder never rests
+            # below the floor.
+            es_cfg = self.cfg.get("exit_strategy") or {}
+            price = max(target_price, float(es_cfg.get("min_exit_price", 0.01)))
+            price = min(price, float(es_cfg.get("max_exit_price", 1.0 - m.tick)))
+            price = min(price, strategy._round_tick(1.0 - m.tick, m.tick))
+            price = strategy._round_tick(price, m.tick)
+        else:
+            price = strategy._round_tick(max(ask, mid + m.tick), m.tick)
+            price = min(price, strategy._round_tick(1.0 - m.tick, m.tick))
         cur = self.broker.exit_quote(m)
         move = self.cfg["quoting"]["requote_move_cents"]
         if (cur is not None and cur.token_id == token

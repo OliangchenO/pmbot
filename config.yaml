@@ -300,7 +300,9 @@ guards:
   # drops to/below the trip level (cents, negative = we got picked off) over
   # at least min_samples fills in the window, the market is tripped into the
   # standard cooldown.
-  markout_horizons_secs: [30, 300]
+  # Record post-fill market movement for every confirmed live fill: immediate
+  # adverse selection and the later exit/recovery path.
+  markout_horizons_secs: [30, 300, 900, 3600]
   markout_window_minutes: 120
   markout_min_samples: 5
   markout_trip_cents: -1.5
@@ -320,6 +322,57 @@ guards:
   flow_widen_threshold: 0.6
   flow_pull_threshold: 0.85
   flow_widen_max_cents: 2.0
+
+# ── 价格感知退出策略 ──────────────────────────────────────────────────
+# 在基于时间的强制对冲管道之前插入一个价格感知优化层。当市场中间价达到
+# 成本基准加盈利目标（或互补 token 价格低至可盈利配平）时，激进挂单卖出
+# 或吃单买入互补 token。现有对冲管道保留为安全网。
+
+exit_strategy:
+  # 总开关。设为 false 时现有时间驱动管道按原样运行。
+  enabled: false
+  # shadow 只记录可成交机会，不撤单、不挂退出单、不提交 FAK。
+  # active 需要完成 shadow 验证并得到单独授权后才允许使用。
+  mode: shadow
+
+  # 同侧盈利目标（绝对价格，如 0.01 = +1c）。
+  # 当多余 token 的 mid 达到 cost_basis + same_side_target 时，
+  # 收紧退出卖单以捕获利润。
+  same_side_target: 0.01
+
+  # 互补侧目标。当互补 token 的 mid 降到 1.0 - cost_basis - complement_target
+  # 时，买入互补 token 即可在配平时盈利。
+  complement_target: 0.01
+
+  # 卖单挂价比最佳买价低多少个 tick。越大成交越快但价格可能稍差。
+  aggressive_ticks_inside: 1
+
+  # ── 渐进式绝望 ───────────────────────────────────────────────────────
+  # 当仓位经过每个阶段边界仍未触及目标时，目标降低到更宽松的水平。
+  progressive:
+    enabled: true
+    phases:
+      - max_hours: 2
+        same_side_target: 0.01      # 0－2h: 要求 +1c 利润
+      - max_hours: 8
+        same_side_target: 0.005     # 2－8h: 接受 +0.5c
+      - max_hours: 24
+        same_side_target: 0.0       # 8－24h: 保本即可
+      # 超过 24h（隐式）: 目标回落至 max_loss
+    max_loss_cents: 1.0             # 最后阶段后接受最多 1c/股的亏损
+
+  # ── 互补感知退出 ─────────────────────────────────────────────────────
+  # 当互补 token 价格足够低使得配平即可盈利时，允许吃单买入互补 token
+  # ——即使同侧价格尚未变化。
+  complement_taker_enabled: true
+
+  # 互补价格必须保持在盈利水平的最短秒数，防止瞬时 flicker 触发。
+  complement_confirm_secs: 5.0
+
+  # ── 安全边界 ─────────────────────────────────────────────────────────
+  min_exit_price: 0.05
+  max_exit_price: 0.95
+  min_shares: 5.0
 
 risk:
   # Markets listed here are held entirely by the operator.  The bot neither
@@ -365,9 +418,10 @@ risk:
   # the excess token joined to its ask — a maker exit that pays nothing.
   # The forced hedge above stays as the escalation if it doesn't fill.
   passive_exit: true
-  # Keep an unchanged passive exit in the queue longer than normal quotes;
-  # GTD expiry still clears it after a crash. Never use an unbounded/GTC exit.
-  exit_order_ttl_secs: 600
+  # Keep an unchanged passive exit in the queue for 30 minutes, longer than
+  # normal quotes; GTD expiry still clears it after a crash.
+  # Never use an unbounded/GTC exit.
+  exit_order_ttl_secs: 1800
   # Don't cross a complement book wider than this (avoid dumping into a void);
   # retry until the spread tightens.
   flatten_max_spread_cents: 4.0

@@ -126,6 +126,16 @@ class MetricsStore:
                 cost_basis REAL, fee_per_share REAL,
                 expected_pair_pnl REAL, hard_cap REAL
             );
+            CREATE TABLE IF NOT EXISTS exit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, market TEXT,
+                decision_id TEXT, event TEXT, action TEXT, reason TEXT,
+                requested_size REAL, filled_size REAL, remaining_size REAL,
+                basis REAL, target_offset REAL, limit_price REAL,
+                expected_net_pnl_per_share REAL, actual_avg_price REAL,
+                realized_net_pnl_per_share REAL, order_id TEXT, phase TEXT,
+                mode TEXT
+            );
             CREATE TABLE IF NOT EXISTS inventory_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, cid TEXT, market TEXT,
@@ -179,6 +189,21 @@ class MetricsStore:
             if column not in rec_cols:
                 self._conn.execute(
                     f"ALTER TABLE recovery_events ADD COLUMN {column} REAL")
+        exit_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(exit_events)")}
+        exit_columns = {
+            "decision_id": "TEXT", "event": "TEXT", "action": "TEXT", "reason": "TEXT",
+            "requested_size": "REAL", "filled_size": "REAL", "remaining_size": "REAL",
+            "basis": "REAL", "target_offset": "REAL", "limit_price": "REAL",
+            "expected_net_pnl_per_share": "REAL", "actual_avg_price": "REAL",
+            "realized_net_pnl_per_share": "REAL", "order_id": "TEXT",
+            "phase": "TEXT", "mode": "TEXT",
+        }
+        for column, column_type in exit_columns.items():
+            if column not in exit_cols:
+                self._conn.execute(f"ALTER TABLE exit_events ADD COLUMN {column} {column_type}")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_events_decision_ts "
+            "ON exit_events (decision_id, ts)")
         self._conn.commit()
 
     def net_shadow_inputs(self, lookback_hours: float,
@@ -400,6 +425,31 @@ class MetricsStore:
                 (time.time() if ts is None else ts, cid, event, reason, unpaired,
                  recovery_path, quote_price, pair_cap, proposed_price, cost_basis,
                  fee_per_share, expected_pair_pnl, hard_cap),
+            )
+            self._conn.commit()
+
+    def record_exit_event(self, cid: str, market: str, *, decision_id: str,
+                          event: str, action: str, reason: str,
+                          requested_size: float, filled_size: float,
+                          remaining_size: float, basis: float,
+                          target_offset: float, limit_price: float | None,
+                          expected_net_pnl_per_share: float | None,
+                          phase: str, actual_avg_price: float | None = None,
+                          realized_net_pnl_per_share: float | None = None,
+                          order_id: str | None = None, mode: str = "active",
+                          ts: float | None = None) -> None:
+        """Record a price-exit lifecycle fact; a decision is never a fill."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO exit_events "
+                "(ts,cid,market,decision_id,event,action,reason,requested_size,"
+                "filled_size,remaining_size,basis,target_offset,limit_price,"
+                "expected_net_pnl_per_share,actual_avg_price,realized_net_pnl_per_share,"
+                "order_id,phase,mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time() if ts is None else ts, cid, market, decision_id, event,
+                 action, reason, requested_size, filled_size, remaining_size, basis,
+                 target_offset, limit_price, expected_net_pnl_per_share, actual_avg_price,
+                 realized_net_pnl_per_share, order_id, phase, mode),
             )
             self._conn.commit()
 

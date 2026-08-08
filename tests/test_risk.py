@@ -2,6 +2,8 @@
 
 import time
 
+import pytest
+
 from pmbot.gamma import Market
 from pmbot.risk import MarkoutTracker, MarketGuards, RiskManager
 
@@ -82,6 +84,24 @@ def test_markout_tracker_market_avg():
     avg = mt.market_avg("cid1")
     assert avg is not None
     assert avg < 0
+
+
+def test_markout_tracker_records_exit_and_taker_fill_price_drift():
+    cfg = {**CFG, "guards": {**CFG["guards"], "markout_horizons_secs": [30]}}
+    tracker = MarkoutTracker(cfg)
+    tracker.ingest([{
+        "ts": 100.0, "cid": "cid1", "token": "yes1", "price": 0.50,
+        "market": "Test?", "taker": True, "exit": True,
+    }])
+
+    resolved = tracker.resolve(lambda token: 0.54 if token == "yes1" else None, 130.0)
+
+    assert len(resolved) == 1
+    row = resolved[0]
+    assert {key: row[key] for key in ("ts", "fill_ts", "cid", "market", "horizon")} == {
+        "ts": 130.0, "fill_ts": 100.0, "cid": "cid1", "market": "Test?", "horizon": 30.0,
+    }
+    assert row["markout"] == pytest.approx(0.04)
 
 
 def test_flow_imbalance_returns_signed_value():
