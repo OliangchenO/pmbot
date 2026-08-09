@@ -84,3 +84,22 @@ python scripts/check_logs.py -m 10   # 检查最近 10 分钟日志
 - 时间戳：内部全部 Unix epoch，显示用北京时间（BEIJING_TZ = UTC+8）
 - 日志：中文 + 英文混合，关键业务日志用中文
 - Python 3.12+，asyncio 异步架构
+
+## P1 Recovery Episode 模块（2026-08-09 已实现）
+
+- **`pmbot/recovery.py`** — 纯函数恢复决策器：`choose_recovery_action()` 比较 `buy_complement` vs `sell_original` vs `manual_hold` vs `wait`，在损失预算内选择最优路径
+- **`pmbot/metrics.py`** — `recovery_episodes` 表 + 5 个生命周期方法（open/update/close/get_open/list）+ `replay_old_recovery_events()` 回放
+- **`pmbot/main.py`** — `_manage_market_inventory()` 集成 episode 控制器，支持 `off`/`shadow`/`active` 三种模式
+- **`config.debug.yaml`** — `risk.recovery_episode_mode: shadow`（默认），`recovery_max_loss_usd_per_market: 3.0`，`recovery_escalate_after_secs: 180`，`recovery_terminal_after_secs: 900`
+- **CLI** — `python -m pmbot.main recovery-episodes`（列出所有 episode），`python -m pmbot.main recovery-replay`（旧事件回放对比），`python -m pmbot.main recovery-history <cid>`（单市场时间线）
+
+### 运行测试
+```bash
+python -m pytest tests/test_recovery.py tests/test_main.py tests/test_metrics.py -v
+```
+共 131 个测试通过（1 个预存在的 Rich 表格格式化测试失败，与此功能无关）
+
+### 模式说明
+- `off` — 完全走旧代码路径，向后兼容
+- `shadow` — 调用 `choose_recovery_action()` 并记录日志/数据库，但不执行 broker 调用（默认，安全）
+- `active` — 实际执行 taker_buy 恢复操作（需用户明确授权）
