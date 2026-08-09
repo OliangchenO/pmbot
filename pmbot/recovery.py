@@ -74,6 +74,7 @@ def choose_recovery_action(
     original_bid: float | None,
     elapsed_secs: float,
     max_loss_usd: float,
+    force_execute: bool = False,
 ) -> RecoveryQuote:
     """Select the cheapest recovery path within the per-episode loss budget.
 
@@ -84,6 +85,12 @@ def choose_recovery_action(
 
     The cheaper executable path wins.  If either path exceeds ``max_loss_usd``
     or neither path has a usable price/basis, the result is ``manual_hold``.
+
+    ``force_execute`` (default False): when True, the budget check is
+    skipped entirely and the cheapest available path is returned regardless
+    of ``max_loss_usd``.  Intended for near-resolution markets where a
+    controlled exit (even at a moderate loss) is preferable to being
+    locked into the final resolution outcome.
 
     ``elapsed_secs`` participates in the decision only when a single
     available path has a positive loss — if that loss exceeds budget and
@@ -170,7 +177,7 @@ def choose_recovery_action(
         chosen_price = original_bid
 
     # ── budget check ──
-    if chosen_loss > max_loss_usd + 1e-9:
+    if not force_execute and chosen_loss > max_loss_usd + 1e-9:
         return RecoveryQuote(
             path="manual_hold",
             token_id=None,

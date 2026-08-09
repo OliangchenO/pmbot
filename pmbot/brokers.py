@@ -242,14 +242,14 @@ class PaperBroker:
     def due_for_refresh(self, market: Market) -> bool:
         return False
 
-    def set_exit(self, market: Market, quote: Quote | None) -> None:
+    def set_exit(self, market: Market, quote: Quote | None) -> bool:
         cid = market.condition_id
         if quote is None:
             self._exits.pop(cid, None)
-            return
+            return True
         cur = self._exits.get(cid)
         if cur is not None and cur.quote.key() == quote.key():
-            return
+            return True
         self._markets[cid] = market
         self._token_to_market[market.yes_token] = market
         self._token_to_market[market.no_token] = market
@@ -257,6 +257,7 @@ class PaperBroker:
         ahead = book.asks.get(quote.price, 0.0) if book else 0.0
         self._exits[cid] = PaperQuoteState(
             quote=quote, queue_ahead=ahead, active_at=time.time() + self.latency)
+        return True
 
     def exit_quote(self, market: Market) -> Quote | None:
         cur = self._exits.get(market.condition_id)
@@ -868,10 +869,37 @@ class LiveBroker:
 
     def _place_sell(self, q: Quote) -> RestingOrder | None:
         from py_clob_client_v2 import AssetType, OrderArgs, OrderType, Side
+        from py_clob_client_v2 import BalanceAllowanceParams
 
         # Selling spends the conditional token; the CLOB must have a fresh view
         # of the deposit wallet's holding of it or it rejects with "balance: 0".
         self._sync_clob_balance(AssetType.CONDITIONAL, q.token_id)
+        # Verify the CLOB's server-side cache actually reflects enough tokens.
+        # Without this check, a stale on-chain balance from a recently settled
+        # exit fill can overwrite the CLOB's correct cache via
+        # _sync_clob_balance, causing a spurious "not enough balance" rejection
+        # and a misleading RECOVERY_SELL_ORIGINAL_PLACED log in the caller.
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=q.token_id,
+                signature_type=int(self.cfg["live"]["signature_type"]),
+            )
+            with self._client_lock:
+                bal = self.client.get_balance_allowance(params)
+            raw = float(bal.get("balance") or 0)
+            needed = q.size * USDC_DECIMALS
+            if raw < needed - 1e-9:
+                log.warning(
+                    "退出卖单跳过（%s @ %.3f size=%.0f）：CLOB 条件代币余额不足 "
+                    "(balance=%.0f raw < needed=%.0f raw, ~%.3f shares available)",
+                    q.token_id[:12], q.price, q.size, raw, needed,
+                    raw / USDC_DECIMALS)
+                return None
+        except Exception as e:  # noqa: BLE001
+            log.debug("无法读取 CLOB 条件代币余额（%s）：%s", q.token_id[:12], e)
+            # Fall through — let the order attempt fail naturally
+
         try:
             with self._client_lock:
                 expiration = self._gtd_expiration(self.exit_order_ttl)
@@ -1103,27 +1131,34 @@ class LiveBroker:
             for ro in self._open_orders.get(market.condition_id, [])
         )
 
-    def set_exit(self, market: Market, quote: Quote | None) -> None:
+    def set_exit(self, market: Market, quote: Quote | None) -> bool:
+        """Place a reduce-only limit SELL (GTD), or cancel an existing one when
+        quote is None. Returns True when the sell order was successfully placed
+        or successfully cancelled (or was already absent). Returns False when
+        the order could not be placed (e.g. balance too low) — callers should
+        NOT record a "placed" log entry on False for new placements."""
         cid = market.condition_id
         cur = self._exit_orders.get(cid)
         now = time.time()
         if (cur is not None and quote is not None and cur.quote.key() == quote.key()
                 and cur.expiration - now >= GTD_REFRESH_MARGIN_SECS):
-            return
+            return True  # unchanged resting order
         if cur is not None:
             if self._batch_cancel([cur.order_id]):
                 self._exit_orders.pop(cid, None)
             else:
                 self.reconcile_orders()
-                return
+                return False
         if quote is None:
-            return
+            return True  # cancelled successfully, or nothing to cancel
         self._markets[cid] = market
         ro = self._place_sell(quote)
         if ro:
             self._exit_orders[cid] = ro
             log.info("退出卖单已挂出：“%s” %.0f 股 @ %.3f",
                      market.question[:40], quote.size, quote.price)
+            return True
+        return False  # _place_sell logged the specific reason
 
     def exit_quote(self, market: Market) -> Quote | None:
         cur = self._exit_orders.get(market.condition_id)

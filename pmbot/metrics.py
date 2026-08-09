@@ -638,6 +638,22 @@ class MetricsStore:
             "closed_episodes": closed_count,
         }
 
+    def recovery_cumulative_loss(self, cid: str) -> float:
+        """Total actual_loss_usd across all episodes (open + closed) for *cid*.
+
+        This is the realised cost of all recovery actions for this market,
+        irrespective of episode boundaries.  When the cumulative loss exceeds
+        ``recovery_loss_ban_threshold_usd`` the market should be banned so it
+        cannot re-enter the quote set — even after a restart the persistent
+        ban stays until the operator manually clears it.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(actual_loss_usd), 0) FROM recovery_episodes "
+            "WHERE cid=?",
+            (cid,),
+        ).fetchone()
+        return float(row[0]) if row else 0.0
+
     def add_actual_loss(self, cid: str, delta: float) -> None:
         """Atomically add *delta* to actual_loss_usd for the open episode."""
         with self._lock:

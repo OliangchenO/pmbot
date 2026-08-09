@@ -343,6 +343,11 @@ risk:
   recovery_max_loss_usd_per_market: 3.0
   recovery_escalate_after_secs: 180
   recovery_terminal_after_secs: 900
+  # P1.3.2: Cumulative realised loss across all recovery episodes for the
+  # same market.  When this threshold is exceeded the market is permanently
+  # banned from re-entering the quote set (persisted to banned_markets.json,
+  # survives restarts).  Set to a very large value to disable.
+  recovery_loss_ban_threshold_usd: 15.0
   # Markets listed here are held entirely by the operator.  The bot neither
   # selects, quotes, recovers, hedges, nor cancels orders for them.
   manual_hold_cids:

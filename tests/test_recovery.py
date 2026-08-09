@@ -429,3 +429,90 @@ def test_fee_calculation_uses_market_fee_parameters():
     expected_fee = 0.01 * (0.60 * 0.40)
     buy_loss = max(0.0, 0.45 + 0.60 + expected_fee - 1.0) * 10.0
     assert result.expected_loss_usd == pytest.approx(buy_loss)
+
+
+# ── P1-5: force_execute near-resolution override ──
+
+
+def test_force_execute_bypasses_budget_check():
+    """When force_execute=True, the budget check is skipped even when
+    the cheapest path exceeds max_loss_usd."""
+    market = _dummy_market()
+    basis = 0.40
+    complement_ask = 0.65  # loss ≈ (0.40+0.65+fee-1)*50 = large
+    fee = _taker_fee(complement_ask, market)
+    buy_loss = max(0.0, basis + complement_ask + fee - 1.0) * 50.0
+    assert buy_loss > 0.50  # loss exceeds the tight budget below
+
+    result = choose_recovery_action(
+        market=market,
+        unpaired=50.0,
+        basis=basis,
+        complement_ask=complement_ask,
+        original_bid=None,  # force buy_complement
+        elapsed_secs=200.0,
+        max_loss_usd=0.50,
+        force_execute=True,
+    )
+
+    assert result.path == "buy_complement"
+    assert result.expected_loss_usd is not None
+    assert result.expected_loss_usd > 0.50
+
+
+def test_force_execute_does_not_affect_normal_budget():
+    """When force_execute=False (default), budget check works normally."""
+    market = _dummy_market()
+    basis = 0.40
+    complement_ask = 0.65
+    fee = _taker_fee(complement_ask, market)
+    buy_loss = max(0.0, basis + complement_ask + fee - 1.0) * 50.0
+    assert buy_loss > 0.50
+
+    result = choose_recovery_action(
+        market=market,
+        unpaired=50.0,
+        basis=basis,
+        complement_ask=complement_ask,
+        original_bid=0.35,
+        elapsed_secs=200.0,
+        max_loss_usd=0.50,
+        force_execute=False,
+    )
+
+    assert result.path == "manual_hold"
+    assert result.reason == "exceeds_loss_budget"
+
+
+def test_force_execute_still_respects_known_guards():
+    """force_execute skips budget but still honours basis availability
+    and min-share guards."""
+    market = _dummy_market()
+
+    # Basis missing → manual_hold even with force_execute
+    result = choose_recovery_action(
+        market=market,
+        unpaired=10.0,
+        basis=None,
+        complement_ask=0.55,
+        original_bid=0.45,
+        elapsed_secs=200.0,
+        max_loss_usd=3.0,
+        force_execute=True,
+    )
+    assert result.path == "manual_hold"
+    assert result.reason == "unknown_cost_basis"
+
+    # Below min shares → wait even with force_execute
+    result = choose_recovery_action(
+        market=market,
+        unpaired=3.0,
+        basis=0.45,
+        complement_ask=0.55,
+        original_bid=0.45,
+        elapsed_secs=200.0,
+        max_loss_usd=3.0,
+        force_execute=True,
+    )
+    assert result.path == "wait"
+    assert result.reason == "below_min_shares"
