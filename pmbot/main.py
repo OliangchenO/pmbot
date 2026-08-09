@@ -1587,38 +1587,58 @@ class Bot:
         from .risk import QuoteRiskDecision
         rd: QuoteRiskDecision = risk_decision
         out: list[strategy.Quote] = []
+        yes_seen, no_seen = False, False
         for q in desired:
             if q.token_id == market.yes_token:
+                yes_seen = True
                 if rd.yes_action == "pull":
                     log.warning(
-                        "P0 逆向选择防护：撤下“%s”的 YES 侧报价 score=%.2f (%s)",
+                        "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1a\u64a4\u4e0b\u201c%s\u201d\u7684 YES \u4fa7\u62a5\u4ef7 score=%.2f (%s)",
                         market.question[:45], rd.score, rd.reason)
                     continue
                 if rd.yes_action == "widen":
                     new_price = strategy._round_tick(
                         q.price - max(rd.yes_widen, market.tick / 2), market.tick)
                     log.info(
-                        "P0 逆向选择防护：扩大“%s”的 YES 侧报价 %.2fc "
-                        "%.4f→%.4f", market.question[:40],
+                        "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1a\u6269\u5927\u201c%s\u201d\u7684 YES \u4fa7\u62a5\u4ef7 %.2fc "
+                        "%.4f\u2192%.4f", market.question[:40],
                         rd.yes_widen * 100, q.price, new_price)
                     out.append(strategy.Quote(q.token_id, new_price, q.size))
                     continue
             elif q.token_id == market.no_token:
+                no_seen = True
                 if rd.no_action == "pull":
                     log.warning(
-                        "P0 逆向选择防护：撤下“%s”的 NO 侧报价 score=%.2f (%s)",
+                        "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1a\u64a4\u4e0b\u201c%s\u201d\u7684 NO \u4fa7\u62a5\u4ef7 score=%.2f (%s)",
                         market.question[:45], rd.score, rd.reason)
                     continue
                 if rd.no_action == "widen":
                     new_price = strategy._round_tick(
                         q.price - max(rd.no_widen, market.tick / 2), market.tick)
                     log.info(
-                        "P0 逆向选择防护：扩大“%s”的 NO 侧报价 %.2fc "
-                        "%.4f→%.4f", market.question[:40],
+                        "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1a\u6269\u5927\u201c%s\u201d\u7684 NO \u4fa7\u62a5\u4ef7 %.2fc "
+                        "%.4f\u2192%.4f", market.question[:40],
                         rd.no_widen * 100, q.price, new_price)
                     out.append(strategy.Quote(q.token_id, new_price, q.size))
                     continue
             out.append(q)
+        # Log when P0 wanted to act but the quote was already absent from
+        # desired (e.g. removed by the traditional guard or recovery logic
+        # earlier in the loop), so we have an audit trail.
+        if rd.yes_action in ("pull", "widen") and not yes_seen:
+            log.info(
+                "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1aYES=%s \u51b3\u7b56\u5df2\u8bb0\u5f55\u4f46\u62a5\u4ef7\u4e0d\u5728 desired \u4e2d "
+                "(\u53ef\u80fd\u5df2\u88ab\u4f20\u7edf guard \u6216\u8865\u5355\u903b\u8f91\u62a2\u5148\u79fb\u9664) score=%.2f (%s) "
+                "market=\"%s\"",
+                rd.yes_action, rd.score, rd.reason,
+                market.question[:40])
+        if rd.no_action in ("pull", "widen") and not no_seen:
+            log.info(
+                "P0 \u9006\u5411\u9009\u62e9\u9632\u62a4\uff1aNO=%s \u51b3\u7b56\u5df2\u8bb0\u5f55\u4f46\u62a5\u4ef7\u4e0d\u5728 desired \u4e2d "
+                "(\u53ef\u80fd\u5df2\u88ab\u4f20\u7edf guard \u6216\u8865\u5355\u903b\u8f91\u62a2\u5148\u79fb\u9664) score=%.2f (%s) "
+                "market=\"%s\"",
+                rd.no_action, rd.score, rd.reason,
+                market.question[:40])
         return out
 
     def _cooldown_recovery_quotes(self, m: gamma.Market,
@@ -1968,7 +1988,8 @@ class Bot:
                 risk_decision = self.guards.quote_risk_decision(
                     m, now, markout_avg=markout_avg, markout_samples=markout_n,
                     markout_yes_avg=yes_avg, markout_no_avg=no_avg,
-                    markout_yes_samples=yes_n, markout_no_samples=no_n)
+                    markout_yes_samples=yes_n, markout_no_samples=no_n,
+                    own_fills=self.broker.fills_log)
                 # Record the decision for audit regardless of mode
                 if self.metrics is not None:
                     self.metrics.record_quote_risk_decision(

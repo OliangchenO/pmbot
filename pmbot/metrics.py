@@ -573,8 +573,30 @@ class MetricsStore:
                      decision.score, decision.reason),
                 )
                 self._conn.commit()
+                # Probabilistic cleanup: ~5% chance each write, delete rows
+                # older than 10 hours to keep the table lean.
+                self._prune_old_decisions(self._conn)
         except Exception:
             log.warning("quote_risk_decision 持久化失败（cid=%s）", cid, exc_info=True)
+
+    @staticmethod
+    def _prune_old_decisions(conn: sqlite3.Connection, keep_hours: int = 10) -> None:
+        """Delete quote_risk_decisions rows older than *keep_hours*, ~5% of calls."""
+        import random
+        if random.random() > 0.05:
+            return
+        cutoff = time.time() - keep_hours * 3600
+        try:
+            cur = conn.execute(
+                "DELETE FROM quote_risk_decisions WHERE ts < ?", (cutoff,))
+            deleted = cur.rowcount
+            if deleted > 0:
+                conn.commit()
+                log.info("P0 guard 历史清理: 删除 %d 条 (%d 小时前的决策)",
+                         deleted, keep_hours)
+        except Exception:
+            # Best-effort; never let cleanup break the write path.
+            pass
 
     def quote_risk_report(self, cid: str | None = None,
                           since_ts: float | None = None,
