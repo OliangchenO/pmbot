@@ -659,7 +659,12 @@ class LiveBroker:
         if funder:
             kwargs["funder"] = funder
         self.client = ClobClient(self.HOST, **kwargs)
-        self.client.set_api_creds(self.client.create_or_derive_api_key())
+        api_creds = _with_retry(
+            "create_or_derive_api_key",
+            self.client.create_or_derive_api_key,
+            attempts=5, base_delay=2.0,
+        )
+        self.client.set_api_creds(api_creds)
         self.tracker = tracker
         self.notifier = notifier
         self.address = funder or self.client.get_address()

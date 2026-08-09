@@ -520,10 +520,25 @@ class MetricsStore:
                     (peak_abs_exposure_usd, stage, cid),
                 )
             else:
+                # INSERT … ON CONFLICT handles the restart case where a
+                # previously-closed episode for the same (cid, started_ts)
+                # already exists.  Re-open it with fresh values instead of
+                # crashing on the UNIQUE constraint.
                 self._conn.execute(
                     "INSERT INTO recovery_episodes "
                     "(cid,started_ts,initial_unpaired,peak_abs_exposure_usd,stage) "
-                    "VALUES (?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(cid, started_ts) DO UPDATE SET "
+                    "initial_unpaired=excluded.initial_unpaired, "
+                    "peak_abs_exposure_usd=MAX(peak_abs_exposure_usd, excluded.peak_abs_exposure_usd), "
+                    "stage=excluded.stage, "
+                    "is_closed=0, "
+                    "closed_ts=NULL, "
+                    "closed_reason=NULL, "
+                    "chosen_path=NULL, "
+                    "expected_loss_usd=NULL, "
+                    "actual_loss_usd=NULL, "
+                    "sell_reserved_loss_usd=0.0",
                     (cid, started_ts, initial_unpaired, peak_abs_exposure_usd, stage),
                 )
             self._conn.commit()
