@@ -1015,7 +1015,7 @@ class Bot:
                 return
             log.warning("市场风控触发，立即撤下“%s”的报价", m.question[:45])
             self.metrics.record_guard_event(
-                cid, "market", "market_guard_pull")
+                cid, "market", "market_guard_pull", market=m.question)
             self.metrics.sample_uptime(cid, False)
             await self._broker_call(self.broker.set_quotes, m, [])
 
@@ -1035,7 +1035,7 @@ class Bot:
                         m.question[:45],
                         "YES" if token_id == m.yes_token else "NO")
             self.metrics.record_guard_event(
-                m.condition_id, "side", "side_guard_pull")
+                m.condition_id, "side", "side_guard_pull", market=m.question)
             await self._broker_call(self.broker.set_quotes, m, remaining)
 
     def _rotatable_tripped_cids(self) -> set[str]:

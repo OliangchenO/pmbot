@@ -296,6 +296,24 @@ class MarketGuards:
         """返回单边报价保护剩余秒数；未保护时为零。"""
         return max(0.0, self._side_blocked_until.get(token_id, 0.0) - now)
 
+    def _sync_p0_cooldown(self, cid: str, token_id: str,
+                          yes_token: str, no_token: str,
+                          until: float) -> None:
+        """同步写入 P0 pull_cooldown，防止传统 guard 和 P0 串行叠加。
+
+        原因：传统 guard（check_flow/record_trade）设了
+        _side_blocked_until 后，P0 quote_risk_decision 不知道这个
+        冷却已经激活。当传统 guard 的 cooldown 到期、allow_side 返回
+        True 时，P0 可能已经通过自己的 hysteresis 又设置了新的
+        pull_cooldown，导致实际冷却 ≈ 传统 + P0 之和。
+
+        写入 _pull_cooldown_until 让两套系统共享同一个冷却时钟。
+        """
+        side: Literal["yes", "no"] = "yes" if token_id == yes_token else "no"
+        cd = self._pull_cooldown_until.setdefault(cid, {"yes": 0.0, "no": 0.0})
+        if until > cd[side]:
+            cd[side] = until
+
     def trip_market(self, cid: str, now: float, reason: str, question: str) -> None:
         self._trip(cid, now, reason, question)
 
@@ -332,6 +350,8 @@ class MarketGuards:
                 log.warning("方向性成交流（连续 %d 笔 %s），撤下“%s”的一侧买单 %.0f 分钟",
                             self.dir_consec, s, market.question[:45], self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
+            self._sync_p0_cooldown(cid, blocked, market.yes_token, market.no_token,
+                                   now + self.side_cooldown)
             if newly_blocked and self.on_side_block is not None:
                 self.on_side_block(blocked)
             sides.clear()
@@ -373,6 +393,9 @@ class MarketGuards:
                             market.question[:45], "NO" if endangered_no else "YES",
                             self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
+            self._sync_p0_cooldown(market.condition_id, blocked,
+                                   market.yes_token, market.no_token,
+                                   now + self.side_cooldown)
             if newly_blocked and self.on_side_block is not None:
                 self.on_side_block(blocked)
             return 0.0, 0.0

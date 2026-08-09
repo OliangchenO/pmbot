@@ -154,7 +154,7 @@ class MetricsStore:
                 ON inventory_events (cid, ts);
             CREATE TABLE IF NOT EXISTS guard_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL, cid TEXT, scope TEXT, reason TEXT
+                ts REAL, cid TEXT, market TEXT, scope TEXT, reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_guard_events_cid_ts
                 ON guard_events (cid, ts);
@@ -212,6 +212,13 @@ class MetricsStore:
             if column not in inv_cols:
                 self._conn.execute(
                     f"ALTER TABLE inventory_snapshots ADD COLUMN {column} REAL")
+        self._conn.commit()
+        # Migration: guard_events gained a market column
+        ge_cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(guard_events)")}
+        if "market" not in ge_cols:
+            self._conn.execute(
+                "ALTER TABLE guard_events ADD COLUMN market TEXT DEFAULT ''")
         self._conn.commit()
 
     def net_shadow_inputs(self, lookback_hours: float,
@@ -531,7 +538,7 @@ class MetricsStore:
             self._conn.commit()
 
     def record_guard_event(self, cid: str, scope: str, reason: str,
-                           ts: float | None = None) -> None:
+                           ts: float | None = None, market: str = "") -> None:
         """Persist a quote interruption caused by a risk guard.
 
         ``reason`` names the observable action (for example
@@ -539,8 +546,8 @@ class MetricsStore:
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO guard_events (ts,cid,scope,reason) VALUES (?,?,?,?)",
-                (time.time() if ts is None else ts, cid, scope, reason),
+                "INSERT INTO guard_events (ts,cid,market,scope,reason) VALUES (?,?,?,?,?)",
+                (time.time() if ts is None else ts, cid, market, scope, reason),
             )
             self._conn.commit()
 
