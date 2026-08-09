@@ -724,3 +724,389 @@ def test_recovery_history_returns_one_market_timeline_and_latest_inventory(tmp_p
         "market": "Question", "unpaired_shares": 8.0, "cost_basis": 0.53,
         "exposure_usd": 4.24, "status": "unpaired", "ts": 103.0,
     }
+
+
+# ── P1 episode lifecycle tests ──
+
+
+def test_open_recovery_episode_creates_one_row(tmp_path):
+    """First non-zero unpaired creates a single episode row."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    rows = store._conn.execute(
+        "SELECT cid, started_ts, initial_unpaired, peak_abs_exposure_usd, "
+        "stage, is_closed FROM recovery_episodes WHERE cid='cid1'"
+    ).fetchall()
+    store.close()
+    assert len(rows) == 1
+    assert rows[0] == ("cid1", 1000.0, 10.0, 5.0, "passive", 0)
+
+
+def test_restart_recovers_same_episode(tmp_path):
+    """After a simulated restart, the same episode is recovered."""
+    store1 = MetricsStore(str(tmp_path / "test.db"))
+    store1.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=15.0,
+        peak_abs_exposure_usd=7.5, stage="passive",
+    )
+    store1.close()
+
+    store2 = MetricsStore(str(tmp_path / "test.db"))
+    ep = store2.get_open_episode("cid1")
+    store2.close()
+    assert ep is not None
+    assert ep["initial_unpaired"] == 15.0
+    assert ep["stage"] == "passive"
+
+
+def test_update_recovery_episode_increases_peak_exposure(tmp_path):
+    """Peak exposure must ratchet up, never down."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    store.update_recovery_episode(
+        cid="cid1", peak_abs_exposure_usd=8.0, stage="escalated",
+    )
+    store.update_recovery_episode(
+        cid="cid1", peak_abs_exposure_usd=3.0, stage="escalated",  # lower — ignored
+    )
+    ep = store.get_open_episode("cid1")
+    store.close()
+    assert ep["peak_abs_exposure_usd"] == 8.0  # retained the higher value
+    assert ep["stage"] == "escalated"
+
+
+def test_close_recovery_episode_sets_terminal_fields(tmp_path):
+    """Closing records the outcome without deleting the row."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="escalated",
+    )
+    store.close_recovery_episode(
+        cid="cid1", closed_ts=1200.0, chosen_path="buy_complement",
+        expected_loss_usd=0.35, actual_loss_usd=0.40, reason="hedge_filled",
+    )
+    ep = store.get_open_episode("cid1")
+    store.close()
+    assert ep is None  # no longer open
+    row = MetricsStore(str(tmp_path / "test.db"))._conn.execute(
+        "SELECT is_closed, closed_ts, chosen_path, expected_loss_usd, "
+        "actual_loss_usd, closed_reason FROM recovery_episodes WHERE cid='cid1'"
+    ).fetchone()
+    assert row == (1, 1200.0, "buy_complement", 0.35, 0.40, "hedge_filled")
+
+
+def test_only_one_open_episode_per_cid(tmp_path):
+    """A second call to open_recovery_episode for the same CID must
+    update the existing row rather than creating a duplicate."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1100.0, initial_unpaired=12.0,
+        peak_abs_exposure_usd=6.0, stage="passive",
+    )
+    cnt = store._conn.execute(
+        "SELECT COUNT(*) FROM recovery_episodes WHERE cid='cid1' AND is_closed=0"
+    ).fetchone()[0]
+    store.close()
+    assert cnt == 1
+
+
+def test_aggregate_recovery_episodes_read_only(tmp_path):
+    """The aggregate query must return episode stats without side effects."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="terminal",
+    )
+    store.close_recovery_episode(
+        cid="cid1", closed_ts=1300.0, chosen_path="buy_complement",
+        expected_loss_usd=0.20, actual_loss_usd=0.25, reason="hedge_filled",
+    )
+    store.open_recovery_episode(
+        cid="cid2", started_ts=1400.0, initial_unpaired=-8.0,
+        peak_abs_exposure_usd=4.0, stage="escalated",
+    )
+    summary = store.recovery_episode_summary()
+    store.close()
+    assert summary["total_episodes"] == 2
+    assert summary["open_episodes"] == 1
+    assert summary["closed_episodes"] == 1
+
+
+def test_get_open_episode_none_for_flat_market(tmp_path):
+    """A market with no open episode returns None."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    assert store.get_open_episode("never_opened") is None
+    store.close()
+
+
+# ── Task 4: historical replay / episode listing ──
+
+
+def test_list_recovery_episodes_returns_all_entries(tmp_path):
+    """list_recovery_episodes must return all episodes sorted by started_ts desc."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid-a", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    store.close_recovery_episode(
+        cid="cid-a", closed_ts=1200.0, chosen_path="buy_complement",
+        expected_loss_usd=0.35, reason="filled",
+    )
+    store.open_recovery_episode(
+        cid="cid-b", started_ts=1100.0, initial_unpaired=-8.0,
+        peak_abs_exposure_usd=4.0, stage="escalated",
+    )
+    store.update_recovery_episode(
+        cid="cid-b", peak_abs_exposure_usd=6.0, stage="terminal",
+    )
+
+    episodes = store.list_recovery_episodes()
+    store.close()
+
+    assert len(episodes) == 2
+    # Default sort: newest first (started_ts DESC)
+    assert episodes[0]["cid"] == "cid-b"
+    assert episodes[0]["stage"] == "terminal"
+    assert episodes[0]["peak_abs_exposure_usd"] == 6.0
+    assert episodes[0]["is_closed"] == 0
+    assert episodes[1]["cid"] == "cid-a"
+    assert episodes[1]["is_closed"] == 1
+    assert episodes[1]["chosen_path"] == "buy_complement"
+    assert abs(episodes[1]["expected_loss_usd"] - 0.35) < 1e-9
+    # Duration for closed episodes
+    assert abs(episodes[1]["duration_secs"] - 200.0) < 1e-9
+
+
+def test_list_recovery_episodes_supports_limit_and_offset(tmp_path):
+    """list_recovery_episodes must support limit and offset."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    for i, cid in enumerate(("c1", "c2", "c3")):
+        store.open_recovery_episode(
+            cid=cid, started_ts=float(1000 + i), initial_unpaired=float(10 + i),
+            peak_abs_exposure_usd=5.0, stage="passive",
+        )
+
+    all_eps = store.list_recovery_episodes()
+    assert len(all_eps) == 3
+
+    limited = store.list_recovery_episodes(limit=2)
+    assert len(limited) == 2
+
+    offset_only = store.list_recovery_episodes(limit=2, offset=1)
+    assert len(offset_only) == 2
+    # c2 should be first (offset=1 skips c3, newest first)
+    assert offset_only[0]["cid"] == "c2"
+    assert offset_only[1]["cid"] == "c1"
+
+    store.close()
+
+
+def test_list_recovery_episodes_filters_by_status(tmp_path):
+    """Filters open_only and closed_only must work."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="c-open", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    store.open_recovery_episode(
+        cid="c-closed", started_ts=900.0, initial_unpaired=8.0,
+        peak_abs_exposure_usd=4.0, stage="passive",
+    )
+    store.close_recovery_episode(
+        cid="c-closed", closed_ts=1100.0, reason="filled",
+    )
+
+    # open_only
+    opens = store.list_recovery_episodes(open_only=True)
+    assert len(opens) == 1
+    assert opens[0]["cid"] == "c-open"
+
+    # closed_only
+    closed = store.list_recovery_episodes(closed_only=True)
+    assert len(closed) == 1
+    assert closed[0]["cid"] == "c-closed"
+
+    store.close()
+
+
+def test_replay_old_recovery_events_folds_into_episodes(tmp_path):
+    """replay_old_recovery_events must group raw recovery_events by CID
+    and produce episode-like dicts with duration, peak unpaired, path counts."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # Simulate old-style events for one market
+    base_ts = 1000.0
+    for i in range(5):
+        store.record_recovery_event(
+            "cid-x", "quote_placed", 10.0,
+            recovery_path="forced_hedge", proposed_price=0.52,
+            cost_basis=0.45,
+        )
+    store.record_recovery_event(
+        "cid-x", "forced_hedge_deferred", 10.0,
+        reason="over_hard_cap", recovery_path="forced_hedge",
+    )
+    store.record_recovery_event(
+        "cid-x", "forced_hedge_filled", 0.0,
+        recovery_path="forced_hedge", quote_price=0.52,
+        cost_basis=0.45, expected_pair_pnl=-0.05,
+    )
+    # Second market
+    store.record_recovery_event(
+        "cid-y", "quote_placed", -8.0,
+        recovery_path="forced_hedge", proposed_price=0.48,
+        cost_basis=0.55,
+    )
+    store.record_recovery_event(
+        "cid-y", "forced_hedge_deferred", -8.0,
+        reason="book_unavailable_or_wide", recovery_path="forced_hedge",
+    )
+
+    replay = store.replay_old_recovery_events()
+    store.close()
+
+    assert len(replay) == 2
+    cid_x = next(r for r in replay if r["cid"] == "cid-x")
+    cid_y = next(r for r in replay if r["cid"] == "cid-y")
+
+    assert cid_x["event_count"] == 7
+    assert cid_x["filled"] is True  # forced_hedge_filled present
+    assert cid_x["quote_placed_count"] == 5
+    assert cid_x["max_abs_unpaired"] > 0
+    assert cid_x["duration_secs"] >= 0
+
+    assert cid_y["event_count"] == 2
+    assert cid_y["filled"] is False
+    assert cid_y["quote_placed_count"] == 1
+    assert cid_y["max_abs_unpaired"] > 0
+
+
+def test_replay_old_recovery_events_marks_insufficient_evidence(tmp_path):
+    """When there is no quote_placed event with proposed_price, the replay
+    must mark insufficient_evidence = True."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # Only deferred events, no proposed_prices
+    store.record_recovery_event(
+        "cid-z", "forced_hedge_deferred", 12.0,
+        reason="over_hard_cap", recovery_path="forced_hedge",
+        # no proposed_price
+    )
+    store.record_recovery_event(
+        "cid-z", "forced_hedge_deferred", 12.0,
+        reason="book_unavailable_or_wide", recovery_path="forced_hedge",
+    )
+
+    replay = store.replay_old_recovery_events()
+    store.close()
+
+    assert len(replay) == 1
+    assert replay[0]["insufficient_evidence"] is True
+    assert replay[0]["event_count"] == 2
+
+
+def test_replay_old_recovery_events_empty_db(tmp_path):
+    """Empty database returns empty list."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    replay = store.replay_old_recovery_events()
+    store.close()
+    assert replay == []
+
+
+def test_replay_splits_same_cid_by_gap(tmp_path):
+    """Same-CID events > gap_secs apart must produce separate episodes."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+
+    # Episode 1: 3 events at t=1000..1200 (within gap)
+    with store._lock:
+        for t in (1000.0, 1100.0, 1200.0):
+            store._conn.execute(
+                "INSERT INTO recovery_events (cid, ts, event, unpaired,"
+                " recovery_path, proposed_price, cost_basis) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("cid-a", t, "quote_placed", 10.0, "forced_hedge",
+                 0.52, 0.45),
+            )
+        # Episode 2: 2 events at t=5000..5100 (gap > 30 min from ep1)
+        for t in (5000.0, 5100.0):
+            store._conn.execute(
+                "INSERT INTO recovery_events (cid, ts, event, unpaired,"
+                " recovery_path, proposed_price, cost_basis) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("cid-a", t, "quote_placed", 8.0, "forced_hedge",
+                 0.54, 0.46),
+            )
+        store._conn.commit()
+
+    replay = store.replay_old_recovery_events(gap_secs=1800.0)
+    store.close()
+
+    # Same CID but separated by a long quiet period → 2 episodes
+    assert len(replay) == 2
+    assert replay[0]["event_count"] == 3
+    assert replay[0]["max_abs_unpaired"] == 10.0
+    assert replay[1]["event_count"] == 2
+    assert replay[1]["max_abs_unpaired"] == 8.0
+    # Both episodes lack dual prices → insufficient_evidence
+    assert replay[0]["insufficient_evidence"]
+    assert replay[1]["insufficient_evidence"]
+
+
+def test_replay_dual_path_compare_reruns_decision_engine(tmp_path):
+    """When complement_ask + original_bid + market_hints are present,
+    _finalize_replay_episode must re-run choose_recovery_action and
+    return a comparison dict."""
+    from unittest.mock import MagicMock
+    from pmbot.recovery import choose_recovery_action
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    market = MagicMock()
+    market.fee_bps = 200
+    market.fee_exponent = 0.5
+    market.tick = 0.01
+    market.condition_id = "cid-compare"
+    market.yes_token = "yes-t"
+    market.no_token = "no-t"
+
+    # Write an event with both complement_ask and original_bid
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO recovery_events (cid, ts, event, unpaired,"
+            " recovery_path, proposed_price, cost_basis,"
+            " complement_ask, original_bid) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("cid-compare", 1000.0, "quote_placed", 10.0, "forced_hedge",
+             0.52, 0.45, 0.58, 0.30),
+        )
+        store._conn.commit()
+
+    replay = store.replay_old_recovery_events(
+        gap_secs=1800.0,
+        market_hints={"cid-compare": market},
+    )
+    store.close()
+
+    assert len(replay) == 1
+    assert replay[0]["comparison"] is not None
+    comp = replay[0]["comparison"]
+    assert comp["path"] in ("buy_complement", "sell_original", "manual_hold")
+    # Buy_complement should be cheaper: basis=0.45, ask=0.58 → loss ~0.40
+    # Sell: basis=0.45, bid=0.30 → loss ~1.60
+    # So buy_complement is expected
+    assert comp["path"] == "buy_complement"
+    assert comp["expected_loss_usd"] is not None
+    # With market hints, dual-price events should still have
+    # insufficient_evidence=False (we have prices to compare)
+    assert not replay[0]["insufficient_evidence"]
+    # The comparison is present because dual prices + market hints were given.
+    assert replay[0]["comparison"] is not None

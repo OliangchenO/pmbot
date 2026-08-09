@@ -1349,7 +1349,7 @@ class LiveBroker:
         self._open_orders = by_cid
         self._exit_orders = exit_by_cid
 
-    def refresh_state(self) -> None:
+    def refresh_state(self) -> bool:
         import httpx
 
         poll_start = time.time()
@@ -1363,7 +1363,7 @@ class LiveBroker:
             rows = resp.json()
         except Exception as e:  # noqa: BLE001
             log.warning("position refresh failed: %s", e)
-            return
+            return False
 
         positions: dict[str, dict] = {}
         token_shares: dict[str, float] = {}
@@ -1490,6 +1490,7 @@ class LiveBroker:
         picked = self._select_collateral(onchain, clob_cache)
         if picked is not None:
             self._collateral = picked
+        return True
 
     def _yes_mid(self, market: Market) -> float | None:
         book = self.tracker.books.get(market.yes_token)
