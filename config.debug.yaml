@@ -117,6 +117,20 @@ scanner:
   #   "capture" = rank by expected captured reward: pool × share(our_size,
   #               competition), with toxicity/band multipliers active
   ranking_mode: "density"
+  # Market selection mode:
+  #   "legacy" (default) = current behavior: rank by score (density or capture)
+  #   "net_outcome" = rank by net_shadow_score when net_outcome_gate thresholds
+  #     are all met; fall back to legacy score with a stable reason code when not.
+  #     P2.2 — requires sufficient closed-cycle outcome data before activation.
+  selection_mode: legacy
+  # Gate thresholds for selection_mode: "net_outcome". All must be met before
+  # net_shadow_score is used for candidate ranking. These are deliberately high
+  # — they require proven, verifiable per-market net-outcome history.
+  net_outcome_gate:
+    min_utc_days: 14
+    min_closed_cycles: 30
+    min_complete_ratio: 0.90
+    min_advantage_usd_per_hour: 0.0
   # Competition multiplier for the capture model. γ × liquidity is the
   # estimated competing in-band score in a market. Calibrated from realized
   # share data (~0.027 for the Polymarket reward pool). Only used when

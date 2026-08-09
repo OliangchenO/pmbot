@@ -48,6 +48,7 @@ class Market:
     capture: float = field(default=0.0)   # expected captured reward $/day (capture mode only)
     net_shadow_score: float = field(default=0.0)  # expected net $/hour; observation only
     net_shadow_inputs: dict[str, object] = field(default_factory=dict)
+    selection_reason: str = field(default="legacy")  # how this market was selected / why not
 
     @property
     def mid_hint(self) -> float:
@@ -265,20 +266,290 @@ def fetch_reward_markets() -> list[Market]:
     return markets
 
 
+def _check_net_outcome_gate(cfg: dict, outcome_report: dict | None) -> tuple[bool, str]:
+    """Check whether the net-outcome gate thresholds are all met.
+
+    Returns (passed, reason_code).  ``outcome_report`` is the dict returned by
+    ``MetricsStore.outcome_report()``; when ``None`` (e.g. no database yet) the
+    gate returns ``(False, "no_outcome_data")`` so selection always falls back
+    to legacy scoring.
+
+    Reason codes (stable — usable in tests and logging):
+
+      Data-availability (fail-closed when pipeline not yet built):
+        * ``"no_outcome_data"`` — report unavailable or core fields missing
+        * ``"insufficient_risk_data"`` — risk metrics (hedge/markout/exposure)
+          not yet computed
+        * ``"insufficient_integrity_data"`` — data-integrity fields
+          (clean_days/gaps/dupes/double) not yet tracked
+        * ``"non_finite_config_threshold"`` — a gate threshold in config is
+          NaN/infinity, which would silently disable the threshold
+
+      Sample-size thresholds:
+        * ``"insufficient_utc_days"`` — complete_utc_days < min_utc_days
+        * ``"insufficient_closed_cycles"`` — total_closed_cycles < min_closed_cycles
+        * ``"insufficient_cids_with_cycles"`` — cids_with_min_cycles < min_cids
+        * ``"insufficient_complete_ratio"`` — complete_ratio < min_complete_ratio
+
+      Risk thresholds (conservative absolute floors):
+        * ``"excessive_forced_hedge_rate"`` — forced_hedge_rate > max_forced_hedge_rate
+        * ``"excessive_negative_markout_rate"`` — negative_markout_300s_rate
+          > max_negative_markout_300s_rate
+        * ``"excessive_single_market_exposure"`` — max_single_exposure_pct
+          > max_single_market_exposure_pct
+
+      Data-integrity thresholds:
+        * ``"insufficient_clean_days"`` — consecutive_clean_days < min_consecutive_clean_days
+        * ``"fill_closure_gaps"`` — fill_closure_gaps > 0
+        * ``"duplicate_fills"`` — duplicate_fill_count > 0
+        * ``"reward_double_count"`` — reward_double_count > 0
+
+      Advantage and statistical significance:
+        * ``"insufficient_advantage"`` — net_outcome_advantage_usd_per_hour
+          <= min_advantage_usd_per_hour
+        * ``"insufficient_significance"`` — advantage_bootstrap_95ci_lower
+          absent or <= 0
+
+      * ``"passed"`` — all thresholds met
+
+    The gate checks are conservative: every threshold must be met, and missing
+    data (e.g. no advantage pre-computed) always fails the gate rather than
+    assuming the data would pass.  This matches the design doc's P2.2 effect
+    thresholds — the gate is merely the code encoding of those thresholds.
+    """
+    gate_cfg = (cfg.get("scanner") or {}).get("net_outcome_gate") or {}
+
+    if outcome_report is None:
+        return False, "no_outcome_data"
+
+    # Required fields — if any are missing the gate cannot be evaluated.
+    # All fields are checked for presence; None on any field means the
+    # corresponding data pipeline is not yet capable of producing the
+    # metric → fail-closed rather than assuming safety.
+    #
+    # Non-finite values (NaN, +∞, -∞) are also rejected.  Python's IEEE 754
+    # semantics mean ``nan > threshold`` is False, so a NaN value would
+    # silently pass through every numeric comparison and reach "passed".
+    # We guard against this by checking every metric value with isfinite().
+    realized_count = outcome_report.get("realized_count")
+    complete_utc_days = outcome_report.get("complete_utc_days")
+    complete_ratio = outcome_report.get("complete_ratio")
+    total_closed_cycles = outcome_report.get("total_closed_cycles")
+    cids_with_min_cycles = outcome_report.get("cids_with_min_cycles")
+    forced_hedge_rate = outcome_report.get("forced_hedge_rate")
+    neg_markout_rate = outcome_report.get("negative_markout_300s_rate")
+    max_exposure_pct = outcome_report.get("max_single_exposure_pct")
+    consecutive_clean_days = outcome_report.get("consecutive_clean_days")
+    fill_closure_gaps = outcome_report.get("fill_closure_gaps")
+    duplicate_fill_count = outcome_report.get("duplicate_fill_count")
+    reward_double_count = outcome_report.get("reward_double_count")
+    advantage = outcome_report.get("net_outcome_advantage_usd_per_hour")
+    advantage_ci_lower = outcome_report.get("advantage_bootstrap_95ci_lower")
+
+    if (realized_count is None or complete_utc_days is None
+            or complete_ratio is None
+            or total_closed_cycles is None
+            or cids_with_min_cycles is None):
+        return False, "no_outcome_data"
+
+    if (forced_hedge_rate is None or neg_markout_rate is None
+            or max_exposure_pct is None):
+        return False, "insufficient_risk_data"
+
+    if (consecutive_clean_days is None or fill_closure_gaps is None
+            or duplicate_fill_count is None or reward_double_count is None):
+        return False, "insufficient_integrity_data"
+
+    # ── non-finite guard (must precede all numeric comparisons) ──
+    # Python: nan > x and nan <= 0 are both False.  A NaN metric value
+    # would pass through every threshold check and reach "passed".
+    # Every numeric field from the report is validated, including int
+    # fields that could become NaN via float coercion in the pipeline.
+    for val, label in (
+        # float report fields
+        (forced_hedge_rate, "forced_hedge_rate"),
+        (neg_markout_rate, "negative_markout_300s_rate"),
+        (max_exposure_pct, "max_single_exposure_pct"),
+        (complete_ratio, "complete_ratio"),
+        # int report fields (NaN coerces to float which is non-finite)
+        (complete_utc_days, "complete_utc_days"),
+        (total_closed_cycles, "total_closed_cycles"),
+        (cids_with_min_cycles, "cids_with_min_cycles"),
+        (consecutive_clean_days, "consecutive_clean_days"),
+        (fill_closure_gaps, "fill_closure_gaps"),
+        (duplicate_fill_count, "duplicate_fill_count"),
+        (reward_double_count, "reward_double_count"),
+        # advantage fields
+        (advantage, "advantage"),
+        (advantage_ci_lower, "advantage_ci"),
+    ):
+        if val is None:
+            continue  # already caught by existence checks above
+        reason = _refuse_non_finite(float(val), label)
+        if reason:
+            return False, reason
+
+    # ── bootstrap CI no-longer-None check ──
+    if advantage_ci_lower is None:
+        return False, "insufficient_significance"
+
+    try:
+        min_utc_days = _gate_cfg_int(gate_cfg, "min_utc_days", 14)
+        min_closed = _gate_cfg_int(gate_cfg, "min_closed_cycles", 30)
+        min_ratio = _gate_cfg_float(gate_cfg, "min_complete_ratio", 0.90)
+        min_adv = _gate_cfg_float(gate_cfg, "min_advantage_usd_per_hour", 0.0)
+        min_cids = _gate_cfg_int(gate_cfg, "min_cids_with_cycles", 3)
+    except ValueError:
+        return False, "non_finite_config_threshold"
+
+    # complete_utc_days counts UTC days with at least one realized market having
+    # activity (fills, merges, or a non-zero inventory snapshot). This is NOT the
+    # same as lookback_days — a 14-day lookback may only have 3 active UTC days.
+    if complete_utc_days < min_utc_days:
+        return False, "insufficient_utc_days"
+    if total_closed_cycles < min_closed:
+        return False, "insufficient_closed_cycles"
+    if cids_with_min_cycles < min_cids:
+        return False, "insufficient_cids_with_cycles"
+    if complete_ratio < min_ratio:
+        return False, "insufficient_complete_ratio"
+
+    # ── risk checks (design doc §5.2) ──
+    # "shadow Top-N 的强制对冲率、300 秒负 markout 率、最大单市场暴露
+    # 均不劣于 legacy".  The same-eligibility comparison requires the
+    # post-hoc pipeline; the gate imposes conservative absolute floors
+    # on whatever values the future pipeline produces.  Passing None
+    # (pipeline not built) is blocked by the existence check above.
+    try:
+        max_hedge = _gate_cfg_float(gate_cfg, "max_forced_hedge_rate", 0.50)
+        max_neg_mo = _gate_cfg_float(gate_cfg, "max_negative_markout_300s_rate", 0.30)
+        max_expo = _gate_cfg_float(gate_cfg, "max_single_market_exposure_pct", 0.50)
+    except ValueError:
+        return False, "non_finite_config_threshold"
+    if forced_hedge_rate > max_hedge:
+        return False, "excessive_forced_hedge_rate"
+    if neg_markout_rate > max_neg_mo:
+        return False, "excessive_negative_markout_rate"
+    if max_exposure_pct > max_expo:
+        return False, "excessive_single_market_exposure"
+
+    # ── data-integrity checks (design doc §5.2) ──
+    # "连续 3 个 UTC 日没有 fill_without_inventory_closure、重复 fill
+    # 或 reward double-count".  Gate enforces minimum consecutive clean
+    # days and zero tolerance for closure gaps / dupes.
+    try:
+        min_clean_days = _gate_cfg_int(gate_cfg, "min_consecutive_clean_days", 3)
+    except ValueError:
+        return False, "non_finite_config_threshold"
+    if consecutive_clean_days < min_clean_days:
+        return False, "insufficient_clean_days"
+    if fill_closure_gaps > 0:
+        return False, "fill_closure_gaps"
+    if duplicate_fill_count > 0:
+        return False, "duplicate_fills"
+    if reward_double_count > 0:
+        return False, "reward_double_count"
+
+    # ── advantage and significance check ──
+    # Design doc §5.2 requires both a positive point estimate AND
+    # bootstrap 95% CI lower bound > 0.  A point estimate without
+    # a confidence interval is not statistically meaningful.
+    if advantage is None or advantage <= min_adv:
+        return False, "insufficient_advantage"
+    if advantage_ci_lower is None or advantage_ci_lower <= 0:
+        return False, "insufficient_significance"
+
+    return True, "passed"
+
+
+def _gate_cfg_float(cfg: dict, key: str, default: float) -> float:
+    """Read a float gate config value, respecting explicit zero.
+
+    ``or`` chains replace 0.0 with the RHS, so we must distinguish "key absent"
+    from "key present with value 0".  This helper returns the explicit value
+    (including 0) when the key exists, and the default otherwise.
+
+    Non-finite config values (NaN, infinity) are rejected: they make every
+    ``rate > threshold`` comparison False, silently removing the threshold.
+    A rejected value raises ValueError so the caller can return a clear
+    reason code rather than silently disabling protection.
+    """
+    import math
+
+    val = cfg.get(key)
+    if val is not None:
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            raise ValueError(f"non_finite_config_threshold:{key}")
+        return f
+    return default
+
+
+def _gate_cfg_int(cfg: dict, key: str, default: int) -> int:
+    """Read an int gate config value, respecting explicit zero.
+
+    Non-finite values are rejected the same way as _gate_cfg_float.
+
+    The non-finite check uses ``float(val)`` *before* ``int(val)`` because
+    ``int(float('nan'))`` raises ``ValueError`` — which the except clause
+    would silently convert to ``default``, defeating the guard.
+    """
+    import math
+
+    val = cfg.get(key)
+    if val is not None:
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            raise ValueError(f"non_finite_config_threshold:{key}")
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _refuse_non_finite(value: float, label: str) -> str | None:
+    """Return a reason code if *value* is non-finite, otherwise None.
+
+    NaN and infinities are numeric but not meaningful metric values.
+    ``nan > threshold`` and ``nan <= 0`` are both False, so a NaN value
+    can silently pass through every comparison gate.  This check must be
+    the first thing done with any pipeline-produced float.
+    """
+    import math
+    if not math.isfinite(value):
+        return f"non_finite_{label}"
+    return None
+
+
 def scan(cfg: dict, exclude_cids: set[str] | None = None,
          full: bool = False,
-         shadow_inputs: dict[str, dict[str, float | int]] | None = None) -> list[Market]:
+         shadow_inputs: dict[str, dict[str, float | int]] | None = None,
+         outcome_report: dict | None = None) -> list[Market]:
     """Filter and rank reward markets per scanner config. Returns best first.
 
-    `exclude_cids` skips specific markets before ranking, so the next-best
+    ``exclude_cids`` skips specific markets before ranking, so the next-best
     eligible markets backfill the top_n slots — used to rotate out of a
     guard-tripped market into a fresh one instead of wasting the slot.
 
-    `full=True` returns every eligible market (best first) instead of just the
+    ``full=True`` returns every eligible market (best first) instead of just the
     top_n slice, so the caller can run its own sticky selection (keep markets
     we are already quoting unless a candidate is materially better). Fee lookups
     already run for every market that clears the cheap filters, so returning the
     full list costs nothing extra.
+
+    ``outcome_report`` is the dict from ``MetricsStore.outcome_report()``. When
+    ``selection_mode`` is ``"net_outcome"`` the gate thresholds inside
+    ``scanner.net_outcome_gate`` are checked against this report; if all pass,
+    candidates are sorted by ``net_shadow_score`` instead of legacy ``score``.
+    When ``None`` or when the gate fails, legacy scoring is used and each
+    market's ``selection_reason`` records why.
     """
     sc = cfg["scanner"]
     skip_cids = exclude_cids or set()
@@ -363,16 +634,35 @@ def scan(cfg: dict, exclude_cids: set[str] | None = None,
 
         candidates.append(m)
 
-    # P2.1 is observational: compute a separate net-economic score only after
-    # legacy eligibility and score are settled.  The existing sort below must
-    # remain the sole selector until a separately approved future phase.
+    # P2.1 shadows are always computed for audit / monitoring.
     from .strategy import compute_net_shadow_score
     inputs_by_cid = shadow_inputs or {}
     for market in candidates:
         market.net_shadow_score, market.net_shadow_inputs = compute_net_shadow_score(
             market, inputs_by_cid.get(market.condition_id, {}), cfg)
 
-    candidates.sort(key=lambda m: m.score, reverse=True)
+    # ── selection mode ──
+    selection_mode = str(sc.get("selection_mode", "legacy")).lower()
+
+    if selection_mode == "net_outcome":
+        gate_passed, reason = _check_net_outcome_gate(cfg, outcome_report)
+        if gate_passed:
+            # Sort by net_shadow_score — the empirically verified per-hour
+            # net result. Higher is better.
+            for m in candidates:
+                m.selection_reason = "net_outcome"
+            candidates.sort(key=lambda m: m.net_shadow_score, reverse=True)
+        else:
+            # Gate not passed — fall back to legacy score and record why.
+            for m in candidates:
+                m.selection_reason = reason
+            candidates.sort(key=lambda m: m.score, reverse=True)
+    else:
+        # Legacy (density or capture) — unchanged behavior.
+        for m in candidates:
+            m.selection_reason = "legacy"
+        candidates.sort(key=lambda m: m.score, reverse=True)
+
     if full:
         return candidates
     return candidates[: sc["top_n_markets"]]

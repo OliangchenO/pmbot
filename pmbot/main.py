@@ -523,6 +523,74 @@ def cmd_reward_calibration(cfg: dict, days: int) -> None:
     )
 
 
+def cmd_outcomes(cfg: dict, date: str | None, days: int) -> None:
+    """Display a read-only closed-loop per-market outcome completeness report."""
+    store = _metrics_store(cfg)
+    report = store.outcome_report(date, lookback_days=max(1, days))
+    store.close()
+
+    console.print(
+        f"[bold]Closed-loop outcomes — {report['date']}"
+        f"{' (single day)' if days == 1 else f' ({days} days)'}[/]"
+    )
+    ratio_str = (f"{report['complete_ratio']:.0%}"
+                 if report['complete_ratio'] is not None else "n/a")
+    console.print(
+        f"Realized: {report['realized_count']}  "
+        f"Resolved: {report['resolved_count']}  "
+        f"Incomplete: {report['incomplete_count']}  "
+        f"Complete ratio: {ratio_str}"
+    )
+    console.print(
+        f"Total trading P&L (complete): ${report['total_trading_pnl_usd']:+.4f}  "
+        f"Market rewards (attributed): ${report['market_reward_total_usd']:.4f}  "
+        f"Account rewards (separate): ${report['account_reward_total_usd']:.4f}"
+    )
+
+    if report["missing_reasons"]:
+        reasons_table = Table(title="Missing data reasons (incomplete markets)")
+        reasons_table.add_column("Reason")
+        reasons_table.add_column("Count")
+        for reason, count in sorted(report["missing_reasons"].items(),
+                                    key=lambda x: -x[1]):
+            reasons_table.add_row(reason, str(count))
+        console.print(reasons_table)
+
+    if report["outcomes"]:
+        table = Table(title="Complete markets (ranked by net outcome)")
+        for col in ("Market (condition_id)", "State", "Trading P&L",
+                    "Market reward", "Net outcome", "Evidence"):
+            table.add_column(col)
+        for o in report["outcomes"]:
+            table.add_row(
+                o["cid"][:24],
+                o["state"],
+                f"${o['trading_pnl_usd']:+.4f}" if o["trading_pnl_usd"] is not None else "—",
+                f"${o['market_reward_usd']:+.4f}" if o["market_reward_usd"] is not None else "—",
+                f"${o['net_outcome_usd']:+.4f}",
+                ",".join(o.get("evidence_flags", [])),
+            )
+        console.print(table)
+
+    if report["incomplete"]:
+        incomplete_table = Table(title="Incomplete markets")
+        incomplete_table.add_column("Condition ID")
+        incomplete_table.add_column("Missing reasons")
+        for o in report["incomplete"]:
+            incomplete_table.add_row(
+                o["cid"][:32],
+                ",".join(o.get("evidence_flags", [])),
+            )
+        console.print(incomplete_table)
+
+    console.print(
+        "[dim]Account-level rewards are never allocated to market outcomes. "
+        "Incomplete markets have no net_outcome and are excluded from "
+        "rankings. Use --days to widen the lookback window (more evidence "
+        "resolves more markets).[/]"
+    )
+
+
 def cmd_recovery_history(cfg: dict, cid: str) -> None:
     """Display a read-only recovery/hedge timeline for one condition id."""
     store = _metrics_store(cfg)
@@ -735,6 +803,12 @@ class Bot:
         self._last_merge_check = 0.0
         self._last_realized_reward = 0.0
         self._merge_task: asyncio.Task | None = None
+        # P2.2 cached snapshot: last successful (shadow_inputs, outcome_report).
+        # Refreshed in the background so _rescan never waits for the ledger.
+        self._cached_shadow_inputs: dict[str, dict] = {}
+        self._cached_outcome_report: dict | None = None
+        self._outcome_refresh_task: asyncio.Task | None = None
+        self._last_outcome_refresh = 0.0
         self._over_since: dict[str, float] = {}
         self._last_flatten: dict[str, float] = {}
         # P1.3: markout-trip banned markets — 持久化到 data/banned_markets.json
@@ -1136,8 +1210,13 @@ class Bot:
         by_cid = {m.condition_id: m for m in ranked}
         held = [m.condition_id for m in self.markets if m.condition_id not in locked_cids]
         # Currently-quoted markets still eligible this scan, freshest score first.
-        survivors = sorted((by_cid[c] for c in held if c in by_cid),
-                           key=lambda m: m.score, reverse=True)[:slots]
+        if str(sc.get("selection_mode", "legacy")).lower() == "net_outcome":
+            survivors = sorted((by_cid[c] for c in held if c in by_cid),
+                               key=lambda m: (m.net_shadow_score, m.score),
+                               reverse=True)[:slots]
+        else:
+            survivors = sorted((by_cid[c] for c in held if c in by_cid),
+                               key=lambda m: m.score, reverse=True)[:slots]
         chosen = list(survivors)
         chosen_cids = {m.condition_id for m in chosen}
         survivor_cids = set(chosen_cids)
@@ -1153,6 +1232,10 @@ class Bot:
         # i.e. its recent in-band uptime is low, so it isn't farming the rewards
         # its rank implies. A market farming well at high uptime is protected
         # regardless of how the ranking reshuffled (the anti-churn guarantee).
+        # P2.2: When selection_mode is net_outcome, displacement comparisons use
+        # net_shadow_score instead of legacy score so a net-result-better
+        # candidate isn't blocked by a market with higher legacy density.
+        net_mode = str(sc.get("selection_mode", "legacy")).lower() == "net_outcome"
         if margin > 0 and survivor_cids:
             min_uptime = float(sc.get("underperform_uptime_pct", 60.0))
             lookback_min = float(sc.get("underperform_lookback_minutes", 30.0))
@@ -1173,8 +1256,11 @@ class Bot:
                                 and _underperforming(m.condition_id)]
                 if not displaceable:
                     break  # every held market is performing — never churn
-                weak = min(displaceable, key=lambda m: m.score)
-                if cand.score < weak.score * (1.0 + margin):
+                weak = min(displaceable, key=lambda m: (
+                    m.net_shadow_score if net_mode else m.score))
+                cand_score = cand.net_shadow_score if net_mode else cand.score
+                weak_score = weak.net_shadow_score if net_mode else weak.score
+                if cand_score < weak_score * (1.0 + margin):
                     break  # sorted desc — nothing further clears the margin
                 chosen.remove(weak)
                 chosen.append(cand)
@@ -1206,7 +1292,15 @@ class Bot:
             exclude |= recovery_cids
         log.info("正在扫描奖励市场…%s",
                  f" (rotating out {len(exclude)} tripped)" if exclude else "")
-        ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
+        # P2.2: read the most recent cached outcome snapshot (refreshed in
+        # background AFTER the previous _rescan finished).  When the metrics db
+        # is new or the cache is stale, scan() falls back to legacy silently.
+        outcome_report = self._cached_outcome_report
+        shadow_inputs = self._cached_shadow_inputs
+        if outcome_report is None:
+            log.info("无缓存净收益报告，使用传统评分")
+        ranked = await asyncio.to_thread(
+            gamma.scan, self.cfg, exclude, True, shadow_inputs, outcome_report)
         if recovery_cids:
             ranked = [market for market in ranked
                       if market.condition_id not in recovery_cids]
@@ -1215,17 +1309,70 @@ class Bot:
                 log.warning("重新扫描未找到市场，保留当前市场集合")
             self._last_scan = time.time()
             return
-        # P2.1: calculate and persist a passive net-economic ranking.  This is
-        # intentionally after gamma's legacy scan: neither this calculation nor
-        # a failed SQLite write may influence eligibility or market selection.
+        # Serialise SQLite access: wait for any running background refresh to
+        # finish before _process_scan_result writes to the metrics DB.
+        if self._outcome_refresh_task and not self._outcome_refresh_task.done():
+            try:
+                await asyncio.wait_for(self._outcome_refresh_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
         shadow_cfg = (self.cfg.get("scanner") or {}).get("net_shadow") or {}
+        await self._process_scan_result(ranked, initial, manual_hold, recovery_cids, shadow_cfg)
+        # Schedule the next background cache refresh now that DB writes are done.
+        # This guarantees the refresh never races with record_net_shadow_snapshot.
+        now_ts = time.time()
+        refresh_interval = float(shadow_cfg.get(
+            "outcome_refresh_seconds", 120.0))
+        if (self.metrics is not None
+                and (self._outcome_refresh_task is None
+                     or self._outcome_refresh_task.done())):
+            if now_ts - self._last_outcome_refresh >= refresh_interval:
+                self._last_outcome_refresh = now_ts
+                self._outcome_refresh_task = asyncio.ensure_future(
+                    self._refresh_outcome_cache(shadow_cfg))
+
+    async def _refresh_outcome_cache(self, shadow_cfg: dict) -> None:
+        """Background: refresh cached shadow_inputs and outcome_report.
+
+        Runs with a 5-second timeout so a locked or slow database never holds
+        up the quote/cancel loop.  On failure the cache keeps its last good
+        snapshot; ``old cache`` is always better than ``no data`` — the gate
+        fallback is the same legacy path either way.
+        """
         lookback_hours = float(shadow_cfg.get("lookback_hours", 24.0))
+        snapshot_age_secs = float(shadow_cfg.get(
+            "snapshot_max_age_seconds", 43200.0))
+        today = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        metrics = self.metrics  # capture ref for closure
+
+        def _fetch_both() -> tuple[dict, dict | None]:
+            si = metrics.net_shadow_inputs(lookback_hours)
+            orpt = metrics.outcome_report(
+                today, lookback_days=14,
+                snapshot_max_age_seconds=snapshot_age_secs)
+            return si, orpt
+
+        deadline = 5.0
         try:
-            inputs_by_cid = self.metrics.net_shadow_inputs(lookback_hours)
-            for market in ranked:
-                market.net_shadow_score, market.net_shadow_inputs = (
-                    strategy.compute_net_shadow_score(
-                        market, inputs_by_cid.get(market.condition_id, {}), self.cfg))
+            task = asyncio.ensure_future(asyncio.to_thread(_fetch_both))
+            si, orpt = await asyncio.wait_for(task, timeout=deadline)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("净收益缓存后台刷新失败（%.0fs timeout）：%s", deadline, exc)
+            return  # keep last good snapshot
+
+        if si:
+            self._cached_shadow_inputs = si
+        self._cached_outcome_report = orpt
+        log.debug("净收益缓存已刷新：%d shadow cid，outcome=%s",
+                  len(si), "ok" if orpt else "none")
+
+    # ── post-scan processing (shared between _rescan and caller) ──
+
+    async def _process_scan_result(self, ranked, initial, manual_hold, recovery_cids, shadow_cfg):
+        # P2.1: persist the passive net-economic ranking and shadow scores
+        # that gamma.scan() already computed (always-on, regardless of mode).
+        # The scores live on market.net_shadow_score / .net_shadow_inputs.
+        try:
             self.metrics.record_net_shadow_snapshot(
                 ranked, time.time(), {"top_n": self.cfg["scanner"]["top_n_markets"],
                                       "net_shadow": shadow_cfg})
@@ -2695,6 +2842,9 @@ class Bot:
                 exposure_usd=self.broker.net_yes_exposure_usd(market),
                 status="unpaired" if abs(unpaired) > 1e-9 else "flat",
                 ts=now,
+                yes_mid=self.tracker.books[market.yes_token].mid if market.yes_token in self.tracker.books else None,
+                position_shares=getattr(self.broker, "position_shares", lambda m: (0.0, 0.0))(market),
+                book_updated_ts=self.tracker.books[market.yes_token].updated_ts if market.yes_token in self.tracker.books else None,
             )
 
     def _print_status(self) -> None:
@@ -2772,7 +2922,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name in ("scan", "run", "report", "trades", "performance", "reward-calibration",
-                 "recovery-history", "recovery-episodes", "recovery-replay"):
+                 "recovery-history", "recovery-episodes", "recovery-replay", "outcomes"):
         sub.add_parser(name)
 
     report_p = sub.choices["report"]
@@ -2798,6 +2948,12 @@ def main() -> None:
     episodes_p = sub.choices["recovery-episodes"]
     episodes_p.add_argument("--limit", type=int, default=50,
                            help="max episodes to show (default 50)")
+
+    outcomes_p = sub.choices["outcomes"]
+    outcomes_p.add_argument("--date", default=None,
+                           help="UTC date YYYY-MM-DD (default: today)")
+    outcomes_p.add_argument("--days", type=int, default=1,
+                           help="number of UTC days to span (default: 1)")
 
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
@@ -2827,6 +2983,8 @@ def main() -> None:
         cmd_recovery_episodes(cfg, args.limit)
     elif args.command == "recovery-replay":
         cmd_recovery_replay(cfg)
+    elif args.command == "outcomes":
+        cmd_outcomes(cfg, args.date, args.days)
     else:
         if cfg["mode"] == "live":
             console.print("[bold red]LIVE mode — real orders will be placed. Ctrl-C cancels all and exits.[/]")

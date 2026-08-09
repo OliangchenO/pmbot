@@ -132,7 +132,9 @@ class MetricsStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, cid TEXT, market TEXT,
                 unpaired_shares REAL, cost_basis REAL,
-                exposure_usd REAL, status TEXT
+                exposure_usd REAL, status TEXT,
+                yes_mid REAL, yes_shares REAL, no_shares REAL,
+                book_updated_ts REAL
             );
             CREATE INDEX IF NOT EXISTS idx_inventory_snapshots_cid_ts
                 ON inventory_snapshots (cid, ts);
@@ -203,6 +205,16 @@ class MetricsStore:
             self._conn.execute(
                 "ALTER TABLE recovery_episodes ADD COLUMN sell_reserved_loss_usd REAL DEFAULT 0.0")
         self._conn.commit()
+        inv_cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(inventory_snapshots)")}
+        if "yes_mid" not in inv_cols:
+            self._conn.execute(
+                "ALTER TABLE inventory_snapshots ADD COLUMN yes_mid REAL")
+        for column in ("yes_shares", "no_shares", "book_updated_ts"):
+            if column not in inv_cols:
+                self._conn.execute(
+                    f"ALTER TABLE inventory_snapshots ADD COLUMN {column} REAL")
+        self._conn.commit()
 
     def net_shadow_inputs(self, lookback_hours: float,
                           now: float | None = None) -> dict[str, dict[str, float | int]]:
@@ -272,6 +284,56 @@ class MetricsStore:
                                        if estimate and realized_samples else 0.0),
                 "reward_samples": int(reward_samples) if realized_samples else 0,
             }
+        # ── P2.2 closed-cycle data ──
+        # A "closed cycle" = one UTC day where a market had fills AND ended
+        # with zero unpaired inventory (fully closed).  Each such day is one
+        # observation of the per-hour net result.  We count distinct closed
+        # UTC days per cid and compute the average net/hour across them.
+        #
+        # CRITICAL: closed-cycle scoring needs enough samples to be meaningful.
+        # The gate uses a 14-day window; we match that here with a dedicated
+        # lookback that is the larger of lookback_hours and the gate's effective
+        # observation window (14 days). Component inputs (uptime, markout, etc.)
+        # still use the shorter lookback — closed cycles are the slow signal.
+        closed_by_cid: dict[str, dict[str, float | int]] = {}
+        try:
+            from .outcomes import build_market_outcomes as _build
+            # Use at least 14 calendar days for cycle counting so min_closed_samples
+            # (default 3) can actually be reached. Component lookback (24h default)
+            # is too short — a market rarely closes a full cycle in one day.
+            closed_lookback_hours = max(hours, 14.0 * 24.0)
+            closed_cutoff = now - closed_lookback_hours * 3600.0
+            # Process each UTC calendar day separately to count cycles.
+            # Walk backwards from today's midnight UTC to the cutoff date,
+            # building per-day outcomes. Each "realized" outcome for a market
+            # is one closed cycle.
+            per_cid_nets: dict[str, list[float]] = {}
+            now_dt = datetime.fromtimestamp(now, timezone.utc)
+            cutoff_dt = datetime.fromtimestamp(closed_cutoff, timezone.utc)
+            day_end = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            while day_end > cutoff_dt:
+                day_start = max(day_end - timedelta(days=1), cutoff_dt)
+                d_start_ts = day_start.timestamp()
+                d_end_ts = day_end.timestamp()
+                outcomes = _build(self._conn, d_start_ts, d_end_ts,
+                                  snapshot_max_age_seconds=43200.0)  # 12h freshness
+                day_hours = max((d_end_ts - d_start_ts) / 3600.0, 0.01)
+                for o in outcomes:
+                    if o.state == "realized" and o.net_outcome_usd is not None:
+                        per_cid_nets.setdefault(o.cid, []).append(
+                            o.net_outcome_usd / day_hours)
+                day_end = day_start
+            for cid, nets in per_cid_nets.items():
+                if nets:
+                    closed_by_cid[cid] = {
+                        "closed_cycle_net_per_hour": sum(nets) / len(nets),
+                        "closed_cycle_samples": len(nets),
+                    }
+        except Exception:
+            pass
+        for cid in closed_by_cid:
+            if cid in out:
+                out[cid] = {**out[cid], **closed_by_cid[cid]}
         return out
 
     def record_net_shadow_snapshot(self, markets, scanned_at: float,
@@ -842,20 +904,34 @@ class MetricsStore:
     def record_inventory_snapshot(
             self, cid: str, market: str, *, unpaired_shares: float,
             cost_basis: float | None, exposure_usd: float, status: str,
-            ts: float | None = None) -> None:
+            ts: float | None = None, yes_mid: float | None = None,
+            position_shares: tuple[float, float] | None = None,
+            book_updated_ts: float | None = None) -> None:
         """Persist a read-only per-market inventory observation.
 
         ``status`` describes only the observed balance: ``unpaired`` or
         ``flat``. It never asserts whether a flat balance was merged, sold,
         redeemed, or reconciled by the exchange.
+
+        ``yes_mid`` is the independently observed order-book YES mid at
+        snapshot time.  When None the mid was unavailable (no live book).
+
+        ``position_shares`` is (yes_shares, no_shares) — the total position
+        including paired shares.  Defaults to (0, 0) when None.
+
+        ``book_updated_ts`` is the Book.updated_ts of the YES order book
+        at snapshot time.  Used for mid freshness validation — a mid value
+        from a stale book (last updated long ago) is not a valid MTM anchor.
         """
+        yes_s, no_s = position_shares or (0.0, 0.0)
         with self._lock:
             self._conn.execute(
                 "INSERT INTO inventory_snapshots "
-                "(ts,cid,market,unpaired_shares,cost_basis,exposure_usd,status) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(ts,cid,market,unpaired_shares,cost_basis,exposure_usd,status,yes_mid,yes_shares,no_shares,book_updated_ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time() if ts is None else ts, cid, market,
-                 unpaired_shares, cost_basis, exposure_usd, status),
+                 unpaired_shares, cost_basis, exposure_usd, status, yes_mid,
+                 yes_s, no_s, book_updated_ts),
             )
             self._conn.commit()
 
@@ -1897,6 +1973,208 @@ class MetricsStore:
         summary = self.daily_report(date)
         return {"date": date, "summary": summary, "markets": rows,
                 "shadow_selection": self.net_shadow_report(date)}
+
+    def outcome_report(self, date: str | None = None, *,
+                       lookback_days: int = 1,
+                       snapshot_max_age_seconds: float | None = None) -> dict:
+        """Closed-loop per-market outcome completeness summary.
+
+        Delegates to ``build_market_outcomes()`` (from ``pmbot.outcomes``)
+        and adds a high-level completeness breakdown: how many markets are
+        ``realized`` / ``paired_unmerged`` / ``unpaired_marked`` /
+        ``incomplete``, plus the reasons for incompleteness.
+
+        ``date`` is a UTC date string like "2026-08-01". When ``lookback_days``
+        > 1 the window spans that many full UTC days ending on ``date``.
+        """
+        from .outcomes import build_market_outcomes as _build
+
+        date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day_start = datetime.strptime(date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc).timestamp()
+        # Window: [date 00:00 UTC, date+1 00:00 UTC).  The caller is
+        # responsible for passing a completed UTC date — during an active
+        # trading day main.py passes yesterday so the partial today is not
+        # counted as a "complete UTC day".
+        start_ts = day_start - (lookback_days - 1) * 86400.0
+        end_ts = day_start + 86400.0
+
+        # Build outcomes for the multi-day window (used for resolved/incomplete
+        # counts and the complete_ratio).  Cycle counting is done separately
+        # per UTC day below.
+        outcomes = _build(self._conn, start_ts, end_ts,
+                          snapshot_max_age_seconds=snapshot_max_age_seconds)
+
+        # Three-way classification:
+        #   realized   — fully closed, no open inventory (gate counts these)
+        #   resolved   — has net_outcome_usd (realized + paired_unmerged + unpaired_marked)
+        #   incomplete — insufficient data (missing MTM mid, etc.)
+        realized: list[dict] = []
+        resolved: list[dict] = []
+        incomplete: list[dict] = []
+        for o in outcomes:
+            d = {
+                "cid": o.cid, "state": o.state, "buy_cash_usd": o.buy_cash_usd,
+                "sell_cash_usd": o.sell_cash_usd, "merge_cash_usd": o.merge_cash_usd,
+                "fees_usd": o.fees_usd, "held_pairs": o.held_pairs,
+                "unpaired_shares": o.unpaired_shares,
+                "unpaired_mtm_usd": o.unpaired_mtm_usd,
+                "trading_pnl_usd": o.trading_pnl_usd,
+                "market_reward_usd": o.market_reward_usd,
+                "net_outcome_usd": o.net_outcome_usd,
+                "evidence_flags": list(o.evidence_flags),
+            }
+            if o.state == "realized":
+                realized.append(d)
+                resolved.append(d)
+            elif o.net_outcome_usd is not None:
+                resolved.append(d)
+            else:
+                incomplete.append(d)
+
+        # Missing reasons: count each evidence flag across incomplete markets.
+        missing_reasons: dict[str, int] = {}
+        for d in incomplete:
+            for flag in d["evidence_flags"]:
+                missing_reasons[flag] = missing_reasons.get(flag, 0) + 1
+
+        # Account-level reward — never enters market outcomes, shown separately.
+        account_reward = self._conn.execute(
+            "SELECT COALESCE(SUM(realized),0) FROM rewards "
+            "WHERE date BETWEEN ? AND ?",
+            (datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%d"),
+             date),
+        ).fetchone()[0] or 0.0
+
+        # Market-level reward total for cross-check.
+        market_reward_total = self._conn.execute(
+            "SELECT COALESCE(SUM(realized),0) FROM market_rewards "
+            "WHERE date BETWEEN ? AND ?",
+            (datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%d"),
+             date),
+        ).fetchone()[0] or 0.0
+
+        total_trading_pnl = sum(
+            o["trading_pnl_usd"] for o in realized
+            if o["trading_pnl_usd"] is not None)
+
+        # ── Per-day complete UTC days + closed-cycle counting ──
+        # A single multi-day build_market_outcomes() window can produce at most
+        # ONE realized outcome per CID — the CID either closed during the full
+        # window or it didn't.  To get actual cycle counts we must walk each
+        # UTC day separately: a CID that closed on 3 different days within the
+        # lookback has N=3 closed cycles.
+        #
+        # Similarly, "complete UTC days" are days where at least one CID
+        # produced a realized outcome.  This is derived from the per-day pass.
+        first_day = datetime.fromtimestamp(start_ts, timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        last_day = datetime.fromtimestamp(end_ts, timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        # last_day is the most recent COMPLETE UTC day in the window
+        # (end_ts = midnight of date, which is the exclusive upper bound)
+        cycle_counts: dict[str, int] = {}        # CID → closed cycles
+        complete_utc_dates: set[str] = set()
+        day_cursor = last_day
+        while day_cursor >= first_day:
+            d_start = day_cursor.timestamp()
+            d_end = d_start + 86400.0
+            day_outcomes = _build(self._conn, d_start, d_end,
+                                  snapshot_max_age_seconds=snapshot_max_age_seconds)
+            day_realized = [o for o in day_outcomes if o.state == "realized"]
+            if day_realized:
+                complete_utc_dates.add(day_cursor.strftime("%Y-%m-%d"))
+                for o in day_outcomes:
+                    if o.state == "realized":
+                        cycle_counts[o.cid] = cycle_counts.get(o.cid, 0) + 1
+            day_cursor -= timedelta(days=1)
+
+        complete_utc_days = len(complete_utc_dates)
+        total_closed_cycles = sum(cycle_counts.values())
+        cids_with_min_cycles = sum(
+            1 for c in cycle_counts.values()
+            if c >= 3)  # min_closed_samples from net_shadow config
+
+        # ── P2.2 risk metrics (design doc §5.2) ──
+        # Design doc requires: "shadow Top-N 的强制对冲率、300 秒负
+        # markout 率、最大单市场暴露均不劣于 legacy" — same scan,
+        # same eligibility set, per-market inventory.  This requires
+        # per-scan legacy-vs-shadow candidate pairing data
+        # (net_shadow_candidates / native ranking snapshots) that is not
+        # available in a static outcome_report().
+        #
+        # Additionally, max_single_market_exposure needs per-market
+        # inventory snapshots; the equity table stores only total
+        # inventory_usd from broker.total_inventory_usd(), not the
+        # largest single-market position as a fraction of equity.
+        #
+        # These three metrics are deferred to a post-hoc analysis
+        # pipeline.  Returning None causes the gate to fail with
+        # "insufficient_risk_data" — fail-closed until the comparison
+        # pipeline is built.  Zero observations (no recovery events,
+        # no markout rows) also map to None rather than a misleading
+        # 0.0 "safe" rate.
+        forced_hedge_rate: float | None = None
+        negative_markout_300s_rate: float | None = None
+        max_single_exposure_pct: float | None = None
+
+        # ── P2.2 data-integrity checks (design doc §5.2) ──
+        # "连续 3 个 UTC 日没有 fill_without_inventory_closure、
+        # 重复 fill 或 reward double-count".  These require cross-day
+        # closure tracking and fill/reward deduplication infrastructure.
+        # Returning None causes the gate to fail with
+        # "insufficient_integrity_data".
+        consecutive_clean_days: int | None = None
+        fill_closure_gaps: int | None = None
+        duplicate_fill_count: int | None = None
+        reward_double_count: int | None = None
+
+        # ── P2.2 net-outcome advantage ──
+        # Design intent: compare (shadow Top-N avg net/hour) minus
+        # (legacy Top-N avg net/hour) on the SAME scan and SAME eligibility
+        # set, with bootstrap 95% CI lower bound > 0.
+        #
+        # This is NOT the global realized PnL rate.  We cannot compute it
+        # from a static outcome_report() because we lack the per-scan
+        # legacy-vs-shadow candidate pairings.  That data lives in
+        # net_shadow_candidates/native ranking snapshots, and the
+        # comparison requires a separate post-hoc analysis pipeline.
+        #
+        # RETURNING NONE IS CORRECT.  The gate will fail at the advantage
+        # check, which is the safe state: net_outcome mode cannot activate
+        # until the ranking-comparison advantage is properly computed.
+        advantage: float | None = None
+
+        return {
+            "date": date,
+            "window_start_ts": start_ts,
+            "window_end_ts": end_ts,
+            "lookback_days": lookback_days,
+            "complete_utc_days": complete_utc_days,
+            "realized_count": len(realized),
+            "resolved_count": len(resolved),
+            "incomplete_count": len(incomplete),
+            "total_closed_cycles": total_closed_cycles,
+            "cids_with_min_cycles": cids_with_min_cycles,
+            "complete_ratio": (len(realized) / len(outcomes)
+                               if outcomes else None),
+            "forced_hedge_rate": forced_hedge_rate,
+            "negative_markout_300s_rate": negative_markout_300s_rate,
+            "max_single_exposure_pct": max_single_exposure_pct,
+            "consecutive_clean_days": consecutive_clean_days,
+            "fill_closure_gaps": fill_closure_gaps,
+            "duplicate_fill_count": duplicate_fill_count,
+            "reward_double_count": reward_double_count,
+            "total_trading_pnl_usd": total_trading_pnl,
+            "market_reward_total_usd": market_reward_total,
+            "account_reward_total_usd": account_reward,
+            "net_outcome_advantage_usd_per_hour": advantage,
+            "advantage_bootstrap_95ci_lower": None,  # requires per-scan pairing pipeline
+            "missing_reasons": missing_reasons,
+            "outcomes": sorted(resolved, key=lambda o: (
+                o.get("net_outcome_usd") or 0.0), reverse=True),
+            "incomplete": sorted(incomplete, key=lambda o: o["cid"]),
+        }
 
     def close(self) -> None:
         self._flush_uptime(int(time.time()) // 60)
