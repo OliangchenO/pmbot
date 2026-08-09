@@ -2417,6 +2417,25 @@ class Bot:
                         accumulated_loss += float(existing["sell_reserved_loss_usd"])
             remaining_budget = max_loss - accumulated_loss
 
+            # P1-5: near-resolution override.  When a market is inside the
+            # exit window, being locked into resolution (a binary outcome)
+            # is worse than a moderate exit loss.  Skip the per-episode
+            # loss-budget gate so the cheapest available path is always
+            # taken, letting forced-hedge / sell-original proceed.
+            near_end = (h is not None and h <= exit_h) or urgent
+
+            if near_end and remaining_budget <= 0.0:
+                log.warning(
+                    "RECOVERY_NEAR_END_OVERRIDE market='%s' cid=%s "
+                    "h_to_end=%.1f exit_h=%.1f urgent=%s "
+                    "max_loss=%.4f accumulated=%.4f remaining=%.4f "
+                    "说明=市场临近结算，跳过 per-episode 损失预算限制，"
+                    "执行最便宜的恢复路径",
+                    m.question[:45], cid,
+                    h if h is not None else float("inf"), exit_h, urgent,
+                    max_loss, accumulated_loss, remaining_budget,
+                )
+
             if elapsed >= terminal_secs:
                 stage = "terminal"
             elif elapsed >= escalate_secs:
@@ -2424,7 +2443,7 @@ class Bot:
             else:
                 stage = "passive"
 
-            if remaining_budget <= 0.0:
+            if remaining_budget <= 0.0 and not near_end:
                 log.warning(
                     "RECOVERY_BUDGET_EXHAUSTED market='%s' cid=%s "
                     "max_loss=%.4f accumulated=%.4f remaining=%.4f "
@@ -2480,6 +2499,7 @@ class Bot:
                     market=m, unpaired=unpaired, basis=basis,
                     complement_ask=complement_ask, original_bid=original_bid,
                     elapsed_secs=elapsed, max_loss_usd=remaining_budget,
+                    force_execute=near_end,
                 )
 
                 if self.metrics:
@@ -2500,12 +2520,14 @@ class Bot:
                 log.info(
                     "RECOVERY_EPISODE_DECISION market='%s' mode=%s path=%s stage=%s "
                     "unpaired=%.0f elapsed=%.0fs expected_loss_usd=%s reason=%s "
+                    "near_end=%s "
                     "说明=P1恢复策略决策",
                     m.question[:45], episode_mode, quote.path, stage,
                     unpaired, elapsed,
                     "unknown" if quote.expected_loss_usd is None
                     else f"{quote.expected_loss_usd:.4f}",
                     quote.reason or "n/a",
+                    "yes" if near_end else "no",
                 )
 
                 # P1-2: in passive stage, the episode controller only
@@ -2620,12 +2642,13 @@ class Bot:
                                         and abs(cur.price - price) * 100 < move
                                         and abs(cur.size - size) <= 0.1 * size):
                                     # unchanged — keep the existing resting order
-                                    pass
+                                    placed_ok = True
                                 else:
                                     sell_quote = strategy.Quote(token_id, price, size)
-                                    await self._broker_call(
-                                        self.broker.set_exit, m, sell_quote)
-                                log.warning(
+                                    placed_ok = bool(await self._broker_call(
+                                        self.broker.set_exit, m, sell_quote))
+                                if placed_ok:
+                                    log.warning(
                                     "RECOVERY_SELL_ORIGINAL_PLACED market='%s' "
                                     "token=%s size=%.0f price=%.3f "
                                     "expected_loss_usd=%s stage=%s "
@@ -2639,7 +2662,21 @@ class Bot:
                                     else f"{quote.expected_loss_usd:.4f}",
                                     stage,
                                 )
-                                if self.metrics:
+                                else:
+                                    log.warning(
+                                        "RECOVERY_SELL_ORIGINAL_FAILED market='%s' "
+                                        "token=%s size=%.0f price=%.3f "
+                                        "expected_loss_usd=%s stage=%s "
+                                        "说明=退出卖单提交失败，余额不足或竞态（仓位已平）",
+                                        m.question[:45],
+                                        "YES" if token_id == m.yes_token else "NO",
+                                        size, price,
+                                        "unknown"
+                                        if quote.expected_loss_usd is None
+                                        else f"{quote.expected_loss_usd:.4f}",
+                                        stage,
+                                    )
+                                if self.metrics and placed_ok:
                                     self.metrics.record_recovery_event(
                                         cid,
                                         f"recovery_{quote.path}_placed",
@@ -2690,7 +2727,7 @@ class Bot:
                             # FAK flattens the position, creating a fresh
                             # naked position in the opposite direction.
                             #
-                            # LiveBroker.set_exit(None) returns None on cancel
+                            # LiveBroker.set_exit(None) returns False on cancel
                             # failure (reconcile_orders + early return at
                             # L1106).  Verify the exit was actually cleared
                             # before sending the FAK; otherwise skip this tick
@@ -2807,6 +2844,28 @@ class Bot:
                                         chosen_path=quote.path,
                                         expected_loss_usd=quote.expected_loss_usd,
                                     )
+                                    # P1.3.2: cumulative loss ban — when
+                                    # the total realised recovery loss across
+                                    # all episodes for this market exceeds
+                                    # the configured cap, ban it permanently
+                                    # (persisted to banned_markets.json).
+                                    ban_thresh = float(
+                                        r.get("recovery_loss_ban_threshold_usd",
+                                              1e9))
+                                    cum_loss = (
+                                        self.metrics.recovery_cumulative_loss(
+                                            cid))
+                                    if cum_loss > ban_thresh + 1e-9:
+                                        self._banned_cids.add(cid)
+                                        self._persist_banned_cids()
+                                        log.warning(
+                                            "RECOVERY_LOSS_BAN market='%s' "
+                                            "cid=%s cumulative_loss=%.4f>%.4f "
+                                            "说明=该市场累计恢复损失超过"
+                                            "阈值，已永久禁入（重启后仍有效）",
+                                            m.question[:45], cid,
+                                            cum_loss, ban_thresh,
+                                        )
                             # P0 new: return — do NOT fall through to old
                             # forced-hedge path.  The FAK already executed;
                             # the old path would re-read stale unpaired and
@@ -3125,6 +3184,7 @@ def main() -> None:
 
     configure_logging(log_dir)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("py_clob_client_v2.http_helpers.helpers").setLevel(logging.WARNING)
     if args.command == "scan":
         cmd_scan(cfg)
     elif args.command == "report":

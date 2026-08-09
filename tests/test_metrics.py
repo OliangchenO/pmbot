@@ -1099,6 +1099,65 @@ def test_aggregate_recovery_episodes_read_only(tmp_path):
     assert summary["closed_episodes"] == 1
 
 
+def test_recovery_cumulative_loss_sums_across_episodes(tmp_path):
+    """Cumulative loss must sum actual_loss across all open+closed episodes for a cid."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # Episode 1: closed with actual_loss 0.25
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="terminal",
+    )
+    store.close_recovery_episode(
+        cid="cid1", closed_ts=1100.0, chosen_path="buy_complement",
+        expected_loss_usd=0.20, actual_loss_usd=0.25, reason="hedge_filled",
+    )
+    # Episode 2: still open, accumulated 1.30 via add_actual_loss
+    store.open_recovery_episode(
+        cid="cid1", started_ts=1200.0, initial_unpaired=15.0,
+        peak_abs_exposure_usd=8.0, stage="terminal",
+    )
+    store.add_actual_loss("cid1", 0.80)
+    store.add_actual_loss("cid1", 0.50)
+
+    cum = store.recovery_cumulative_loss("cid1")
+    assert abs(cum - (0.25 + 0.80 + 0.50)) < 1e-9
+
+    # Unrelated cid unaffected
+    store.open_recovery_episode(
+        cid="cid2", started_ts=1300.0, initial_unpaired=-5.0,
+        peak_abs_exposure_usd=3.0, stage="escalated",
+    )
+    store.add_actual_loss("cid2", 0.10)
+    assert abs(store.recovery_cumulative_loss("cid2") - 0.10) < 1e-9
+    assert abs(store.recovery_cumulative_loss("cid1") - 1.55) < 1e-9
+    store.close()
+
+
+def test_recovery_cumulative_loss_zero_for_unknown_cid(tmp_path):
+    """A cid with no episodes returns 0.0, not None or NaN."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    result = store.recovery_cumulative_loss("never_seen")
+    store.close()
+    assert result == 0.0
+    assert result == result  # not NaN
+
+
+def test_recovery_cumulative_loss_ignores_null_actual(tmp_path):
+    """Episodes where actual_loss_usd is NULL count as zero."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.open_recovery_episode(
+        cid="cid_null", started_ts=1000.0, initial_unpaired=10.0,
+        peak_abs_exposure_usd=5.0, stage="passive",
+    )
+    # Close without ever setting actual_loss_usd (passive-only, no execution)
+    store.close_recovery_episode(
+        cid="cid_null", closed_ts=1100.0, reason="flat",
+    )
+    result = store.recovery_cumulative_loss("cid_null")
+    store.close()
+    assert result == 0.0
+
+
 def test_get_open_episode_none_for_flat_market(tmp_path):
     """A market with no open episode returns None."""
     store = MetricsStore(str(tmp_path / "test.db"))

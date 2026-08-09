@@ -8,7 +8,7 @@ notifications:
     enabled: true
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 340
+capital_usd: 560
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
@@ -248,11 +248,12 @@ quoting:
   # crashes (orders rest up to ttl+60s before self-expiring). 180s is a good
   # balance for a small book; the dead-man switch still fires quickly enough.
   order_ttl_secs: 180
-  # Inventory-recovery bids keep their queue position longer because they only
-  # reduce an existing YES/NO imbalance. Their GTD expiry is this value plus
-  # the CLOB's 60-second safety threshold; price, size, or risk-cap changes
-  # still replace them immediately.
-  recovery_order_ttl_secs: 900
+  # Inventory-recovery bids keep their queue position because they only
+  # reduce an existing YES/NO imbalance.  They are never refreshed on expiry
+  # alone (only on price/size change), so the TTL acts solely as a dead-man
+  # switch that clears the order after a crash.  10 hours gives plenty of
+  # queue seniority in deep markets.
+  recovery_order_ttl_secs: 36000
   # Close the per-refresh reward gap: when a resting quote is only expiring
   # (same price/size), post its replacement BEFORE cancelling the old order so
   # the side is never off the book when Polymarket samples the book for reward
@@ -348,10 +349,15 @@ risk:
   # ── P1 recovery episode (new controller) ──
   # Shadow = record decisions without executing broker calls.
   # Active = execute broker calls.  Must be explicitly authorized.
-  recovery_episode_mode: shadow
+  recovery_episode_mode: active
   recovery_max_loss_usd_per_market: 3.0
   recovery_escalate_after_secs: 180
   recovery_terminal_after_secs: 900
+  # P1.3.2: Cumulative realised loss across all recovery episodes for the
+  # same market.  When this threshold is exceeded the market is permanently
+  # banned from re-entering the quote set (persisted to banned_markets.json,
+  # survives restarts).  Set to a very large value to disable.
+  recovery_loss_ban_threshold_usd: 15.0
   # Markets listed here are held entirely by the operator.  The bot neither
   # selects, quotes, recovers, hedges, nor cancels orders for them.
   manual_hold_cids:
