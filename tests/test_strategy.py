@@ -262,3 +262,77 @@ def test_reconcile_quotes_replaces_distant_quotes():
     des = [Quote("yes_tok", 0.45, 10)]
     final = reconcile_quotes(cur, des, move_cents=0.4)
     assert final[0] is des[0]
+
+
+def test_net_shadow_score_uses_closed_cycle_net_when_sufficient(tmp_path):
+    """When closed-cycle outcomes are available with enough samples, the hourly
+    net result replaces the component decomposition entirely."""
+    market = _market(daily_pool=240.0)
+    cfg = {"scanner": {"net_shadow": {
+        "min_closed_samples": 3,
+    }}}
+    score, audit = compute_net_shadow_score(market, {
+        "closed_cycle_net_per_hour": -0.85,
+        "closed_cycle_samples": 5,
+    }, cfg)
+
+    assert score == pytest.approx(-0.85)
+    assert audit["closed_cycle_net_per_hour"]["source"] == "market"
+    assert audit["closed_cycle_net_per_hour"]["samples"] == 5
+    assert audit["insufficient_sample"] is False
+    # The component-decomposition fields should NOT appear — only the closed-cycle
+    # branch, which is a single verified number.
+    assert "reward_realization" not in audit
+
+
+def test_net_shadow_score_falls_back_to_components_when_closed_insufficient():
+    """Closed-cycle data that is present but below min_closed_samples must NOT
+    override the component branch — it's insufficient evidence."""
+    market = _market(daily_pool=240.0)
+    cfg = {"scanner": {"net_shadow": {
+        "min_closed_samples": 3,
+        "min_reward_samples": 2, "min_uptime_samples": 2,
+        "min_markout_samples": 2, "min_recovery_samples": 2,
+        "reward_realization_prior": 0.5, "uptime_prior": 0.5,
+        "markout_cost_per_hour_prior": 0.2,
+        "recovery_cost_per_hour_prior": 0.3,
+    }}}
+
+    # 2 closed cycles < 3 min → still uses component branch
+    score, audit = compute_net_shadow_score(market, {
+        "closed_cycle_net_per_hour": -0.85,
+        "closed_cycle_samples": 2,
+        "reward_realization": 0.8, "reward_samples": 3,
+        "uptime_ratio": 0.5, "uptime_samples": 3,
+        "markout_cost_per_hour": 1.0, "markout_samples": 3,
+        "recovery_cost_per_hour": 0.5, "recovery_samples": 3,
+        "taker_fee_per_hour": 0.25, "taker_fee_samples": 1,
+    }, cfg)
+
+    # Expected from component branch: 240/24*0.8*0.5 - 1.0 - 0.5 - 0.25 = 2.25
+    assert score == pytest.approx(2.25)
+    assert audit["reward_realization"]["source"] == "market"
+    assert audit["insufficient_sample"] is False
+    # The closed-cycle data is still recorded in the audit for visibility.
+    assert audit["closed_cycle_net_per_hour"]["source"] == "market"
+    assert audit["closed_cycle_net_per_hour"]["samples"] == 2
+
+
+def test_net_shadow_score_uses_conservative_priors_for_no_closed_cycles():
+    """A market with zero closed cycles uses component priors as before."""
+    market = _market(daily_pool=240.0)
+    cfg = {"scanner": {"net_shadow": {
+        "min_closed_samples": 3,
+        "min_reward_samples": 2, "min_uptime_samples": 2,
+        "min_markout_samples": 2, "min_recovery_samples": 2,
+        "reward_realization_prior": 0.5, "uptime_prior": 0.5,
+        "markout_cost_per_hour_prior": 0.2,
+        "recovery_cost_per_hour_prior": 0.3,
+    }}}
+
+    score, audit = compute_net_shadow_score(market,{}, cfg)
+
+    # 240/24*0.5*0.5 - 0.2 - 0.3 = 2.0
+    assert score == pytest.approx(2.0)
+    assert audit["closed_cycle_net_per_hour"]["source"] == "missing"
+    assert audit["insufficient_sample"] is True

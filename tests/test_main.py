@@ -353,7 +353,7 @@ def test_quote_all_replaces_flat_selected_market_without_submittable_quotes(
         replacement = _scored("replacement", 2.0)
         scan_excludes = []
 
-        def fake_scan(_cfg, exclude=None, full=False):
+        def fake_scan(_cfg, exclude=None, full=False, shadow_inputs=None, outcome_report=None):
             scan_excludes.append(set(exclude or ()))
             return [market for market in (selected, replacement)
                     if market.condition_id not in (exclude or set())]
@@ -765,7 +765,7 @@ def test_rescan_is_sticky_and_swaps_incrementally(tmp_path, monkeypatch):
 
     ranked_holder = {"v": []}
     monkeypatch.setattr(gamma_mod, "scan",
-                        lambda cfg, exclude=None, full=False: list(ranked_holder["v"]))
+                        lambda cfg, exclude=None, full=False, shadow_inputs=None, outcome_report=None: list(ranked_holder["v"]))
 
     async def scenario():
         bot = _bot(tmp_path)
@@ -819,7 +819,7 @@ def test_rescan_excludes_manual_hold_market_without_cancelling_orders(tmp_path, 
         scan_excludes = []
         replacement = _scored("replacement", 2.0)
 
-        def fake_scan(_cfg, exclude=None, full=False):
+        def fake_scan(_cfg, exclude=None, full=False, shadow_inputs=None, outcome_report=None):
             scan_excludes.append(set(exclude or ()))
             return [replacement]
 
@@ -848,7 +848,7 @@ def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_
     legacy_winner, shadow_winner = _scored("legacy", 2.0), _scored("shadow", 1.0)
     shadow_winner.daily_pool = 300
     monkeypatch.setattr(gamma_mod, "scan",
-                        lambda cfg, exclude=None, full=False: [legacy_winner, shadow_winner])
+                        lambda cfg, exclude=None, full=False, shadow_inputs=None, outcome_report=None: [legacy_winner, shadow_winner])
 
     async def scenario():
         bot = _bot(tmp_path)
@@ -888,7 +888,7 @@ def test_rescan_removes_unpaired_inventory_market_from_quote_set(tmp_path, monke
     ranked = {"value": []}
     scan_excludes = []
 
-    def fake_scan(cfg, exclude=None, full=False):
+    def fake_scan(cfg, exclude=None, full=False, shadow_inputs=None, outcome_report=None):
         scan_excludes.append(set(exclude or ()))
         return list(ranked["value"])
 
@@ -1410,3 +1410,53 @@ def test_runtime_log_formatter_uses_beijing_time():
     formatter = main.BeijingFormatter("%(asctime)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     assert formatter.format(record) == "1970-01-01 08:00:00"
+
+
+def test_outcomes_command_shows_completeness_counts(tmp_path):
+    """The outcomes CLI must display complete/incomplete counts and missing reasons."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    ts = main.datetime(2026, 8, 1, 12, tzinfo=main.timezone.utc).timestamp()
+    # Realized: balanced + merge
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "YES",
+                       "token": "y", "price": 0.50, "size": 10})
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "NO",
+                       "token": "n", "price": 0.50, "size": 10})
+    store.record_merge("m1", 10, ts=ts)
+    # Incomplete: unpaired no mid
+    store.record_fill({"ts": ts, "cid": "m2", "market": "M2", "side": "YES",
+                       "token": "y2", "price": 0.60, "size": 15})
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_outcomes(cfg, "2026-08-01", days=1)
+
+    output = capture.get()
+    assert "Realized: 1" in output
+    assert "Incomplete: 1" in output
+    assert "Complete ratio: 50%" in output
+    assert "unpaired_no_persistent_mid" in output
+
+
+def test_outcomes_command_separates_account_reward_in_summary(tmp_path):
+    """Account rewards must not appear in any market outcome in the CLI output."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    ts = main.datetime(2026, 8, 1, 12, tzinfo=main.timezone.utc).timestamp()
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "YES",
+                       "token": "y", "price": 0.50, "size": 10})
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "NO",
+                       "token": "n", "price": 0.50, "size": 10})
+    store.record_merge("m1", 10, ts=ts)
+    store.record_realized_reward("2026-08-01", 4.50)
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_outcomes(cfg, "2026-08-01", days=1)
+
+    output = capture.get()
+    assert "Account rewards (separate): $4.5000" in output
+    # The market outcome row must NOT show the account reward
+    assert "market_reward" not in output.lower() or "Market rewards (attributed): $0.0000" in output
