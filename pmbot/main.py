@@ -195,7 +195,7 @@ def cmd_scan(cfg: dict) -> None:
     console.print(table)
 
 
-def _metrics_store(cfg: dict) -> MetricsStore:
+def _metrics_store(cfg: dict, *, read_only: bool = False) -> MetricsStore:
     m = cfg.get("metrics") or {}
     db_path = m.get("db_path", "data/metrics.db")
     # Paper mode uses a separate DB so simulated data doesn't mix with live.
@@ -203,7 +203,8 @@ def _metrics_store(cfg: dict) -> MetricsStore:
         db_path = "data/metrics_paper.db"
     return MetricsStore(db_path,
                         trades_log=m.get("trades_log"),
-                        inception_date=m.get("inception_date"))
+                        inception_date=m.get("inception_date"),
+                        read_only=read_only)
 
 
 def cmd_report(cfg: dict, date: str | None = None) -> None:
@@ -355,6 +356,8 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         f"uptime {summary['uptime_pct']:.1f}%"
         + extra
     )
+
+
     shadow = report["shadow_selection"]
     if shadow["status"] == "no_shadow_scan_data":
         console.print("[dim]Net shadow candidates: no shadow scan data for this UTC date.[/]")
@@ -433,6 +436,58 @@ def cmd_performance(cfg: dict, date: str | None) -> None:
         "it remains unresolved. Carry means today's closing cashflow may include "
         "pre-day inventory, so it is not attributed to today's selection.[/]"
     )
+
+
+def cmd_quote_risk_report(cfg: dict, date: str | None) -> None:
+    """Display active adverse-selection guard observations for one Beijing day."""
+    date = date or datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=BEIJING_TZ).timestamp()
+    store = _metrics_store(cfg, read_only=True)
+    report = store.quote_risk_report(
+        since_ts=day_start, until_ts=day_start + 86400, mode="active")
+    store.close()
+
+    console.print(f"[bold]Quote risk validation — {date} (active, Beijing time)[/]")
+    console.print(
+        f"intercepted {report['active_intercepted']}  "
+        f"avg score {report['avg_score'] if report['avg_score'] is not None else '—'}  "
+        f"intercepted avg score "
+        f"{report['avg_score_intercepted'] if report['avg_score_intercepted'] is not None else '—'}"
+    )
+    markout_table = Table(title="Paired markout (cents; active decisions only)")
+    for col in ("Horizon", "Intercepted", "Allow", "Negative hit / false-positive"):
+        markout_table.add_column(col)
+    for horizon, stats in (("30s", report["markout_30s"]),
+                           ("300s", report["markout_300s"])):
+        intercepted = (f"{stats['intercepted_avg_cents']:+.2f}c "
+                       f"(n={stats['intercepted_paired_samples']})"
+                       if stats["intercepted_avg_cents"] is not None else "—")
+        allowed = (f"{stats['allow_avg_cents']:+.2f}c "
+                   f"(n={stats['allow_paired_samples']})"
+                   if stats["allow_avg_cents"] is not None else "—")
+        rates = (f"{stats['intercepted_neg_hit_rate']:.0%} / "
+                 f"{stats['allow_neg_rate']:.0%}"
+                 if stats["intercepted_neg_hit_rate"] is not None
+                 and stats["allow_neg_rate"] is not None else "—")
+        markout_table.add_row(horizon, intercepted, allowed, rates)
+    console.print(markout_table)
+
+    if not report["decisions"]:
+        console.print("no active quote-risk decisions recorded in this UTC day")
+        return
+    recent = Table(title="Recent active decisions")
+    for col in ("时间（北京）", "市场 / CID", "动作", "分数", "原因"):
+        recent.add_column(col, overflow="fold")
+    for decision in report["decisions"]:
+        recent.add_row(
+            datetime.fromtimestamp(decision["ts"], BEIJING_TZ).strftime(
+                "%Y-%m-%d %H:%M:%S"),
+            f"{decision['market'] or 'Unknown market'}\n{decision['cid']}",
+            f"{decision['yes_action']}/{decision['no_action']}",
+            f"{decision['score']:.2f}", decision["reason"],
+        )
+    console.print(recent)
 
 
 def cmd_reward_calibration(cfg: dict, days: int) -> None:
@@ -2182,7 +2237,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pmbot")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("scan", "run", "report", "trades", "performance", "reward-calibration",
+    for name in ("scan", "run", "report", "trades", "performance", "quote-risk-report", "reward-calibration",
                  "recovery-history"):
         sub.add_parser(name)
 
@@ -2200,6 +2255,9 @@ def main() -> None:
     perf_p = sub.choices["performance"]
     perf_p.add_argument("--date", default=None,
                         help="UTC date YYYY-MM-DD (default: today)")
+    quote_risk_p = sub.choices["quote-risk-report"]
+    quote_risk_p.add_argument("--date", default=None,
+                              help="UTC date YYYY-MM-DD (default: today)")
     calibration_p = sub.choices["reward-calibration"]
     calibration_p.add_argument("--days", type=int, default=7,
                                help="number of UTC days to inspect (default: 7)")
@@ -2226,6 +2284,8 @@ def main() -> None:
         cmd_trades(cfg, args.limit, args.hours, args.export_csv)
     elif args.command == "performance":
         cmd_performance(cfg, args.date)
+    elif args.command == "quote-risk-report":
+        cmd_quote_risk_report(cfg, args.date)
     elif args.command == "reward-calibration":
         cmd_reward_calibration(cfg, args.days)
     elif args.command == "recovery-history":

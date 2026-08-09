@@ -59,6 +59,47 @@ def test_report_command_renders_requested_utc_date(tmp_path):
     assert "$+2.50" not in output
 
 
+def test_quote_risk_report_reads_active_decisions_only(tmp_path):
+    """The live-validation command must exclude prior shadow observations."""
+    cfg = dict(BASE_CFG)
+    cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}
+    store = main._metrics_store(cfg)
+    from pmbot.risk import QuoteRiskDecision
+
+    store.record_quote_risk_decision(
+        "early-cid", "active",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "early-risk", 0.0),
+        ts=main.datetime(2026, 8, 9, 11, 59, tzinfo=main.timezone.utc).timestamp(),
+    )
+    store.record_quote_risk_decision(
+        "active-cid", "active",
+        QuoteRiskDecision("pull", "allow", 0.0, 0.0, "active-risk", 0.9),
+        ts=main.datetime(2026, 8, 9, 12, tzinfo=main.timezone.utc).timestamp(),
+    )
+    store.record_fill({
+        "cid": "active-cid", "market": "Active market title", "side": "YES",
+        "token": "yes", "price": 0.5, "size": 1,
+    })
+    store.record_quote_risk_decision(
+        "shadow-cid", "shadow",
+        QuoteRiskDecision("pull", "allow", 0.0, 0.0, "shadow-risk", 0.9),
+        ts=main.datetime(2026, 8, 9, 12, tzinfo=main.timezone.utc).timestamp(),
+    )
+    store.close()
+
+    with main.console.capture() as capture:
+        main.cmd_quote_risk_report(cfg, "2026-08-09")
+
+    output = capture.get()
+    assert "Quote risk validation — 2026-08-09 (active, Beijing time)" in output
+    assert "active-risk" in output
+    assert "shadow-risk" not in output
+    assert "Active market" in output
+    assert "title" in output
+    assert "2026-08-09 20:00:00" in output
+    assert output.index("early-risk") < output.index("active-risk")
+
+
 def test_trades_command_keeps_full_market_question(tmp_path):
     cfg = dict(BASE_CFG)
     cfg["metrics"] = {"db_path": str(tmp_path / "metrics.db")}

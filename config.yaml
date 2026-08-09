@@ -324,7 +324,7 @@ guards:
   #   shadow: record decisions for audit, do NOT change quotes (default / safe)
   #   active: apply widen/pull per decision to live maker quotes
   #   off:    skip the decision engine entirely
-  quote_risk_mode: shadow
+  quote_risk_mode: active
   quote_risk_widen_score: 0.60
   quote_risk_pull_score: 0.85
   quote_risk_resume_score: 0.45

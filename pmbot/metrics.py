@@ -16,24 +16,33 @@ log = logging.getLogger("pmbot.metrics")
 class MetricsStore:
     def __init__(self, db_path: str = "data/metrics.db",
                  trades_log: str | None = None,
-                 inception_date: str | None = None):
+                 inception_date: str | None = None,
+                 read_only: bool = False):
         self.path = Path(db_path)
-        self.path.parent.mkdir(exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(exist_ok=True)
         self._trades_log = Path(trades_log) if trades_log else None
         if self._trades_log:
             self._trades_log.parent.mkdir(exist_ok=True)
         # Reports reflect bot activity only: drop/refuse anything before this
         # UTC date (earlier rows were manual testing).
         self.inception_date = inception_date or None
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        if read_only:
+            self._conn = sqlite3.connect(
+                f"file:{self.path.resolve().as_posix()}?mode=ro",
+                uri=True, check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         # Tolerate brief contention from a concurrent reader/backfill instead of
         # raising "database is locked" immediately.
         self._conn.execute("PRAGMA busy_timeout=5000")
         # Order ops run concurrently in worker threads and all record metrics
         # through this single connection — serialize writes.
         self._lock = threading.Lock()
-        self._init_schema()
-        self._prune_before_inception()
+        if not read_only:
+            self._init_schema()
+            self._prune_before_inception()
         self._uptime_samples: dict[str, list[bool]] = {}
         self._last_uptime_minute: int = 0
         self._session_start = time.time()
@@ -482,7 +491,8 @@ class MetricsStore:
 
     def quote_risk_report(self, cid: str | None = None,
                           since_ts: float | None = None,
-                          until_ts: float | None = None) -> dict:
+                          until_ts: float | None = None,
+                          mode: str | None = None) -> dict:
         """Read-only summary for shadow/active guard effect measurement.
 
         The minimum viable audit surface per the design spec:
@@ -517,6 +527,11 @@ class MetricsStore:
             clauses_q.append("qrd.ts < ?")
             params_u.append(until_ts)
             params_q.append(until_ts)
+        if mode:
+            clauses_u.append("mode = ?")
+            clauses_q.append("qrd.mode = ?")
+            params_u.append(mode)
+            params_q.append(mode)
         uwhere = f"WHERE {' AND '.join(clauses_u)}" if clauses_u else "WHERE 1=1"
         qwhere = f"WHERE {' AND '.join(clauses_q)}" if clauses_q else "WHERE 1=1"
 
@@ -575,6 +590,10 @@ class MetricsStore:
             m_clauses.append("m.ts < ?")
             m_params.append(until_ts)
         mwhere = f"WHERE {' AND '.join(m_clauses)}" if m_clauses else "WHERE 1=1"
+        mode_2 = " AND qrd2.mode = ?" if mode else ""
+        mode_3 = " AND qrd3.mode = ?" if mode else ""
+        mode_qrd = " AND qrd.mode = ?" if mode else ""
+        paired_params = ([mode] + m_params + [mode, mode]) if mode else m_params
 
         paired_30 = self._conn.execute(f"""
             SELECT
@@ -587,17 +606,20 @@ class MetricsStore:
                WHERE qrd2.cid = m.cid
                  AND qrd2.ts <= m.fill_ts
                  AND qrd2.ts >= m.fill_ts - 150.0
+                 {mode_2}
              )
             {mwhere}
               AND m.horizon = 30.0
+              {mode_qrd}
               AND EXISTS (
                 SELECT 1 FROM quote_risk_decisions qrd3
                 WHERE qrd3.cid = m.cid
                   AND qrd3.ts <= m.fill_ts
                   AND qrd3.ts >= m.fill_ts - 150.0
+                  {mode_3}
               )
             ORDER BY qrd.ts
-        """, m_params).fetchall()
+        """, paired_params).fetchall()
 
         paired_300 = self._conn.execute(f"""
             SELECT
@@ -610,17 +632,20 @@ class MetricsStore:
                WHERE qrd2.cid = m.cid
                  AND qrd2.ts <= m.fill_ts
                  AND qrd2.ts >= m.fill_ts - 420.0
+                 {mode_2}
              )
             {mwhere}
               AND m.horizon >= 300.0
+              {mode_qrd}
               AND EXISTS (
                 SELECT 1 FROM quote_risk_decisions qrd3
                 WHERE qrd3.cid = m.cid
                   AND qrd3.ts <= m.fill_ts
                   AND qrd3.ts >= m.fill_ts - 420.0
+                  {mode_3}
               )
             ORDER BY qrd.ts
-        """, m_params).fetchall()
+        """, paired_params).fetchall()
 
         def _markout_stats(rows: list) -> dict:
             intercepted_marks = [r[1] for r in rows if r[0]]
@@ -645,11 +670,14 @@ class MetricsStore:
             }
 
         decisions = self._conn.execute(
-            f"SELECT ts, cid, mode, yes_action, no_action, yes_widen, "
-            f"no_widen, score, reason "
-            f"FROM quote_risk_decisions {uwhere} "
-            f"ORDER BY ts DESC LIMIT 200",
-            params_u,
+            f"SELECT qrd.ts, qrd.cid, qrd.mode, qrd.yes_action, qrd.no_action, "
+            f"qrd.yes_widen, qrd.no_widen, qrd.score, qrd.reason, "
+            f"(SELECT f.market FROM fills f WHERE f.cid=qrd.cid "
+            f"AND f.market IS NOT NULL AND f.market!='' "
+            f"ORDER BY f.ts DESC LIMIT 1) "
+            f"FROM quote_risk_decisions qrd {qwhere} "
+            f"ORDER BY qrd.ts ASC LIMIT 200",
+            params_q,
         ).fetchall()
 
         return {
@@ -666,7 +694,7 @@ class MetricsStore:
                     "ts": r[0], "cid": r[1], "mode": r[2],
                     "yes_action": r[3], "no_action": r[4],
                     "yes_widen": r[5], "no_widen": r[6],
-                    "score": r[7], "reason": r[8],
+                    "score": r[7], "reason": r[8], "market": r[9],
                 }
                 for r in decisions
             ],
