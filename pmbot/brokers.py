@@ -975,17 +975,22 @@ class LiveBroker:
             d = desired.get(ro.quote.token_id)
             near_expiry = (ro.expiration > 0
                            and ro.expiration - now < GTD_REFRESH_MARGIN_SECS)
-            if (d is not None and d.key() == ro.quote.key() and not near_expiry):
-                kept.append(ro)
-                desired.pop(ro.quote.token_id)
-            elif (d is not None and d.key() == ro.quote.key()
-                  and near_expiry and self.refresh_overlap):
-                # Same price/size, only expiring: leave it in `desired` so the
-                # replacement posts first, then cancel the old order below. No
-                # off-book gap, so the reward sampler always sees this side.
-                cancel_after.append(ro.order_id)
-                refresh_audits[ro.order_id] = (
-                    (audit_context or {}).get(ro.quote.token_id, ro.audit))
+            is_recovery = (ro.audit or {}).get("recovery_order") or \
+                          ((audit_context or {}).get(ro.quote.token_id, {})).get("recovery_order")
+            if d is not None and d.key() == ro.quote.key():
+                if not near_expiry or is_recovery:
+                    # Recovery orders stay put even near expiry — their goal is
+                    # queue depth, not reward scoring.  Price/size changes still
+                    # replace them immediately.
+                    kept.append(ro)
+                    desired.pop(ro.quote.token_id)
+                elif near_expiry and self.refresh_overlap:
+                    # Same price/size, only expiring: leave it in `desired` so the
+                    # replacement posts first, then cancel the old order below. No
+                    # off-book gap, so the reward sampler always sees this side.
+                    cancel_after.append(ro.order_id)
+                    refresh_audits[ro.order_id] = (
+                        (audit_context or {}).get(ro.quote.token_id, ro.audit))
             else:
                 cancel_now.append(ro.order_id)
 

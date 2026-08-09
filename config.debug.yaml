@@ -234,6 +234,10 @@ quoting:
   # which a reward farmer prefers to a scoring gap. Price/size changes still
   # cancel-first. Set false to revert to plain cancel-then-repost.
   refresh_overlap: true
+  # Recovery orders (complement buy-backs) only cancel on price/size changes,
+  # not on GTD expiry. Their long TTL is a dead-man switch for a crash; in
+  # normal operation they sit on the book collecting queue seniority.
+  recovery_order_ttl_secs: 36000
   # Don't quote unless book spread <= this multiple of the reward band.
   max_book_spread_mult_of_band: 3.0
   # Max quote-center drift from signed flow imbalance (cents).
