@@ -156,7 +156,7 @@ class MetricsStore:
                 ON inventory_events (cid, ts);
             CREATE TABLE IF NOT EXISTS guard_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL, cid TEXT, scope TEXT, reason TEXT
+                ts REAL, cid TEXT, market TEXT, scope TEXT, reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_guard_events_cid_ts
                 ON guard_events (cid, ts);
@@ -235,6 +235,13 @@ class MetricsStore:
             if column not in inv_cols:
                 self._conn.execute(
                     f"ALTER TABLE inventory_snapshots ADD COLUMN {column} REAL")
+        self._conn.commit()
+        # Migration: guard_events gained a market column
+        ge_cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(guard_events)")}
+        if "market" not in ge_cols:
+            self._conn.execute(
+                "ALTER TABLE guard_events ADD COLUMN market TEXT DEFAULT ''")
         self._conn.commit()
 
     def net_shadow_inputs(self, lookback_hours: float,
@@ -957,7 +964,7 @@ class MetricsStore:
             self._conn.commit()
 
     def record_guard_event(self, cid: str, scope: str, reason: str,
-                           ts: float | None = None) -> None:
+                           ts: float | None = None, market: str = "") -> None:
         """Persist a quote interruption caused by a risk guard.
 
         ``reason`` names the observable action (for example
@@ -965,8 +972,8 @@ class MetricsStore:
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO guard_events (ts,cid,scope,reason) VALUES (?,?,?,?)",
-                (time.time() if ts is None else ts, cid, scope, reason),
+                "INSERT INTO guard_events (ts,cid,market,scope,reason) VALUES (?,?,?,?,?)",
+                (time.time() if ts is None else ts, cid, market, scope, reason),
             )
             self._conn.commit()
 
@@ -992,8 +999,30 @@ class MetricsStore:
                      decision.score, decision.reason),
                 )
                 self._conn.commit()
+                # Probabilistic cleanup: ~5% chance each write, delete rows
+                # older than 10 hours to keep the table lean.
+                self._prune_old_decisions(self._conn)
         except Exception:
             log.warning("quote_risk_decision 持久化失败（cid=%s）", cid, exc_info=True)
+
+    @staticmethod
+    def _prune_old_decisions(conn: sqlite3.Connection, keep_hours: int = 10) -> None:
+        """Delete quote_risk_decisions rows older than *keep_hours*, ~5% of calls."""
+        import random
+        if random.random() > 0.05:
+            return
+        cutoff = time.time() - keep_hours * 3600
+        try:
+            cur = conn.execute(
+                "DELETE FROM quote_risk_decisions WHERE ts < ?", (cutoff,))
+            deleted = cur.rowcount
+            if deleted > 0:
+                conn.commit()
+                log.info("P0 guard 历史清理: 删除 %d 条 (%d 小时前的决策)",
+                         deleted, keep_hours)
+        except Exception:
+            # Best-effort; never let cleanup break the write path.
+            pass
 
     def quote_risk_report(self, cid: str | None = None,
                           since_ts: float | None = None,

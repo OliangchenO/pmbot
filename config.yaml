@@ -283,37 +283,31 @@ quoting:
   size_markout_penalty: 0.5
 
 guards:
-  # Pull quotes from a market when its mid moves this many cents within the
-  # window — a one-way move usually means informed flow (e.g. a daily weather
-  # market resolving in real time).
+  # 波动率熔断：窗口内中间价变动超过此阈值即撤下全市场报价。
+  # 单边连续移动通常意味着知情流（例如每日天气市场实时结算）。
   vol_window_secs: 60
   vol_max_move_cents: 3.0
-  # Stop quoting a market after this many same-side fills inside the window —
-  # someone is repeatedly unloading into our skewing quotes.
+  # 同侧吃单熔断：窗口内同一侧被吃超过此次数，暂停整个市场报价。
+  # 有人在持续单向砸盘，倾斜的报价被反复吃掉。
   max_same_side_fills: 3
   same_side_window_minutes: 15
-  # How long a tripped market stays unquoted.
+  # 熔断后市场冷却时间。
   market_cooldown_minutes: 45
-  # Trade velocity breaker: pull the whole market when this many trades print
-  # within the window (news being traded).
+  # 交易速度熔断：窗口内达到此次数即暂停整个市场（消息市）。
   velocity_window_secs: 10
   velocity_max_trades: 8
-  # Directional flow: this many consecutive same-direction taker trades on a
-  # token pulls the endangered bid only (asymmetric defense).
+  # 方向性流：连续 N 笔同方向吃单，撤下被吃一侧报价（非对称防护）。
   directional_consecutive: 5
   side_cooldown_minutes: 10
-  # Quote fading: each of our fills within the window pushes that side's next
-  # bid this much further from the mid (escalating, capped).
+  # 报价衰减：窗口内每笔自己的吃单将下次报价推离中间价（递增，有上限）。
   fade_cents_per_fill: 0.5
   fade_window_minutes: 5
   fade_max_cents: 2.0
-  # Latency kill: never quote on a book older than this — pull instead.
+  # 延迟保护：订单簿超过此时长的市场不报价。
   max_book_staleness_secs: 25
-  # Markouts: post-fill price drift at these horizons measures adverse
-  # selection directly. If a market's average markout at the longest horizon
-  # drops to/below the trip level (cents, negative = we got picked off) over
-  # at least min_samples fills in the window, the market is tripped into the
-  # standard cooldown.
+  # Markout（成交后价格漂移）：在这几个时间窗口内测量反向选择强度。
+  # 如果市场在最长窗口内的平均 markout 达到或低于 trip 水平（负值=被吃），
+  # 且窗口内至少有 min_samples 笔成交，则触发标准冷却。
   markout_horizons_secs: [30, 300]
   markout_window_minutes: 120
   markout_min_samples: 5
@@ -324,20 +318,27 @@ guards:
   # 关闭后：保持原有行为，冷却 45 分钟后该市场仍可被重新扫入选入。
   # P1.3 — markout 联动自动退出市场。
   markout_ban_on_trip: true
-  # Flow imbalance (VPIN-lite): signed taker volume over a rolling window,
-  # in YES-equivalent shares. Above the widen threshold the endangered bid
-  # fades out progressively (up to flow_widen_max_cents); above the pull
-  # threshold it is pulled for side_cooldown_minutes. Ignored below the
-  # minimum volume (thin flow is noise).
+  # 流量失衡（VPIN-lite）：滚动窗口内带符号的吃单量（YES 等价股数）。
+  # 失衡度超过 widen 阈值时，受威胁侧报价渐进拉宽（最高 flow_widen_max_cents）；
+  # 超过 pull 阈值时撤下该侧报价 side_cooldown_minutes 分钟。
+  # 低于最小成交量时忽略（薄量噪声）。
   flow_window_secs: 300
   flow_min_volume_shares: 200
   flow_widen_threshold: 0.6
   flow_pull_threshold: 0.85
   flow_widen_max_cents: 2.0
-  # P0 reverse selection pre-guard (quote risk decision engine).
-  #   shadow: record decisions for audit, do NOT change quotes (default / safe)
-  #   active: apply widen/pull per decision to live maker quotes
-  #   off:    skip the decision engine entirely
+  # 累积吃单检测（pickoff）：按侧统计时间窗口内自己被吃的笔数。
+  # 不依赖单笔大小 —— 小单反复被吃同样是反向选择信号。
+  # 达到拉升阈值时拉宽该侧报价，达到撤单阈值时撤下该侧报价。
+  # 这是 flow（依赖大单量）和 markout（依赖成交后漂移）之外的第三道防线，
+  # 专门针对小单缓慢吃货场景。
+  pickoff_window_secs: 300
+  pickoff_widen_fills: 1
+  pickoff_pull_fills: 2
+  # P0 反向选择前哨（quote risk decision engine）。
+  #   shadow: 仅记录决策供审计，不修改实际报价（默认／安全）
+  #   active: 根据决策对实盘报价执行拉宽／撤单
+  #   off:    完全跳过决策引擎
   quote_risk_mode: active
   quote_risk_widen_score: 0.60
   quote_risk_pull_score: 0.85

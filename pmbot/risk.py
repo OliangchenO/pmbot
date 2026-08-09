@@ -221,6 +221,10 @@ class MarketGuards:
         # markout thresholds for the composite score
         self.markout_min_samples = int(g.get("markout_min_samples", 3))
         self.markout_trip_cents = float(g.get("markout_trip_cents", -1.5))
+        # P0: pickoff (own-fill counting) — catches small persistent fills
+        self.pickoff_window = float(g.get("pickoff_window_secs", 300))
+        self.pickoff_widen_fills = int(g.get("pickoff_widen_fills", 1))
+        self.pickoff_pull_fills = int(g.get("pickoff_pull_fills", 2))
 
     def reload(self, cfg: dict) -> None:
         """Re-read guard thresholds after the controller mutates config.
@@ -296,6 +300,24 @@ class MarketGuards:
         """返回单边报价保护剩余秒数；未保护时为零。"""
         return max(0.0, self._side_blocked_until.get(token_id, 0.0) - now)
 
+    def _sync_p0_cooldown(self, cid: str, token_id: str,
+                          yes_token: str, no_token: str,
+                          until: float) -> None:
+        """同步写入 P0 pull_cooldown，防止传统 guard 和 P0 串行叠加。
+
+        原因：传统 guard（check_flow/record_trade）设了
+        _side_blocked_until 后，P0 quote_risk_decision 不知道这个
+        冷却已经激活。当传统 guard 的 cooldown 到期、allow_side 返回
+        True 时，P0 可能已经通过自己的 hysteresis 又设置了新的
+        pull_cooldown，导致实际冷却 ≈ 传统 + P0 之和。
+
+        写入 _pull_cooldown_until 让两套系统共享同一个冷却时钟。
+        """
+        side: Literal["yes", "no"] = "yes" if token_id == yes_token else "no"
+        cd = self._pull_cooldown_until.setdefault(cid, {"yes": 0.0, "no": 0.0})
+        if until > cd[side]:
+            cd[side] = until
+
     def trip_market(self, cid: str, now: float, reason: str, question: str) -> None:
         self._trip(cid, now, reason, question)
 
@@ -332,6 +354,8 @@ class MarketGuards:
                 log.warning("方向性成交流（连续 %d 笔 %s），撤下“%s”的一侧买单 %.0f 分钟",
                             self.dir_consec, s, market.question[:45], self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
+            self._sync_p0_cooldown(cid, blocked, market.yes_token, market.no_token,
+                                   now + self.side_cooldown)
             if newly_blocked and self.on_side_block is not None:
                 self.on_side_block(blocked)
             sides.clear()
@@ -373,6 +397,9 @@ class MarketGuards:
                             market.question[:45], "NO" if endangered_no else "YES",
                             self.side_cooldown / 60)
             self._side_blocked_until[blocked] = now + self.side_cooldown
+            self._sync_p0_cooldown(market.condition_id, blocked,
+                                   market.yes_token, market.no_token,
+                                   now + self.side_cooldown)
             if newly_blocked and self.on_side_block is not None:
                 self.on_side_block(blocked)
             return 0.0, 0.0
@@ -407,22 +434,27 @@ class MarketGuards:
         markout_no_avg: float | None = None,
         markout_yes_samples: int = 0,
         markout_no_samples: int = 0,
+        own_fills: list[dict] | None = None,
     ) -> QuoteRiskDecision:
         """Pure-function decision for per-side quote admission.
 
-        Composes three observed signals into a composite risk score in [0, 1]:
+        Composes four observed signals into a composite risk score in [0, 1]:
           1. Flow imbalance (from ``_flow_stats``) — signed taker volume.
           2. Markout (post-fill price drift) — direct adverse selection evidence.
           3. Mid velocity — short-term price speed.
+          4. Pickoff (own-fill counts) — cumulative same-side fills, regardless of
+             individual fill size. Catches persistent small-fill adverse selection
+             that flow (gated by min volume) and markout (requires post-fill drift)
+             can miss.
 
         Uses hysteresis: ``pull`` is held until the score drops below
         ``quote_risk_resume_score``, and ``widen`` is held until the score
         drops below ``quote_risk_widen_score`` — preventing per-loop churn.
         Pull actions also have a minimum time cooldown before re-allow.
 
-        When flow is absent, per-side markout directs the ``pull``/``widen``
-        to the specific side that was actually picked off — no longer flags
-        both sides out of caution.
+        When flow is absent, per-side markout (or per-side pickoff counts)
+        directs the ``pull``/``widen`` to the specific side that was actually
+        picked off — no longer flags both sides out of caution.
 
         Returns ``QuoteRiskDecision(allow, allow, 0.0, 0.0, "no_signal", 0.0)``
         when ``quote_risk_mode`` is ``"off"`` or no signal is present.
@@ -434,11 +466,17 @@ class MarketGuards:
         flow_score = self._compute_flow_score(market, now)
         markout_score = self._compute_markout_score(markout_avg, markout_samples)
         mid_score = self._compute_mid_score(market, now)
+        pickoff_yes, pickoff_no = self._compute_pickoff_score(
+            market, now, own_fills)
 
-        # Composite: max of the three component scores.
-        # The strongest signal dominates — flow, markout, or velocity can each
-        # independently trigger protect/widen/pull.
-        score = max(flow_score, markout_score, mid_score)
+        # Composite: max of the four component scores, per-side for pickoff.
+        # Flow, markout, and velocity are market-wide — same score for both
+        # sides. Pickoff is per-side: a YES fill should not widen NO's bid.
+        shared = max(flow_score, markout_score, mid_score)
+        yes_score = max(shared, pickoff_yes)
+        no_score = max(shared, pickoff_no)
+        score = max(yes_score, no_score)  # for widen-amount and reason display
+        pickoff_score = max(pickoff_yes, pickoff_no)
 
         if score <= 0.0:
             # Enforce pull cooldown before clearing state — zero score
@@ -467,28 +505,37 @@ class MarketGuards:
             relevant = [s for _, s in flow if _ >= cutoff]
             net = sum(relevant)
 
-        # With no flow signal, use per-side markout to target the
-        # specific side that got picked off — instead of pessimistically
-        # flagging both sides (old behavior that caused both YES and NO
-        # to be pulled under negative markout alone).
-        # With a clear flow signal: net > 0 (YES buying) → NO side is
-        # dangerous (matches existing check_flow convention).
-        no_danger = net > 0.0 if abs(net) > 1e-9 else (
-            markout_no_avg is not None
-            and markout_no_samples >= self.markout_min_samples
-            and markout_no_avg < 0.0
+        # Direction: strongest active signal determines which side is dangerous.
+        # Priority: flow → pickoff → markout.
+        # When flow is present, net > 0 (YES buying) → NO side is dangerous
+        # (matches existing check_flow convention).
+        # When flow is absent, pickoff counts are the next clue — someone is
+        # repeatedly selling into our resting bid on that side.
+        # Otherwise, fall back to per-side markout.
+        has_flow = abs(net) > 1e-9
+        any_pickoff = pickoff_yes > 0.0 or pickoff_no > 0.0
+        no_danger = (
+            net > 0.0 if has_flow
+            else pickoff_no > 0.0 if any_pickoff
+            else markout_no_avg is not None
+                and markout_no_samples >= self.markout_min_samples
+                and markout_no_avg < 0.0
         )
-        yes_danger = net < 0.0 if abs(net) > 1e-9 else (
-            markout_yes_avg is not None
-            and markout_yes_samples >= self.markout_min_samples
-            and markout_yes_avg < 0.0
+        yes_danger = (
+            net < 0.0 if has_flow
+            else pickoff_yes > 0.0 if any_pickoff
+            else markout_yes_avg is not None
+                and markout_yes_samples >= self.markout_min_samples
+                and markout_yes_avg < 0.0
         )
 
         # Apply hysteresis: resolve the final action from the composite score
         # and the previous state for each side independently.
+        # Each side uses its own score: yes_score for YES, no_score for NO.
+        # This prevents a pickoff on NO from pulling YES.
         prev = self._risk_state.setdefault(market.condition_id, {})
-        yes_action = self._resolve_action(score, prev.get("yes", "allow"), "yes")
-        no_action = self._resolve_action(score, prev.get("no", "allow"), "no")
+        yes_action = self._resolve_action(yes_score, prev.get("yes", "allow"), "yes")
+        no_action = self._resolve_action(no_score, prev.get("no", "allow"), "no")
 
         # Pre-load cooldown state: if either side was previously pulled and
         # cooldown hasn't expired, reinstate pull regardless of score.
@@ -506,8 +553,8 @@ class MarketGuards:
         # even if flow reverses direction and marks the other side dangerous.
         if mid_score > 0.0 and mid_score >= score:
             # Mid velocity is market-wide; both sides may be dangerous.
-            yes_action = self._resolve_action(score, prev.get("yes", "allow"), "yes")
-            no_action = self._resolve_action(score, prev.get("no", "allow"), "no")
+            yes_action = self._resolve_action(yes_score, prev.get("yes", "allow"), "yes")
+            no_action = self._resolve_action(no_score, prev.get("no", "allow"), "no")
             # Re-apply cooldown after mid-velocity re-resolution —
             # _resolve_action may have downgraded a pull to widen/allow
             # when score is below pull threshold but cooldown hasn't expired.
@@ -547,13 +594,13 @@ class MarketGuards:
         if not prev:
             self._risk_state.pop(market.condition_id, None)
 
-        # Compute widen amounts — flow-derived, scaled by score.
+        # Compute widen amounts — flow-derived, scaled by per-side score.
         yes_widen = 0.0
         no_widen = 0.0
         if yes_action == "widen":
-            yes_widen = self._compute_widen_amount(score, market)
+            yes_widen = self._compute_widen_amount(yes_score, market)
         if no_action == "widen":
-            no_widen = self._compute_widen_amount(score, market)
+            no_widen = self._compute_widen_amount(no_score, market)
 
         parts = []
         if flow_score > 0:
@@ -562,6 +609,9 @@ class MarketGuards:
             parts.append(f"markout={markout_score:.2f}")
         if mid_score > 0:
             parts.append(f"mid_vel={mid_score:.2f}")
+        if pickoff_score > 0:
+            parts.append(f"pickoff={pickoff_score:.2f}"
+                         f"(yes={pickoff_yes:.2f},no={pickoff_no:.2f})")
         reason = ",".join(parts) if parts else "no_signal"
 
         return QuoteRiskDecision(
@@ -610,6 +660,54 @@ class MarketGuards:
         if move <= 0:
             return 0.0
         return max(0.0, min(1.0, move / self.vol_move))
+
+    def _compute_pickoff_score(
+        self, market, now: float, fills_log: list[dict] | None,
+    ) -> tuple[float, float]:
+        """Per-side own-fill count scores in [0, 1].
+
+        Counts only maker fills (not taker, not exit). Score maps fill counts
+        to a graded [0, 1] range using pickoff_widen_fills as the floor and
+        pickoff_pull_fills as the pull anchor. Returns (yes_score, no_score).
+
+        This catches persistent small-fill adverse selection that the flow
+        signal (gated by flow_min_volume_shares) and markout (requires
+        post-fill drift) both miss.
+        """
+        if not fills_log or self.pickoff_widen_fills <= 0:
+            return 0.0, 0.0
+        cid = market.condition_id
+        yes_count = 0
+        no_count = 0
+        cutoff = now - self.pickoff_window
+        for f in fills_log:
+            if f.get("cid") != cid:
+                continue
+            if f["ts"] < cutoff:
+                continue
+            if f.get("taker") or f.get("exit"):
+                continue
+            if f.get("side") == "YES":
+                yes_count += 1
+            elif f.get("side") == "NO":
+                no_count += 1
+
+        def _score(count: int) -> float:
+            if count < self.pickoff_widen_fills:
+                return 0.0
+            if count >= self.pickoff_pull_fills:
+                # At pull_fills → quote_risk_pull_score, beyond → linearly to 1.0
+                extra = min(count - self.pickoff_pull_fills, 3)
+                return min(1.0, self.quote_risk_pull_score + extra * 0.05)
+            # Between widen_fills and pull_fills (exclusive) → widen zone.
+            # Map to [quote_risk_widen_score, quote_risk_pull_score - 0.01]
+            span = max(self.pickoff_pull_fills - self.pickoff_widen_fills, 1)
+            frac = (count - self.pickoff_widen_fills) / span
+            base = self.quote_risk_widen_score
+            top = self.quote_risk_pull_score - 0.01
+            return base + (top - base) * frac
+
+        return _score(yes_count), _score(no_count)
 
     def _resolve_action(
         self, score: float, prev: ActionLiteral, _side: str,
