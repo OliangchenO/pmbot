@@ -5,11 +5,32 @@ from __future__ import annotations
 import logging
 import statistics
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable
+from typing import Callable, Literal
 
 log = logging.getLogger("pmbot.risk")
+
+
+ActionLiteral = Literal["allow", "widen", "pull"]
+
+
+@dataclass(frozen=True)
+class QuoteRiskDecision:
+    """Pure-function decision for per-market quote admission and width adjustment.
+
+    Determines whether each side's bid should stay (allow), be widened (widen),
+    or be pulled entirely (pull). Only affects normal maker quotes — inventory
+    recovery orders bypass this module entirely.
+    """
+
+    yes_action: ActionLiteral
+    no_action: ActionLiteral
+    yes_widen: float   # price units to widen the YES bid (0 when action != widen)
+    no_widen: float    # price units to widen the NO bid
+    reason: str
+    score: float       # composite risk score in [0, 1]
 
 
 class RiskAction(Enum):
@@ -168,6 +189,13 @@ class MarketGuards:
         # scanner can't immediately re-enter a sibling and bleed the same way.
         self._event_of: dict[str, str] = {}
         self._paused_events: dict[str, float] = {}
+        # Hysteresis state for quote_risk_decision: per-market, per-side last
+        # action. "allow" is omitted from the dict to save space — absence = allow.
+        self._risk_state: dict[str, dict[Literal["yes", "no"], ActionLiteral]] = {}
+        # Pull cooldown: after a side is pulled, a minimum time must pass before
+        # it can re-allow via hysteresis alone — prevents re-entry churn when
+        # the signal briefly dips below resume_score.
+        self._pull_cooldown_until: dict[str, dict[Literal["yes", "no"], float]] = {}
 
     def _load(self, cfg: dict) -> None:
         g = cfg["guards"]
@@ -185,6 +213,14 @@ class MarketGuards:
         self.flow_widen_thr = float(g["flow_widen_threshold"])
         self.flow_pull_thr = float(g["flow_pull_threshold"])
         self.flow_widen_max = float(g["flow_widen_max_cents"]) / 100.0
+        # P0: quote-risk decision engine parameters
+        self.quote_risk_mode = str(g.get("quote_risk_mode", "shadow"))
+        self.quote_risk_widen_score = float(g.get("quote_risk_widen_score", 0.60))
+        self.quote_risk_pull_score = float(g.get("quote_risk_pull_score", 0.85))
+        self.quote_risk_resume_score = float(g.get("quote_risk_resume_score", 0.45))
+        # markout thresholds for the composite score
+        self.markout_min_samples = int(g.get("markout_min_samples", 3))
+        self.markout_trip_cents = float(g.get("markout_trip_cents", -1.5))
 
     def reload(self, cfg: dict) -> None:
         """Re-read guard thresholds after the controller mutates config.
@@ -359,6 +395,260 @@ class MarketGuards:
                            f"{recent[key]} {f['side']} fills in "
                            f"{self.fill_window / 60:.0f} min", f["market"])
 
+    # ── P0: Quote risk decision engine ──
+
+    def quote_risk_decision(
+        self,
+        market,
+        now: float,
+        markout_avg: float | None,
+        markout_samples: int,
+        markout_yes_avg: float | None = None,
+        markout_no_avg: float | None = None,
+        markout_yes_samples: int = 0,
+        markout_no_samples: int = 0,
+    ) -> QuoteRiskDecision:
+        """Pure-function decision for per-side quote admission.
+
+        Composes three observed signals into a composite risk score in [0, 1]:
+          1. Flow imbalance (from ``_flow_stats``) — signed taker volume.
+          2. Markout (post-fill price drift) — direct adverse selection evidence.
+          3. Mid velocity — short-term price speed.
+
+        Uses hysteresis: ``pull`` is held until the score drops below
+        ``quote_risk_resume_score``, and ``widen`` is held until the score
+        drops below ``quote_risk_widen_score`` — preventing per-loop churn.
+        Pull actions also have a minimum time cooldown before re-allow.
+
+        When flow is absent, per-side markout directs the ``pull``/``widen``
+        to the specific side that was actually picked off — no longer flags
+        both sides out of caution.
+
+        Returns ``QuoteRiskDecision(allow, allow, 0.0, 0.0, "no_signal", 0.0)``
+        when ``quote_risk_mode`` is ``"off"`` or no signal is present.
+        """
+        if self.quote_risk_mode == "off":
+            return QuoteRiskDecision("allow", "allow", 0.0, 0.0,
+                                     "off", 0.0)
+
+        flow_score = self._compute_flow_score(market, now)
+        markout_score = self._compute_markout_score(markout_avg, markout_samples)
+        mid_score = self._compute_mid_score(market, now)
+
+        # Composite: max of the three component scores.
+        # The strongest signal dominates — flow, markout, or velocity can each
+        # independently trigger protect/widen/pull.
+        score = max(flow_score, markout_score, mid_score)
+
+        if score <= 0.0:
+            # Enforce pull cooldown before clearing state — zero score
+            # must not bypass an active cooldown (e.g. flow evaporates
+            # but the side was pulled less than side_cooldown ago).
+            cd = self._pull_cooldown_until.get(market.condition_id, {})
+            yes_hold = now < cd.get("yes", 0.0)
+            no_hold = now < cd.get("no", 0.0)
+            if yes_hold or no_hold:
+                return QuoteRiskDecision(
+                    "pull" if yes_hold else "allow",
+                    "pull" if no_hold else "allow",
+                    0.0, 0.0,
+                    "pull_cooldown", 0.0,
+                )
+            # Clear hysteresis state when signal vanishes entirely
+            self._risk_state.pop(market.condition_id, None)
+            return QuoteRiskDecision("allow", "allow", 0.0, 0.0,
+                                     "no_signal", 0.0)
+
+        # Determine which side is dangerous from flow direction.
+        flow = self._flow.get(market.condition_id)
+        net = 0.0
+        if flow:
+            cutoff = now - self.flow_window
+            relevant = [s for _, s in flow if _ >= cutoff]
+            net = sum(relevant)
+
+        # With no flow signal, use per-side markout to target the
+        # specific side that got picked off — instead of pessimistically
+        # flagging both sides (old behavior that caused both YES and NO
+        # to be pulled under negative markout alone).
+        # With a clear flow signal: net > 0 (YES buying) → NO side is
+        # dangerous (matches existing check_flow convention).
+        no_danger = net > 0.0 if abs(net) > 1e-9 else (
+            markout_no_avg is not None
+            and markout_no_samples >= self.markout_min_samples
+            and markout_no_avg < 0.0
+        )
+        yes_danger = net < 0.0 if abs(net) > 1e-9 else (
+            markout_yes_avg is not None
+            and markout_yes_samples >= self.markout_min_samples
+            and markout_yes_avg < 0.0
+        )
+
+        # Apply hysteresis: resolve the final action from the composite score
+        # and the previous state for each side independently.
+        prev = self._risk_state.setdefault(market.condition_id, {})
+        yes_action = self._resolve_action(score, prev.get("yes", "allow"), "yes")
+        no_action = self._resolve_action(score, prev.get("no", "allow"), "no")
+
+        # Pre-load cooldown state: if either side was previously pulled and
+        # cooldown hasn't expired, reinstate pull regardless of score.
+        cd = self._pull_cooldown_until.setdefault(
+            market.condition_id, {"yes": 0.0, "no": 0.0})
+        if yes_action != "pull" and now < cd["yes"]:
+            yes_action = "pull"
+        if no_action != "pull" and now < cd["no"]:
+            no_action = "pull"
+
+        # Only the dangerous side is affected — the safe side stays allow,
+        # unless mid velocity (market-wide) pushes both sides.
+        # BUT: pull cooldown overrides the "safe side → allow" rule.  A side
+        # that was pulled must stay pulled for at least side_cooldown_minutes
+        # even if flow reverses direction and marks the other side dangerous.
+        if mid_score > 0.0 and mid_score >= score:
+            # Mid velocity is market-wide; both sides may be dangerous.
+            yes_action = self._resolve_action(score, prev.get("yes", "allow"), "yes")
+            no_action = self._resolve_action(score, prev.get("no", "allow"), "no")
+            # Re-apply cooldown after mid-velocity re-resolution —
+            # _resolve_action may have downgraded a pull to widen/allow
+            # when score is below pull threshold but cooldown hasn't expired.
+            if yes_action != "pull" and now < cd.get("yes", 0.0):
+                yes_action = "pull"
+            if no_action != "pull" and now < cd.get("no", 0.0):
+                no_action = "pull"
+        else:
+            # Before setting safe side to allow, check cooldown.
+            if not yes_danger and now < cd.get("yes", 0.0):
+                pass  # cooldown still active — keep pull
+            elif not yes_danger:
+                yes_action = "allow"
+            if not no_danger and now < cd.get("no", 0.0):
+                pass  # cooldown still active — keep pull
+            elif not no_danger:
+                no_action = "allow"
+
+        # Write cooldown deadlines: only after the final action is settled
+        # (dangerous-side + cooldown checks), not from the raw hysteresis
+        # output.  This prevents writing cd["yes"] when YES wasn't actually
+        # kept as pull after the dangerous-side filter.
+        if yes_action == "pull":
+            cd["yes"] = now + self.side_cooldown
+        if no_action == "pull":
+            cd["no"] = now + self.side_cooldown
+
+        # Reset safe side hysteresis state.
+        if yes_action == "allow":
+            prev.pop("yes", None)
+        else:
+            prev["yes"] = yes_action
+        if no_action == "allow":
+            prev.pop("no", None)
+        else:
+            prev["no"] = no_action
+        if not prev:
+            self._risk_state.pop(market.condition_id, None)
+
+        # Compute widen amounts — flow-derived, scaled by score.
+        yes_widen = 0.0
+        no_widen = 0.0
+        if yes_action == "widen":
+            yes_widen = self._compute_widen_amount(score, market)
+        if no_action == "widen":
+            no_widen = self._compute_widen_amount(score, market)
+
+        parts = []
+        if flow_score > 0:
+            parts.append(f"flow={flow_score:.2f}")
+        if markout_score > 0:
+            parts.append(f"markout={markout_score:.2f}")
+        if mid_score > 0:
+            parts.append(f"mid_vel={mid_score:.2f}")
+        reason = ",".join(parts) if parts else "no_signal"
+
+        return QuoteRiskDecision(
+            yes_action=yes_action, no_action=no_action,
+            yes_widen=yes_widen, no_widen=no_widen,
+            reason=reason, score=score,
+        )
+
+    def _compute_flow_score(self, market, now: float) -> float:
+        """Normalized flow-imbalance score in [0, 1]."""
+        volume, _net, imbalance = self._flow_stats(market, now)
+        if volume < self.flow_min_vol:
+            return 0.0
+        if imbalance <= 0.0:
+            return 0.0
+        # Scale the imbalance into [0, 1] using widen/pull thresholds as anchors.
+        score = max(0.0, min(1.0, (imbalance - self.flow_widen_thr * 0.5)
+                             / max(self.flow_pull_thr - self.flow_widen_thr * 0.5, 1e-9)))
+        return score
+
+    def _compute_markout_score(
+        self, markout_avg: float | None, markout_samples: int,
+    ) -> float:
+        """Normalized markout score in [0, 1]. Ignores markout with too few samples."""
+        if (markout_avg is None or markout_samples < self.markout_min_samples
+                or markout_avg >= 0.0):
+            return 0.0
+        # markout_avg is in price units (e.g. -0.03 = -3c).
+        # trip_cents is the worst acceptable markout (e.g. -1.5c).
+        # Score scales from 0 at 0c to 1.0 at 2× trip_cents.
+        trip = abs(self.markout_trip_cents) / 100.0  # convert cents → price units
+        if trip <= 0:
+            return 0.0
+        return max(0.0, min(1.0, abs(markout_avg) / (trip * 2.0)))
+
+    def _compute_mid_score(self, market, now: float) -> float:
+        """Normalized mid-velocity score in [0, 1]."""
+        hist = self._mids.get(market.condition_id)
+        if not hist:
+            return 0.0
+        cutoff = now - self.vol_window
+        window = [(t, m) for t, m in hist if t >= cutoff]
+        if len(window) < 2:
+            return 0.0
+        move = abs(window[-1][1] - window[0][1])
+        if move <= 0:
+            return 0.0
+        return max(0.0, min(1.0, move / self.vol_move))
+
+    def _resolve_action(
+        self, score: float, prev: ActionLiteral, _side: str,
+    ) -> ActionLiteral:
+        """Apply hysteresis to determine the next action."""
+        if score >= self.quote_risk_pull_score:
+            return "pull"
+        if score >= self.quote_risk_widen_score:
+            # From pull, hold until score drops below resume.
+            if prev == "pull" and score > self.quote_risk_resume_score:
+                return "pull"
+            return "widen"
+        if score > self.quote_risk_resume_score:
+            # Below widen threshold but above resume — hold prior action.
+            if prev in ("pull", "widen"):
+                return prev
+            return "allow"
+        return "allow"
+
+    def _compute_widen_amount(self, score: float, market) -> float:
+        """Compute widen amount in price units for a dangerous side.
+
+        ``widen`` action can fire when score >= quote_risk_widen_score, but
+        floating-point rounding can make score epsilon-below that threshold
+        (e.g. 0.5999999 where widen_score=0.60).  In that case, frac is
+        effectively zero → widen_amount = 0.00.
+
+        Floor at ``market.tick`` (not a fixed 25 % of max) because a widen of
+        0.005 rounds back to the original price at tick = 0.01, leaving the
+        quote unchanged despite the decision recording ``widen``.  The tick
+        floor guarantees at least one visible tick of movement.
+        """
+        frac = (score - self.quote_risk_widen_score) / max(
+            self.quote_risk_pull_score - self.quote_risk_widen_score, 1e-9)
+        # At least one tick, but never exceed 1.0 × flow_widen_max.
+        min_frac = market.tick / max(self.flow_widen_max, 1e-9)
+        frac = max(min_frac, min(1.0, frac))
+        return self.flow_widen_max * frac
+
 
 class MarkoutTracker:
     """Measures adverse selection directly via post-fill price drift."""
@@ -371,7 +661,7 @@ class MarkoutTracker:
         self.trip_cents = float(g["markout_trip_cents"])
         self._pending: list[dict] = []
         self._seen_ts = 0.0
-        self._samples: dict[str, list[tuple[float, float, float]]] = {}
+        self._samples: dict[str, list[tuple[float, float, float, str]]] = {}  # (ts, horizon, markout, token_id)
         self._session: dict[float, list[float]] = {h: [] for h in self.horizons}
 
     def reload(self, cfg: dict) -> None:
@@ -413,7 +703,8 @@ class MarkoutTracker:
                 if mid is None:
                     continue
                 markout = mid - p["price"]
-                self._samples.setdefault(p["cid"], []).append((now, h, markout))
+                self._samples.setdefault(p["cid"], []).append(
+                    (now, h, markout, p["token"]))
                 self._session[h].append(markout)
                 resolved.append({
                     "ts": now, "fill_ts": p["ts"], "cid": p["cid"],
@@ -436,10 +727,31 @@ class MarkoutTracker:
         if not samples:
             return None
         h = horizon if horizon is not None else max(self.horizons)
-        vals = [m for _, hh, m in samples if hh == h]
+        vals = [m for _, hh, m, _token in samples if hh == h]
         if not vals:
             return None
         return sum(vals) / len(vals)
+
+    def market_avg_by_side(
+        self, cid: str, yes_token: str, no_token: str,
+        horizon: float | None = None,
+    ) -> tuple[float | None, float | None, int, int]:
+        """Per-side markout average for directional danger targeting.
+
+        Returns (yes_avg, no_avg, yes_samples, no_samples) so the risk
+        decision engine can determine *which* side was picked off when
+        there is no flow signal — rather than pessimistically flagging
+        both sides as dangerous.
+        """
+        samples = self._samples.get(cid)
+        if not samples:
+            return None, None, 0, 0
+        h = horizon if horizon is not None else max(self.horizons)
+        yes_vals = [m for _, hh, m, tok in samples if hh == h and tok == yes_token]
+        no_vals = [m for _, hh, m, tok in samples if hh == h and tok == no_token]
+        yes_avg = sum(yes_vals) / len(yes_vals) if yes_vals else None
+        no_avg = sum(no_vals) / len(no_vals) if no_vals else None
+        return yes_avg, no_avg, len(yes_vals), len(no_vals)
 
     def recent_markout(self, horizon: float | None = None) -> tuple[float, int]:
         """Rolling cross-market markout (cents) and sample count.
@@ -450,7 +762,7 @@ class MarkoutTracker:
         """
         h = horizon if horizon is not None else (max(self.horizons) if self.horizons else 0.0)
         vals = [m for samples in self._samples.values()
-                for _, hh, m in samples if hh == h]
+                for _, hh, m, _token in samples if hh == h]
         if not vals:
             return 0.0, 0
         return sum(vals) / len(vals) * 100, len(vals)
@@ -459,7 +771,7 @@ class MarkoutTracker:
         h_long = max(self.horizons)
         out = []
         for cid, samples in self._samples.items():
-            vals = [m for _, h, m in samples if h == h_long]
+            vals = [m for _, h, m, _token in samples if h == h_long]
             if len(vals) < self.min_samples:
                 continue
             avg_cents = sum(vals) / len(vals) * 100

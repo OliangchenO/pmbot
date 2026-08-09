@@ -724,3 +724,259 @@ def test_recovery_history_returns_one_market_timeline_and_latest_inventory(tmp_p
         "market": "Question", "unpaired_shares": 8.0, "cost_basis": 0.53,
         "exposure_usd": 4.24, "status": "unpaired", "ts": 103.0,
     }
+
+
+# ── P0 quote risk decision persistence ──
+
+
+def test_quote_risk_decision_persists_all_fields(tmp_path):
+    """决策的所有字段都必须可持久化且可回读。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    d = QuoteRiskDecision(
+        yes_action="widen", no_action="allow",
+        yes_widen=0.02, no_widen=0.0,
+        reason="flow=0.70", score=0.70,
+    )
+    store.record_quote_risk_decision("cid1", "shadow", d, ts=1_700_000_100.0)
+
+    row = store._conn.execute(
+        "SELECT ts, cid, mode, yes_action, no_action, yes_widen, no_widen, score, reason "
+        "FROM quote_risk_decisions WHERE cid='cid1'").fetchone()
+    store.close()
+
+    assert row == (
+        1_700_000_100.0, "cid1", "shadow",
+        "widen", "allow", 0.02, 0.0, 0.70, "flow=0.70",
+    )
+
+
+def test_quote_risk_decision_write_failure_does_not_raise(tmp_path):
+    """SQLite 写入失败时只能告警，不能中止报价循环。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    d = QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0)
+    # Force an error by closing the connection early.
+    store._conn.close()
+
+    # Must NOT raise — the caller is the quote loop.
+    store.record_quote_risk_decision("cid1", "shadow", d)
+
+
+def test_quote_risk_report_filters_by_cid_and_time(tmp_path):
+    """报表支持按 cid 和时间窗口过滤。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_quote_risk_decision(
+        "cidA", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    store.record_quote_risk_decision(
+        "cidB", "shadow",
+        QuoteRiskDecision("widen", "allow", 0.01, 0.0, "flow=0.65", 0.65),
+        ts=2000.0)
+    store.record_quote_risk_decision(
+        "cidB", "active",
+        QuoteRiskDecision("pull", "allow", 0.0, 0.0, "flow=0.90", 0.90),
+        ts=3000.0)
+    store.record_quote_risk_decision(
+        "cidB", "shadow",
+        QuoteRiskDecision("allow", "pull", 0.0, 0.0, "flow=0.88", 0.88),
+        ts=4000.0)
+
+    # Filter by cid
+    report_cid = store.quote_risk_report(cid="cidA")
+    assert len(report_cid["decisions"]) == 1
+
+    # Filter by time window
+    report_window = store.quote_risk_report(since_ts=2500.0)
+    assert len(report_window["decisions"]) == 2  # ts=3000, 4000
+
+    # Both filters
+    report_both = store.quote_risk_report(cid="cidB", since_ts=3500.0)
+    assert len(report_both["decisions"]) == 1
+
+    store.close()
+
+
+def test_quote_risk_report_action_distribution(tmp_path):
+    """动作分布统计正确（两侧独立计数）。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # 1: both allow
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    # 2: yes=widen, no=allow
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("widen", "allow", 0.01, 0.0, "flow=0.65", 0.65),
+        ts=2000.0)
+    # 3: yes=widen, no=pull
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("widen", "pull", 0.01, 0.0, "flow=0.75", 0.75),
+        ts=3000.0)
+
+    report = store.quote_risk_report()
+    store.close()
+
+    dist = report["action_distribution"]
+    # Each row counts 2 sides: allow x 3, widen x 2, pull x 1
+    assert dist.get("allow", 0) == 3
+    assert dist.get("widen", 0) == 2
+    assert dist.get("pull", 0) == 1
+
+
+def test_quote_risk_report_shadow_vs_active_interception(tmp_path):
+    """shadow/active 拦截计数分别统计。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # shadow, both allow (not intercepted)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    # shadow, widen yes (intercepted)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("widen", "allow", 0.01, 0.0, "flow=0.70", 0.70),
+        ts=2000.0)
+    # active, pull no (intercepted)
+    store.record_quote_risk_decision(
+        "c", "active",
+        QuoteRiskDecision("allow", "pull", 0.0, 0.0, "flow=0.90", 0.90),
+        ts=3000.0)
+    # active, both allow (not intercepted)
+    store.record_quote_risk_decision(
+        "c", "active",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=4000.0)
+
+    report = store.quote_risk_report()
+    store.close()
+
+    assert report["shadow_intercepted"] == 1
+    assert report["active_intercepted"] == 1
+
+
+def test_quote_risk_report_avg_scores(tmp_path):
+    """平均分和拦截平均分统计正确。"""
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("widen", "allow", 0.01, 0.0, "flow=0.70", 0.70),
+        ts=2000.0)
+
+    report = store.quote_risk_report()
+    store.close()
+
+    # avg = (0.0 + 0.70) / 2 = 0.35
+    assert report["avg_score"] == 0.35
+    # intercepted avg = 0.70
+    assert report["avg_score_intercepted"] == 0.70
+    # markout sections present (no paired markouts in this test, so all None)
+    assert "markout_30s" in report
+    assert "markout_300s" in report
+
+
+def test_quote_risk_report_pairs_markouts(tmp_path):
+    """决策与 markouts 配对后可计算 intercepted/allow 组的 markout 统计。
+
+    配对方向：markout → 决策（每条 markout 归最近 fill_ts 前的决策）。
+    """
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    # Two decisions at t=1000 (allow) and t=2000 (widen, intercepted)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("widen", "allow", 0.01, 0.0, "flow=0.70", 0.70),
+        ts=2000.0)
+
+    # Markouts: fill_ts determines which decision they pair to.
+    # fill_ts=1001 pairs to decision ts=1000 (allow).
+    # fill_ts=2001 pairs to decision ts=2000 (intercepted).
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO markouts (ts, fill_ts, cid, market, horizon, markout) "
+            "VALUES (?,?,?,?,?,?)",
+            (1031.0, 1001.0, "c", "M", 30.0, -0.02))
+        store._conn.execute(
+            "INSERT INTO markouts (ts, fill_ts, cid, market, horizon, markout) "
+            "VALUES (?,?,?,?,?,?)",
+            (2050.0, 2001.0, "c", "M", 30.0, -0.04))
+        # Also a 300s markout only after the intercepted fill
+        store._conn.execute(
+            "INSERT INTO markouts (ts, fill_ts, cid, market, horizon, markout) "
+            "VALUES (?,?,?,?,?,?)",
+            (2301.0, 2001.0, "c", "M", 300.0, -0.08))
+        store._conn.commit()
+
+    report = store.quote_risk_report(since_ts=500.0, until_ts=3000.0)
+    store.close()
+
+    ms30 = report["markout_30s"]
+    assert ms30["intercepted_paired_samples"] == 1
+    assert ms30["allow_paired_samples"] == 1
+    assert ms30["intercepted_avg_cents"] == -4.0
+    assert ms30["allow_avg_cents"] == -2.0
+    assert ms30["intercepted_neg_hit_rate"] == 1.0  # both negative
+    assert ms30["allow_neg_rate"] == 1.0
+
+    ms300 = report["markout_300s"]
+    assert ms300["intercepted_paired_samples"] == 1
+    assert ms300["allow_paired_samples"] == 0
+
+
+def test_quote_risk_report_single_markout_not_double_counted(tmp_path):
+    """一条 markout 只归入一条决策，不会被多条决策同时统计。
+
+    最小复现：t=1000 决策=allow，t=1010 决策=pull。
+    只有一条 fill_ts=1005 的 markout（介于两者之间）。
+    旧代码会同时计入 allow 和 intercepted；修复后只计入 allow
+    （fill_ts=1005 最近的 ≤ fill_ts 决策是 t=1000）。
+    """
+    from pmbot.risk import QuoteRiskDecision
+
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("allow", "allow", 0.0, 0.0, "no_signal", 0.0),
+        ts=1000.0)
+    store.record_quote_risk_decision(
+        "c", "shadow",
+        QuoteRiskDecision("pull", "allow", 0.0, 0.0, "flow=0.90", 0.90),
+        ts=1010.0)
+
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO markouts (ts, fill_ts, cid, market, horizon, markout) "
+            "VALUES (?,?,?,?,?,?)",
+            (1030.0, 1005.0, "c", "M", 30.0, -0.02))
+        store._conn.commit()
+
+    report = store.quote_risk_report()
+    store.close()
+
+    ms30 = report["markout_30s"]
+    # Only the allow decision should capture this markout
+    assert ms30["allow_paired_samples"] == 1
+    assert ms30["intercepted_paired_samples"] == 0
+    assert ms30["allow_avg_cents"] == -2.0

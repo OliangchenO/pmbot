@@ -78,7 +78,10 @@ def test_market_themes_includes_event_id():
 
 def test_markout_tracker_market_avg():
     mt = MarkoutTracker(CFG)
-    mt._samples["cid1"] = [(time.time(), 300.0, -0.02), (time.time(), 300.0, -0.01)]
+    mt._samples["cid1"] = [
+        (time.time(), 300.0, -0.02, "yes_token"),
+        (time.time(), 300.0, -0.01, "no_token"),
+    ]
     avg = mt.market_avg("cid1")
     assert avg is not None
     assert avg < 0

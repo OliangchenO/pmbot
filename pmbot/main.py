@@ -1366,6 +1366,56 @@ class Bot:
         return [q for q in desired
                 if q.token_id == recovery_token or self.guards.allow_side(q.token_id, now)]
 
+    def _apply_quote_risk_decision(
+        self,
+        desired: list[strategy.Quote],
+        risk_decision,
+        market: gamma.Market,
+    ) -> list[strategy.Quote]:
+        """Apply a QuoteRiskDecision to desired quotes in active mode.
+
+        - ``pull``: removes the quote from the dangerous side entirely.
+        - ``widen``: widens the dangerous side's bid by ``yes_widen``/``no_widen``
+          price units (lowers the bid price).
+        - ``allow``: leaves the quote unchanged.
+        """
+        from .risk import QuoteRiskDecision
+        rd: QuoteRiskDecision = risk_decision
+        out: list[strategy.Quote] = []
+        for q in desired:
+            if q.token_id == market.yes_token:
+                if rd.yes_action == "pull":
+                    log.warning(
+                        "P0 逆向选择防护：撤下“%s”的 YES 侧报价 score=%.2f (%s)",
+                        market.question[:45], rd.score, rd.reason)
+                    continue
+                if rd.yes_action == "widen":
+                    new_price = strategy._round_tick(
+                        q.price - max(rd.yes_widen, market.tick / 2), market.tick)
+                    log.info(
+                        "P0 逆向选择防护：扩大“%s”的 YES 侧报价 %.2fc "
+                        "%.4f→%.4f", market.question[:40],
+                        rd.yes_widen * 100, q.price, new_price)
+                    out.append(strategy.Quote(q.token_id, new_price, q.size))
+                    continue
+            elif q.token_id == market.no_token:
+                if rd.no_action == "pull":
+                    log.warning(
+                        "P0 逆向选择防护：撤下“%s”的 NO 侧报价 score=%.2f (%s)",
+                        market.question[:45], rd.score, rd.reason)
+                    continue
+                if rd.no_action == "widen":
+                    new_price = strategy._round_tick(
+                        q.price - max(rd.no_widen, market.tick / 2), market.tick)
+                    log.info(
+                        "P0 逆向选择防护：扩大“%s”的 NO 侧报价 %.2fc "
+                        "%.4f→%.4f", market.question[:40],
+                        rd.no_widen * 100, q.price, new_price)
+                    out.append(strategy.Quote(q.token_id, new_price, q.size))
+                    continue
+            out.append(q)
+        return out
+
     def _cooldown_recovery_quotes(self, m: gamma.Market,
                                    desired: list[strategy.Quote],
                                    unpaired: float,
@@ -1696,6 +1746,36 @@ class Bot:
                     self.metrics.record_recovery_event(
                         m.condition_id, "skip", unpaired,
                         reason=reason, recovery_path=recovery_path)
+            # ── P0: quote risk decision — only for normal two-sided quotes ──
+            is_recovery = (needs_recovery
+                           and recovery_path
+                           and recovery_path != "normal")
+            if not is_recovery and desired:
+                markout_avg = self.markouts.market_avg(m.condition_id)
+                highest_horizon = max(self.markouts.horizons) if self.markouts.horizons else 300.0
+                markout_n = len([
+                    s for s in self.markouts._samples.get(m.condition_id, [])
+                    if s[1] == highest_horizon
+                ]) if self.markouts._samples.get(m.condition_id) else 0
+                # Per-side markout for directional danger targeting
+                yes_avg, no_avg, yes_n, no_n = self.markouts.market_avg_by_side(
+                    m.condition_id, m.yes_token, m.no_token)
+                risk_decision = self.guards.quote_risk_decision(
+                    m, now, markout_avg=markout_avg, markout_samples=markout_n,
+                    markout_yes_avg=yes_avg, markout_no_avg=no_avg,
+                    markout_yes_samples=yes_n, markout_no_samples=no_n)
+                # Record the decision for audit regardless of mode
+                if self.metrics is not None:
+                    self.metrics.record_quote_risk_decision(
+                        m.condition_id,
+                        self.guards.quote_risk_mode,
+                        risk_decision,
+                        ts=now,
+                    )
+                # Apply the decision in active mode
+                if self.guards.quote_risk_mode == "active":
+                    desired = self._apply_quote_risk_decision(
+                        desired, risk_decision, m)
             current = self.broker.open_quotes(m)
             if self._can_retain_recovery_quote(m, current, unpaired):
                 final = current

@@ -294,6 +294,14 @@ guards:
   flow_widen_threshold: 0.6
   flow_pull_threshold: 0.85
   flow_widen_max_cents: 2.0
+  # P0 reverse selection pre-guard (quote risk decision engine).
+  #   shadow: record decisions for audit, do NOT change quotes (default / safe)
+  #   active: apply widen/pull per decision to live maker quotes
+  #   off:    skip the decision engine entirely
+  quote_risk_mode: shadow
+  quote_risk_widen_score: 0.60
+  quote_risk_pull_score: 0.85
+  quote_risk_resume_score: 0.45
 
 risk:
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-

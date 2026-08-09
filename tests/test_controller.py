@@ -86,7 +86,7 @@ def _seed_markouts(markouts, markout_cents, n):
     h = max(markouts.horizons)
     now = time.time()
     markouts._samples["cid-test"] = [
-        (now, h, markout_cents / 100.0) for _ in range(n)
+        (now, h, markout_cents / 100.0, "token-test") for _ in range(n)
     ]
 
 
@@ -131,7 +131,7 @@ def test_partial_toxicity_interpolates():
     cfg, _, markouts, ctrl = _make(copy.deepcopy(BASE_CFG))
     _seed_markouts(markouts, markout_cents=-1.5, n=10)  # halfway to toxic
     ctrl.apply(equity=90.0)
-    assert ctrl.toxicity == 0.5
+    assert abs(ctrl.toxicity - 0.5) < 1e-9
     # offset halfway between 0.30 and 0.60.
     assert abs(cfg["quoting"]["offset_frac_of_max_spread"] - 0.45) < 1e-9
 

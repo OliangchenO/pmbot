@@ -57,7 +57,8 @@ class MetricsStore:
         with self._lock:
             for tbl in ("fills", "hedges", "merges", "equity", "markouts",
                         "quotes", "inventory_snapshots", "inventory_events",
-                        "market_rewards", "guard_events", "pause_day_events"):
+                        "market_rewards", "guard_events", "pause_day_events",
+                        "quote_risk_decisions"):
                 self._conn.execute(f"DELETE FROM {tbl} WHERE ts < ?", (ts,))
             self._conn.execute("DELETE FROM uptime WHERE minute_ts < ?",
                                (int(ts) // 60,))
@@ -154,6 +155,13 @@ class MetricsStore:
             CREATE TABLE IF NOT EXISTS net_shadow_scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL NOT NULL, top_n INTEGER NOT NULL, config_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS quote_risk_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, cid TEXT, mode TEXT,
+                yes_action TEXT, no_action TEXT,
+                yes_widen REAL, no_widen REAL,
+                score REAL, reason TEXT
             );
             CREATE TABLE IF NOT EXISTS net_shadow_candidates (
                 scan_id INTEGER NOT NULL, cid TEXT NOT NULL, market TEXT,
@@ -446,6 +454,223 @@ class MetricsStore:
                 (time.time() if ts is None else ts, cid, scope, reason),
             )
             self._conn.commit()
+
+    def record_quote_risk_decision(
+            self, cid: str, mode: str, decision,
+            ts: float | None = None) -> None:
+        """Persist one per-loop adverse-selection decision for audit.
+
+        ``decision`` is a ``QuoteRiskDecision``; SQLite write failures
+        must NEVER abort the quote loop — catch and warn only.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO quote_risk_decisions "
+                    "(ts, cid, mode, yes_action, no_action, yes_widen, "
+                    "no_widen, score, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (time.time() if ts is None else ts,
+                     cid, mode,
+                     decision.yes_action, decision.no_action,
+                     decision.yes_widen, decision.no_widen,
+                     decision.score, decision.reason),
+                )
+                self._conn.commit()
+        except Exception:
+            log.warning("quote_risk_decision 持久化失败（cid=%s）", cid, exc_info=True)
+
+    def quote_risk_report(self, cid: str | None = None,
+                          since_ts: float | None = None,
+                          until_ts: float | None = None) -> dict:
+        """Read-only summary for shadow/active guard effect measurement.
+
+        The minimum viable audit surface per the design spec:
+
+        * intercepted vs allow-group markout at 30s and 300s horizons
+          (paired via the nearest decision → markout sample within 120s).
+        * negative-markout hit rate (what fraction of intercepted decisions
+          had a subsequent negative markout).
+        * false-positive rate (allow-group decisions that coincidentally
+          had a negative markout).
+
+        ``since_ts`` and ``until_ts`` define a UTC timestamp window; without
+        them, the full dataset is used (up to 10 000 decisions).
+        """
+        # Build two parallel clause lists:
+        #  - unqualified (no table alias) for single-table queries
+        #  - qualified with "qrd." for the markout JOIN subqueries.
+        clauses_u, params_u = [], []
+        clauses_q, params_q = [], []
+        if cid:
+            clauses_u.append("cid = ?")
+            clauses_q.append("qrd.cid = ?")
+            params_u.append(cid)
+            params_q.append(cid)
+        if since_ts is not None:
+            clauses_u.append("ts >= ?")
+            clauses_q.append("qrd.ts >= ?")
+            params_u.append(since_ts)
+            params_q.append(since_ts)
+        if until_ts is not None:
+            clauses_u.append("ts < ?")
+            clauses_q.append("qrd.ts < ?")
+            params_u.append(until_ts)
+            params_q.append(until_ts)
+        uwhere = f"WHERE {' AND '.join(clauses_u)}" if clauses_u else "WHERE 1=1"
+        qwhere = f"WHERE {' AND '.join(clauses_q)}" if clauses_q else "WHERE 1=1"
+
+        # ── Action distribution ──
+        dist_rows = self._conn.execute(
+            f"SELECT yes_action, no_action, COUNT(*) FROM quote_risk_decisions "
+            f"{uwhere} GROUP BY yes_action, no_action",
+            params_u,
+        ).fetchall()
+        action_dist: dict[str, int] = {}
+        for ya, na, cnt in dist_rows:
+            action_dist[ya] = action_dist.get(ya, 0) + cnt
+            action_dist[na] = action_dist.get(na, 0) + cnt
+
+        shadow_intercepted = self._conn.execute(
+            f"SELECT COUNT(*) FROM quote_risk_decisions {uwhere} "
+            f"AND mode='shadow' AND (yes_action!='allow' OR no_action!='allow')",
+            params_u,
+        ).fetchone()[0]
+
+        active_intercepted = self._conn.execute(
+            f"SELECT COUNT(*) FROM quote_risk_decisions {uwhere} "
+            f"AND mode='active' AND (yes_action!='allow' OR no_action!='allow')",
+            params_u,
+        ).fetchone()[0]
+
+        avg_score = self._conn.execute(
+            f"SELECT AVG(score) FROM quote_risk_decisions {uwhere}",
+            params_u,
+        ).fetchone()[0]
+
+        avg_score_intercepted = self._conn.execute(
+            f"SELECT AVG(score) FROM quote_risk_decisions {uwhere} "
+            f"AND (yes_action!='allow' OR no_action!='allow')",
+            params_u,
+        ).fetchone()[0]
+
+        # ── Markout-matched validation ──
+        # Correlation is markout → decision (one-to-one).  Each markout row
+        # belongs to the single most recent quote_risk_decision on the same
+        # CID whose ts ≤ m.fill_ts.  This prevents one markout from being
+        # counted by two overlapping decisions.
+        #
+        # Window: the decision must have been issued within
+        # ``horizon + 120 s slack`` before fill_ts.
+        # Build separate WHERE clauses for the markout table itself
+        # (m.cid / m.ts) so they don't collide with qrd columns in the JOIN.
+        m_clauses, m_params = [], []
+        if cid:
+            m_clauses.append("m.cid = ?")
+            m_params.append(cid)
+        if since_ts is not None:
+            m_clauses.append("m.ts >= ?")
+            m_params.append(since_ts)
+        if until_ts is not None:
+            m_clauses.append("m.ts < ?")
+            m_params.append(until_ts)
+        mwhere = f"WHERE {' AND '.join(m_clauses)}" if m_clauses else "WHERE 1=1"
+
+        paired_30 = self._conn.execute(f"""
+            SELECT
+              (qrd.yes_action != 'allow' OR qrd.no_action != 'allow') AS intercepted,
+              m.markout
+            FROM markouts m
+            INNER JOIN quote_risk_decisions qrd ON qrd.cid = m.cid
+             AND qrd.ts = (
+               SELECT MAX(qrd2.ts) FROM quote_risk_decisions qrd2
+               WHERE qrd2.cid = m.cid
+                 AND qrd2.ts <= m.fill_ts
+                 AND qrd2.ts >= m.fill_ts - 150.0
+             )
+            {mwhere}
+              AND m.horizon = 30.0
+              AND EXISTS (
+                SELECT 1 FROM quote_risk_decisions qrd3
+                WHERE qrd3.cid = m.cid
+                  AND qrd3.ts <= m.fill_ts
+                  AND qrd3.ts >= m.fill_ts - 150.0
+              )
+            ORDER BY qrd.ts
+        """, m_params).fetchall()
+
+        paired_300 = self._conn.execute(f"""
+            SELECT
+              (qrd.yes_action != 'allow' OR qrd.no_action != 'allow') AS intercepted,
+              m.markout
+            FROM markouts m
+            INNER JOIN quote_risk_decisions qrd ON qrd.cid = m.cid
+             AND qrd.ts = (
+               SELECT MAX(qrd2.ts) FROM quote_risk_decisions qrd2
+               WHERE qrd2.cid = m.cid
+                 AND qrd2.ts <= m.fill_ts
+                 AND qrd2.ts >= m.fill_ts - 420.0
+             )
+            {mwhere}
+              AND m.horizon >= 300.0
+              AND EXISTS (
+                SELECT 1 FROM quote_risk_decisions qrd3
+                WHERE qrd3.cid = m.cid
+                  AND qrd3.ts <= m.fill_ts
+                  AND qrd3.ts >= m.fill_ts - 420.0
+              )
+            ORDER BY qrd.ts
+        """, m_params).fetchall()
+
+        def _markout_stats(rows: list) -> dict:
+            intercepted_marks = [r[1] for r in rows if r[0]]
+            allow_marks = [r[1] for r in rows if not r[0]]
+            intercepted_neg = [m for m in intercepted_marks if m < 0]
+            allow_neg = [m for m in allow_marks if m < 0]
+            return {
+                "intercepted_avg_cents": round(
+                    sum(intercepted_marks) / len(intercepted_marks) * 100, 2
+                ) if intercepted_marks else None,
+                "allow_avg_cents": round(
+                    sum(allow_marks) / len(allow_marks) * 100, 2
+                ) if allow_marks else None,
+                "intercepted_neg_hit_rate": round(
+                    len(intercepted_neg) / len(intercepted_marks), 4
+                ) if intercepted_marks else None,
+                "allow_neg_rate": round(
+                    len(allow_neg) / len(allow_marks), 4
+                ) if allow_marks else None,
+                "intercepted_paired_samples": len(intercepted_marks),
+                "allow_paired_samples": len(allow_marks),
+            }
+
+        decisions = self._conn.execute(
+            f"SELECT ts, cid, mode, yes_action, no_action, yes_widen, "
+            f"no_widen, score, reason "
+            f"FROM quote_risk_decisions {uwhere} "
+            f"ORDER BY ts DESC LIMIT 200",
+            params_u,
+        ).fetchall()
+
+        return {
+            "shadow_intercepted": shadow_intercepted,
+            "active_intercepted": active_intercepted,
+            "action_distribution": action_dist,
+            "avg_score": round(avg_score, 4) if avg_score is not None else None,
+            "avg_score_intercepted": (round(avg_score_intercepted, 4)
+                                      if avg_score_intercepted is not None else None),
+            "markout_30s": _markout_stats(paired_30),
+            "markout_300s": _markout_stats(paired_300),
+            "decisions": [
+                {
+                    "ts": r[0], "cid": r[1], "mode": r[2],
+                    "yes_action": r[3], "no_action": r[4],
+                    "yes_widen": r[5], "no_widen": r[6],
+                    "score": r[7], "reason": r[8],
+                }
+                for r in decisions
+            ],
+        }
 
     def record_pause_day_event(
             self, event: str, *, reason: str, equity: float,
