@@ -1826,6 +1826,7 @@ class Bot:
                         self.guards.quote_risk_mode,
                         risk_decision,
                         ts=now,
+                        market=m.question,
                     )
                 # Apply the decision in active mode
                 if self.guards.quote_risk_mode == "active":

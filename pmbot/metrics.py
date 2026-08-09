@@ -168,6 +168,7 @@ class MetricsStore:
             CREATE TABLE IF NOT EXISTS quote_risk_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, cid TEXT, mode TEXT,
+                market TEXT,
                 yes_action TEXT, no_action TEXT,
                 yes_widen REAL, no_widen REAL,
                 score REAL, reason TEXT
@@ -186,6 +187,9 @@ class MetricsStore:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
             self._conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
+        qrd_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(quote_risk_decisions)")}
+        if "market" not in qrd_cols:
+            self._conn.execute("ALTER TABLE quote_risk_decisions ADD COLUMN market TEXT DEFAULT ''")
         rec_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(recovery_events)")}
         if "quote_price" not in rec_cols:
             self._conn.execute("ALTER TABLE recovery_events ADD COLUMN quote_price REAL")
@@ -466,7 +470,7 @@ class MetricsStore:
 
     def record_quote_risk_decision(
             self, cid: str, mode: str, decision,
-            ts: float | None = None) -> None:
+            ts: float | None = None, market: str = "") -> None:
         """Persist one per-loop adverse-selection decision for audit.
 
         ``decision`` is a ``QuoteRiskDecision``; SQLite write failures
@@ -476,11 +480,11 @@ class MetricsStore:
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO quote_risk_decisions "
-                    "(ts, cid, mode, yes_action, no_action, yes_widen, "
+                    "(ts, cid, mode, market, yes_action, no_action, yes_widen, "
                     "no_widen, score, reason) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (time.time() if ts is None else ts,
-                     cid, mode,
+                     cid, mode, market,
                      decision.yes_action, decision.no_action,
                      decision.yes_widen, decision.no_widen,
                      decision.score, decision.reason),
