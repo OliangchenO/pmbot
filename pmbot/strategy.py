@@ -90,9 +90,14 @@ def compute_net_shadow_score(
 ) -> tuple[float, dict[str, object]]:
     """Calculate P2.1's observational expected net reward per hour.
 
+    When closed-cycle (complete) market outcomes are available they replace the
+    component decomposition — the actual net per hour is a single, directly
+    measured number that already includes markout, recovery, and fee costs.
+    Each missing or thin market-level measurement falls back to an explicitly
+    configured conservative prior and records why.
+
     The return value is deliberately independent from quote generation and
-    scanner ranking.  Each missing or thin market-level measurement falls back
-    to an explicitly configured conservative prior and records why.
+    scanner ranking.
     """
     shadow = (cfg.get("scanner") or {}).get("net_shadow") or {}
 
@@ -107,6 +112,36 @@ def compute_net_shadow_score(
         prior = float(shadow.get(prior_key, default))
         return prior, {"value": prior, "samples": samples, "source": "prior"}
 
+    # ── closed-cycle (complete outcome) branch ──
+    closed_net = market_inputs.get("closed_cycle_net_per_hour")
+    closed_samples = int(market_inputs.get("closed_cycle_samples", 0) or 0)
+    min_closed = int(shadow.get("min_closed_samples", 3) or 3)
+
+    if closed_net is not None and closed_samples >= min_closed:
+        audit: dict[str, object] = {
+            "closed_cycle_net_per_hour": {
+                "value": float(closed_net), "samples": closed_samples,
+                "source": "market",
+            },
+            "insufficient_sample": False,
+        }
+        return float(closed_net), audit
+
+    # ── component-decomposition branch (legacy / insufficient outcomes) ──
+    if closed_net is not None and closed_samples > 0:
+        closed_audit: dict[str, object] = {
+            "closed_cycle_net_per_hour": {
+                "value": float(closed_net), "samples": closed_samples,
+                "source": "market",
+            },
+        }
+    else:
+        closed_audit = {
+            "closed_cycle_net_per_hour": {
+                "value": None, "samples": 0, "source": "missing",
+            },
+        }
+
     realization, reward = choose("reward_realization", "reward_samples",
                                  "min_reward_samples", "reward_realization_prior", 0.5)
     uptime_ratio, uptime = choose("uptime_ratio", "uptime_samples",
@@ -119,7 +154,8 @@ def compute_net_shadow_score(
     fee_samples = int(market_inputs.get("taker_fee_samples", 0) or 0)
     fee_audit = {"value": fee, "samples": fee_samples,
                  "source": "market" if fee_samples else "missing"}
-    audit: dict[str, object] = {
+    audit = {
+        **closed_audit,
         "reward_realization": reward,
         "uptime": uptime,
         "markout_cost_per_hour": markout,

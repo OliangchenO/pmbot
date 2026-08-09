@@ -980,3 +980,97 @@ def test_quote_risk_report_single_markout_not_double_counted(tmp_path):
     assert ms30["allow_paired_samples"] == 1
     assert ms30["intercepted_paired_samples"] == 0
     assert ms30["allow_avg_cents"] == -2.0
+
+
+def test_outcome_report_separates_realized_paired_unpaired_and_incomplete(tmp_path):
+    """Completeness summary must count each state and expose missing reasons."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+
+    # Realized: balanced buy + merge
+    store.record_fill({"ts": ts, "cid": "realized", "market": "R", "side": "YES",
+                       "token": "ry", "price": 0.46, "size": 10})
+    store.record_fill({"ts": ts, "cid": "realized", "market": "R", "side": "NO",
+                       "token": "rn", "price": 0.52, "size": 10})
+    store.record_merge("realized", 10, ts=ts)
+    # Incomplete: unpaired no mid
+    store.record_fill({"ts": ts, "cid": "incomplete", "market": "I", "side": "YES",
+                       "token": "iy", "price": 0.60, "size": 15})
+
+    report = store.outcome_report("2026-08-01")
+    store.close()
+
+    assert report["realized_count"] == 1
+    assert report["incomplete_count"] == 1
+    assert report["complete_ratio"] == 0.5
+    assert "unpaired_no_persistent_mid" in report["missing_reasons"]
+    assert report["account_reward_total_usd"] == 0.0
+
+
+def test_outcome_report_excludes_account_reward_from_market_net(tmp_path):
+    """Account-level rewards must appear in the report summary but never in a market outcome."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "YES",
+                       "token": "y", "price": 0.50, "size": 10})
+    store.record_fill({"ts": ts, "cid": "m1", "market": "M1", "side": "NO",
+                       "token": "n", "price": 0.50, "size": 10})
+    store.record_merge("m1", 10, ts=ts)
+    store.record_realized_reward("2026-08-01", 5.25)
+
+    report = store.outcome_report("2026-08-01")
+    store.close()
+
+    assert report["account_reward_total_usd"] == 5.25
+    o = report["outcomes"][0]
+    assert o.get("market_reward_usd") is None
+    assert o["net_outcome_usd"] == o["trading_pnl_usd"]
+
+
+def test_outcome_report_ranks_complete_by_net_outcome(tmp_path):
+    """Complete markets are sorted by net_outcome_usd descending for ranking."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+
+    # Market A: pair cost 0.50+0.52=1.02 → loss $0.02
+    store.record_fill({"ts": ts, "cid": "A", "market": "A", "side": "YES",
+                       "token": "ay", "price": 0.50, "size": 10})
+    store.record_fill({"ts": ts, "cid": "A", "market": "A", "side": "NO",
+                       "token": "an", "price": 0.52, "size": 10})
+    store.record_merge("A", 10, ts=ts)
+    # Market B: pair cost 0.40+0.45=0.85 → gain $1.50
+    store.record_fill({"ts": ts, "cid": "B", "market": "B", "side": "YES",
+                       "token": "by", "price": 0.40, "size": 10})
+    store.record_fill({"ts": ts, "cid": "B", "market": "B", "side": "NO",
+                       "token": "bn", "price": 0.45, "size": 10})
+    store.record_merge("B", 10, ts=ts)
+
+    report = store.outcome_report("2026-08-01")
+    store.close()
+
+    assert report["realized_count"] == 2
+    assert [o["cid"] for o in report["outcomes"]] == ["B", "A"]
+
+
+def test_outcome_report_incomplete_not_in_rankings(tmp_path):
+    """Incomplete markets are excluded from net-outcome ranking entirely."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = datetime(2026, 8, 1, 12, tzinfo=timezone.utc).timestamp()
+
+    store.record_fill({"ts": ts, "cid": "inc", "market": "Inc", "side": "YES",
+                       "token": "iy", "price": 0.55, "size": 20})
+    store.record_fill({"ts": ts, "cid": "comp", "market": "Comp", "side": "YES",
+                       "token": "cy", "price": 0.50, "size": 2})
+    store.record_fill({"ts": ts + 1, "cid": "comp", "market": "Comp", "side": "YES",
+                       "token": "cy", "price": 0.52, "size": 2, "exit": 1})
+
+    report = store.outcome_report("2026-08-01")
+    store.close()
+
+    assert report["realized_count"] == 1
+    assert report["incomplete_count"] == 1
+    assert len(report["outcomes"]) == 1
+    assert report["outcomes"][0]["cid"] == "comp"
+    assert len(report["incomplete"]) == 1
+    assert report["incomplete"][0]["cid"] == "inc"

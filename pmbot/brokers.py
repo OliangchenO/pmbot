@@ -555,6 +555,13 @@ class PaperBroker:
             return pos.no_cost / pos.no_shares
         return None
 
+    def position_shares(self, market: Market) -> tuple[float, float]:
+        """Return (yes_shares, no_shares) for the market, or (0, 0)."""
+        pos = self.state.positions.get(market.condition_id)
+        if pos is None:
+            return (0.0, 0.0)
+        return (pos.yes_shares, pos.no_shares)
+
     def held_markets(self) -> list[Market]:
         return [
             self._markets[cid]
@@ -1587,6 +1594,11 @@ class LiveBroker:
         with self._state_lock:
             cids = set(self._positions) | set(self._pending_hedges)
         return [self._markets[cid] for cid in cids if cid in self._markets]
+
+    def position_shares(self, market: Market) -> tuple[float, float]:
+        """Return (yes_shares, no_shares) for the market, or (0, 0)."""
+        d = LiveBroker._effective_position(self, market)
+        return (float(d.get("yes", 0.0)), float(d.get("no", 0.0)))
 
     def last_fill_ts(self, cid: str) -> float | None:
         """Timestamp of the most recent fill for this market, if any.
