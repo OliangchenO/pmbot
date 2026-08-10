@@ -10,13 +10,45 @@ are reduce-only passive exits on excess inventory — see main._update_exit_sell
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 from .books import Book
 from .gamma import Market
 
+log = logging.getLogger(__name__)
+
 SINGLE_SIDED_DIVISOR = 3.0  # Polymarket's `c` scaling factor
+
+
+def _short(market) -> str:
+    """返回市场名称的前 50 个字符，用于日志。"""
+    return getattr(market, "question", str(market))[:50]
+
+
+def _price_reason(yes_bid, mid, band, skew_frac):
+    """yes_bid 被拒绝的原因。"""
+    reasons = []
+    if yes_bid <= 0:
+        reasons.append(f"yes_bid={yes_bid:.3f}≤0")
+    if skew_frac >= 1.0:
+        reasons.append(f"skew={skew_frac:.2f}≥1")
+    if (mid - yes_bid) > band:
+        reasons.append(f"dist={mid - yes_bid:.4f}>band={band:.4f}")
+    return ",".join(reasons) if reasons else "ok"
+
+
+def _no_price_reason(no_bid, no_mid, band, skew_frac):
+    """no_bid 被拒绝的原因。"""
+    reasons = []
+    if no_bid <= 0:
+        reasons.append(f"no_bid={no_bid:.3f}≤0")
+    if skew_frac <= -1.0:
+        reasons.append(f"skew={skew_frac:.2f}≤-1")
+    if (no_mid - no_bid) > band:
+        reasons.append(f"dist={no_mid - no_bid:.4f}>band={band:.4f}")
+    return ",".join(reasons) if reasons else "ok"
 
 
 @dataclass
@@ -255,15 +287,24 @@ def compute_quotes(
     q = cfg["quoting"]
     mid = yes_book.mid
     if mid is None:
+        log.warning("报价跳过 %s: yes_book mid 为 None (bid=%s ask=%s)",
+                    _short(market), yes_book.best_bid, yes_book.best_ask)
         return []
 
     band = market.max_spread_cents / 100.0
     max_spread_mult = float(q.get("max_book_spread_mult_of_band", 3.0))
     if not book_is_quotable(yes_book, band, max_spread_mult):
+        bb, ba = yes_book.best_bid, yes_book.best_ask
+        spread = ba - bb if (bb is not None and ba is not None) else None
+        log.warning("报价跳过 %s: yes_book 不可报价 bid=%.3f ask=%.3f spread=%s band=%.3f",
+                    _short(market), bb or 0, ba or 0,
+                    f"{spread:.3f}" if spread is not None else "None", band)
         return []
 
     lo, hi = cfg["scanner"]["mid_range"]
     if not (lo <= mid <= hi):
+        log.warning("报价跳过 %s: mid %.3f 超出范围 [%.2f, %.2f]",
+                    _short(market), mid, lo, hi)
         return []
 
     yes_microprice = microprice(yes_book)
@@ -295,6 +336,8 @@ def compute_quotes(
     # under a held market's min size).
     max_cap = q["max_capital_per_market"] * scale
     if quote_min_size > max_cap + 1e-9:
+        log.warning("报价跳过 %s: 最小份数 %.0f > 资金上限 %.0f",
+                    _short(market), quote_min_size, max_cap)
         return []
     size = min(size, float(int(max_cap)))
     size = max(size, float(math.ceil(quote_min_size)))
@@ -334,6 +377,13 @@ def compute_quotes(
         quotes.append(Quote(market.yes_token, yes_bid, size))
     if 0 < no_bid and skew_frac > -1.0 and (no_mid - no_bid) <= band + 1e-9:
         quotes.append(Quote(market.no_token, no_bid, size))
+    if not quotes:
+        log.warning("报价跳过 %s: 双边价格筛选均失败 yes=%.3f(%s) no=%.3f(%s) "
+                    "skew=%.1f band=%.3f mid=%.3f offset=%.4f fade_yes=%.4f fade_no=%.4f",
+                    _short(market),
+                    yes_bid, _price_reason(yes_bid, mid, band, skew_frac),
+                    no_bid, _no_price_reason(no_bid, no_mid, band, skew_frac),
+                    skew_frac, band, mid, offset, fade_yes, fade_no)
     return quotes
 
 
