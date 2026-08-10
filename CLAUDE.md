@@ -84,3 +84,40 @@ python scripts/check_logs.py -m 10   # 检查最近 10 分钟日志
 - 时间戳：内部全部 Unix epoch，显示用北京时间（BEIJING_TZ = UTC+8）
 - 日志：中文 + 英文混合，关键业务日志用中文
 - Python 3.12+，asyncio 异步架构
+
+## P1 Recovery Episode 模块（2026-08-09 已实现）
+
+- **`pmbot/recovery.py`** — 纯函数恢复决策器：`choose_recovery_action()` 比较 `buy_complement` vs `sell_original` vs `manual_hold` vs `wait`，在损失预算内选择最优路径
+- **`pmbot/metrics.py`** — `recovery_episodes` 表 + 5 个生命周期方法（open/update/close/get_open/list）+ `replay_old_recovery_events()` 回放
+- **`pmbot/main.py`** — `_manage_market_inventory()` 集成 episode 控制器，支持 `off`/`shadow`/`active` 三种模式
+- **`config.debug.yaml`** — `risk.recovery_episode_mode: active`（默认），`recovery_max_loss_usd_per_market: 3.0`，`recovery_escalate_after_secs: 180`，`recovery_terminal_after_secs: 900`
+- **CLI** — `python -m pmbot.main recovery-episodes`（列出所有 episode），`python -m pmbot.main recovery-replay`（旧事件回放对比），`python -m pmbot.main recovery-history <cid>`（单市场时间线）
+
+### 运行测试
+```bash
+python -m pytest tests/test_recovery.py tests/test_main.py tests/test_metrics.py -v
+```
+共 149 个测试通过（1 个预存在的 Rich 表格格式化测试失败，与此功能无关）
+
+### 模式说明
+- `off` — 完全走旧代码路径，向后兼容
+- `shadow` — 调用 `choose_recovery_action()` 并记录日志/数据库，但不执行 broker 调用（仅用于调试对比）
+- `active` — 实际执行 taker_buy 恢复操作（默认，生产模式）
+
+## P1.3.2 累计损失禁入（2026-08-09 已实现）
+
+当某市场所有 recovery episode 的 `actual_loss_usd` 累计超过 `risk.recovery_loss_ban_threshold_usd`（默认 $15），
+bot 自动将该市场加入永久禁入列表（持久化到 `data/banned_markets.json`，重启后仍有效）。
+
+- **触发时机**：`RECOVERY_EXECUTED` 完成后（active 模式实际执行了 taker_buy）
+- **计算逻辑**：`MetricsStore.recovery_cumulative_loss(cid)` → `SUM(actual_loss_usd)` across all episodes (open + closed)
+- **持久化**：`_banned_cids` → `_persist_banned_cids()` → `banned_markets.json`
+- **排除链**：`_rescan()` 中 `exclude |= self._banned_cids` 确保禁入市场不会被重新扫入
+- **配置 key**：`risk.recovery_loss_ban_threshold_usd`（config.yaml 和 config.debug.yaml 均已添加）
+- **日志**：触发时输出 `RECOVERY_LOSS_BAN` 警告，包含市场名、cid、累计损失、阈值
+
+```bash
+python -m pytest tests/test_metrics.py::test_recovery_cumulative_loss_sums_across_episodes \
+  tests/test_metrics.py::test_recovery_cumulative_loss_zero_for_unknown_cid \
+  tests/test_metrics.py::test_recovery_cumulative_loss_ignores_null_actual -v
+```

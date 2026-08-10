@@ -22,8 +22,8 @@ import queue
 import time
 try:
     import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore[no-redef]
+except ImportError:  # Python < 3.11
+    import tomli as tomllib
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
@@ -39,6 +39,7 @@ from .books import Book, BookTracker
 from .brokers import LiveBroker, PaperBroker
 from .controller import AdaptiveController
 from .metrics import MetricsStore
+from .recovery import choose_recovery_action, RecoveryQuote
 from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
 console = Console()
@@ -196,6 +197,42 @@ def cmd_scan(cfg: dict) -> None:
             f"{m.density:.4f}", capture_str, f"{m.score:.4f}",
         )
     console.print(table)
+
+def _compute_sell_realized_loss(
+        broker, m: gamma.Market, cid: str,
+        basis: float | None, since_ts: float,
+) -> float:
+    """Sum actual loss from exit fills for *cid* that occurred >= *since_ts*.
+
+    Loss formula matches choose_recovery_action's sell_original path:
+        loss_per_share = max(0, basis - fill_price + fee_per_share)
+
+    The reservation uses a conservative taker-fee assumption for budgeting;
+    actual fills are typically maker (no fee).  We charge a fee only when
+    the broker recorded the fill as taker, so the closed-episode total
+    reflects real execution rather than a worst-case estimate.
+    """
+    if basis is None:
+        return 0.0
+    fills = getattr(broker, "fills_log", [])
+    total = 0.0
+    for entry in fills:
+        if (entry.get("cid") != cid
+                or not entry.get("exit")
+                or entry.get("ts", 0.0) < since_ts):
+            continue
+        price = entry.get("price")
+        size = entry.get("size")
+        if price is None or size is None:
+            continue
+        price_f = float(price)
+        size_f = float(size)
+        fee = 0.0
+        if entry.get("taker"):
+            fee = m.fee_bps / 10_000.0 * (price_f * (1.0 - price_f)) ** m.fee_exponent
+        loss_per_share = max(0.0, basis - price_f + fee)
+        total += loss_per_share * size_f
+    return total
 
 
 def _metrics_store(cfg: dict, *, read_only: bool = False) -> MetricsStore:
@@ -658,6 +695,138 @@ def cmd_recovery_history(cfg: dict, cid: str) -> None:
     console.print(
         "[dim]这是本地审计时间线：quote_placed 是挂单，不是成交；"
         "forced_hedge_filled 是本地成交结果，仍应结合后续库存快照确认配平。[/]"
+    )
+
+
+def cmd_recovery_episodes(cfg: dict, limit: int = 50) -> None:
+    """Read-only listing of all recovery episodes with duration/peak/path."""
+    store = _metrics_store(cfg)
+    episodes = store.list_recovery_episodes(limit=limit)
+    store.close()
+
+    if not episodes:
+        console.print("[dim]暂无 recovery episode 记录。[/]")
+        return
+
+    table = Table(title="Recovery Episodes")
+    for col in ("CID", "开始时间（北京）", "持续/秒", "峰值敞口/$",
+                "阶段", "路径", "预期损失/$", "状态"):
+        table.add_column(col)
+
+    for ep in episodes:
+        started = datetime.fromtimestamp(ep["started_ts"], BEIJING_TZ).strftime(
+            "%m-%d %H:%M:%S")
+        duration = ("—" if ep["duration_secs"] is None
+                    else f"{ep['duration_secs']:.0f}")
+        peak = f"{ep['peak_abs_exposure_usd']:.2f}"
+        path = ep.get("chosen_path") or "—"
+        loss = ("—" if ep.get("expected_loss_usd") is None
+                else f"{ep['expected_loss_usd']:.4f}")
+        status = "closed" if ep["is_closed"] else "open"
+        table.add_row(
+            ep["cid"][:24], started, duration, peak,
+            ep["stage"], path, loss, status,
+        )
+    console.print(table)
+
+
+def cmd_recovery_replay(cfg: dict) -> None:
+    """Replay old recovery_events into per-CID summaries; compare old vs new."""
+    store = _metrics_store(cfg)
+
+    # Build market hints from the current config so the replay can
+    # re-run choose_recovery_action() with real fee parameters and
+    # token IDs.
+    market_hints: dict = {}
+    try:
+        markets = gamma.scan(cfg)
+        for m in markets:
+            market_hints[m.condition_id] = m
+    except Exception:
+        pass
+
+    max_loss = float(
+        (cfg.get("risk") or {}).get("recovery_max_loss_usd_per_market", 3.0))
+    market_hints["_max_loss_usd"] = max_loss
+
+    replay = store.replay_old_recovery_events(market_hints=market_hints)
+    episode_summary = store.recovery_episode_summary()
+    store.close()
+
+    if not replay:
+        console.print("[dim]暂无历史恢复事件可以回放。[/]")
+        return
+
+    # Episode-level summary (new strategy)
+    console.print(
+        f"[bold]Episode 统计（新策略）[/] "
+        f"总计 {episode_summary['total_episodes']} 个 episode，"
+        f"其中 {episode_summary['open_episodes']} 个进行中，"
+        f"{episode_summary['closed_episodes']} 个已关闭"
+    )
+
+    # Old events folded into per-CID summaries
+    table = Table(title="旧策略恢复事件折叠回放")
+    for col in ("CID", "事件数", "持续/秒", "最大裸仓", "有证据",
+                "已完成", "样本报价", "新策略对比"):
+        table.add_column(col)
+
+    for r in replay:
+        evidence = "否" if r["insufficient_evidence"] else "是"
+        filled = "是" if r["filled"] else "否"
+        sample = ""
+        if r["sample_quotes"]:
+            q = r["sample_quotes"][-1]
+            sample = (f"报{q['proposed_price']:.3f}"
+                      f" @成本{q['cost_basis']:.3f}"
+                      if q.get("cost_basis") is not None
+                      else f"报{q['proposed_price']:.3f}")
+        comp = r.get("comparison")
+        comp_str = ""
+        if comp is not None:
+            if comp.get("status") == "no_market_hints":
+                comp_str = "—"
+            else:
+                comp_str = (
+                    f"{comp.get('path','?')} "
+                    f"loss={comp.get('expected_loss_usd','?'):.4f}"
+                    if comp.get("expected_loss_usd") is not None
+                    else f"{comp.get('path','?')}")
+        table.add_row(
+            r["cid"][:24],
+            str(r["event_count"]),
+            f"{r['duration_secs']:.0f}",
+            f"{r['max_abs_unpaired']:.0f}",
+            evidence,
+            filled,
+            sample,
+            comp_str,
+        )
+    console.print(table)
+
+    # Comparison summary
+    with_comp = sum(1 for r in replay if r.get("comparison") and isinstance(
+        r["comparison"], dict) and "path" in r["comparison"])
+    insufficient = sum(1 for r in replay if r["insufficient_evidence"])
+    filled_old = sum(1 for r in replay if r["filled"])
+    console.print(
+        f"[dim]旧策略回放：{len(replay)} 个唯一 CID，"
+        f"其中 {filled_old} 个有成交记录，"
+        f"{insufficient} 个证据不足，"
+        f"{with_comp} 个可对比。"
+        f"[/]"
+    )
+    if with_comp > 0:
+        console.print(
+            "[dim]「新策略对比」列由 choose_recovery_action 在旧事件"
+            "的双边报价快照上重新运行得出。"
+            "[/]"
+        )
+    console.print(
+        "[dim]说明：旧策略将「等待报价→轮询→成交」编码为独立事件，"
+        "回放将它们折叠为 per-CID episode。"
+        "quote_placed 是挂单（非成交）；forced_hedge_filled 是本地成交结果。"
+        "[/]"
     )
 
 
@@ -2127,6 +2296,48 @@ class Bot:
             self._over_since.pop(cid, None)
             if hasattr(self.broker, "unpaired_since"):
                 self.broker.unpaired_since.pop(cid, None)
+            # Close any open recovery episode — position is flat.
+            # Preserve the accumulated outcome data (chosen_path,
+            # expected_loss_usd, actual_loss_usd) that partial fills
+            # may have written; close_recovery_episode() overwrites
+            # those columns with the passed values, so fetch the
+            # existing row first.
+            if self.metrics and r.get("recovery_episode_mode", "shadow") != "off":
+                existing = self.metrics.get_open_episode(cid)
+                close_actual = existing.get("actual_loss_usd") if existing else None
+                # P1: a sell_original GTD order carries a reserved
+                # expected loss.  When the position goes flat the order
+                # (or a portion of it) has presumably executed.  Compute
+                # actual loss from confirmed exit fills in fills_log
+                # rather than blindly folding the full reservation, so
+                # the closed episode reflects the true realised cost.
+                # Caveat: exit fills older than the episode's started_ts
+                # are intentionally excluded — those belong to a prior
+                # episode.
+                if existing and existing.get("sell_reserved_loss_usd"):
+                    ep_start = (float(existing["started_ts"])
+                                if existing.get("started_ts") is not None
+                                else 0.0)
+                    # Broker cost basis is unavailable when the position
+                    # is already flat (unpaired_cost_basis returns None).
+                    # Recover it from the persisted recovery_events that
+                    # were recorded during the episode — every tick's
+                    # record_recovery_event() includes a cost_basis.
+                    flat_basis = (self.metrics.recovery_event_cost_basis(
+                        cid, ep_start) if self.metrics else None)
+                    realized = _compute_sell_realized_loss(
+                        self.broker, m, cid, flat_basis, ep_start)
+                    prev_actual = (
+                        float(existing["actual_loss_usd"])
+                        if existing.get("actual_loss_usd") is not None
+                        else 0.0)
+                    close_actual = prev_actual + realized
+                self.metrics.close_recovery_episode(
+                    cid=cid, closed_ts=now,
+                    chosen_path=existing.get("chosen_path") if existing else None,
+                    expected_loss_usd=existing.get("expected_loss_usd") if existing else None,
+                    actual_loss_usd=close_actual,
+                    reason="flat")
             await self._broker_call(self.broker.set_exit, m, None)
             return
         exposure = self.broker.net_yes_exposure_usd(m)
@@ -2152,11 +2363,524 @@ class Bot:
             persist_fn = getattr(self.broker, "_persist_unpaired_since", None)
             if persist_fn is not None:
                 persist_fn()
-        if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
-            await self._update_exit_sell(m, unpaired)
+        # The passive maker exit (below) runs before the episode controller.
+        # In active mode the episode controller owns inventory management —
+        # skip the legacy exit so it doesn't bypass the episode loss budget
+        # or place orders the controller didn't decide.
+        # Shadow and off keep the old exit unchanged (P1: shadow broker
+        # calls must match pre-episode behaviour exactly).
+        episode_mode_tmp = r.get("recovery_episode_mode", "shadow")
+        if episode_mode_tmp != "active":
+            if not urgent and abs(exposure) >= threshold and passive and cid in quoted:
+                await self._update_exit_sell(m, unpaired)
         if now - self._last_flatten.get(cid, 0.0) < FLATTEN_RETRY_SECONDS:
             return
         self._last_flatten[cid] = now
+
+        # ── P1 recovery episode controller ──
+        episode_mode = r.get("recovery_episode_mode", "shadow")
+        _VALID_MODES = frozenset({"off", "shadow", "active"})
+        if episode_mode not in _VALID_MODES:
+            log.warning(
+                "RECOVERY_EPISODE_BAD_MODE mode=%r 说明=config 中 recovery_"
+                "episode_mode 值无效，已回退为 shadow。合法值：off/shadow/active",
+                episode_mode,
+            )
+            episode_mode = "shadow"
+        if episode_mode == "off":  # P0-2: only exact "off" skips new logic
+            pass
+        else:
+            held_yes = unpaired > 0
+            complement_token = m.no_token if held_yes else m.yes_token
+            original_token = m.yes_token if held_yes else m.no_token
+            complement_book = self.tracker.books.get(complement_token)
+            original_book = self.tracker.books.get(original_token)
+            complement_ask = complement_book.best_ask if complement_book else None
+            original_bid = original_book.best_bid if original_book else None
+            basis_fn = getattr(self.broker, "unpaired_cost_basis", None)
+            basis = basis_fn(m) if basis_fn else None
+            elapsed = now - start
+            max_loss = float(r.get("recovery_max_loss_usd_per_market", 3.0))
+            escalate_secs = float(r.get("recovery_escalate_after_secs", 180))
+            terminal_secs = float(r.get("recovery_terminal_after_secs", 900))
+
+            # P1: deduct accumulated actual_loss from partial fills and
+            # reserved sell_original loss so the total loss across all
+            # actions within a single episode stays within the per-market
+            # cap.
+            accumulated_loss: float = 0.0
+            if self.metrics:
+                existing = self.metrics.get_open_episode(cid)
+                if existing:
+                    if existing.get("actual_loss_usd") is not None:
+                        accumulated_loss += float(existing["actual_loss_usd"])
+                    if existing.get("sell_reserved_loss_usd") is not None:
+                        accumulated_loss += float(existing["sell_reserved_loss_usd"])
+            remaining_budget = max_loss - accumulated_loss
+
+            # P1-5: near-resolution override.  When a market is inside the
+            # exit window, being locked into resolution (a binary outcome)
+            # is worse than a moderate exit loss.  Skip the per-episode
+            # loss-budget gate so the cheapest available path is always
+            # taken, letting forced-hedge / sell-original proceed.
+            near_end = (h is not None and h <= exit_h) or urgent
+
+            if near_end and remaining_budget <= 0.0:
+                log.warning(
+                    "RECOVERY_NEAR_END_OVERRIDE market='%s' cid=%s "
+                    "h_to_end=%.1f exit_h=%.1f urgent=%s "
+                    "max_loss=%.4f accumulated=%.4f remaining=%.4f "
+                    "说明=市场临近结算，跳过 per-episode 损失预算限制，"
+                    "执行最便宜的恢复路径",
+                    m.question[:45], cid,
+                    h if h is not None else float("inf"), exit_h, urgent,
+                    max_loss, accumulated_loss, remaining_budget,
+                )
+
+            if elapsed >= terminal_secs:
+                stage = "terminal"
+            elif elapsed >= escalate_secs:
+                stage = "escalated"
+            else:
+                stage = "passive"
+
+            if remaining_budget <= 0.0 and not near_end:
+                log.warning(
+                    "RECOVERY_BUDGET_EXHAUSTED market='%s' cid=%s "
+                    "max_loss=%.4f accumulated=%.4f remaining=%.4f "
+                    "说明=本 episode 损失预算已耗尽，跳过恢复决策",
+                    m.question[:45], cid, max_loss, accumulated_loss,
+                    remaining_budget,
+                )
+                if self.metrics:
+                    self.metrics.update_recovery_episode(
+                        cid=cid,
+                        peak_abs_exposure_usd=abs(exposure), stage=stage,
+                        # P2: budget_exhausted is a state, not an executed
+                        # action — don't overwrite a previously recorded
+                        # executed path (buy_complement or sell_original).
+                    )
+                    self.metrics.record_recovery_event(
+                        cid, "budget_exhausted", unpaired,
+                        recovery_path="budget_exhausted", cost_basis=basis,
+                        complement_ask=complement_ask,
+                        original_bid=original_bid,
+                        mkt_fee_bps=m.fee_bps,
+                        mkt_fee_exponent=m.fee_exponent,
+                    )
+                # Fall through to old forced-hedge path — do NOT return.
+                # Skip the rest of the episode controller so
+                # choose_recovery_action is not called with a stale
+                # budget.
+                #
+                # However, the old forced-hedge path can still submit a
+                # taker FAK, which would bypass the episode loss cap.
+                # For active mode, cancel the exit and return — do NOT
+                # re-issue with an unvalidated price that hasn't been
+                # through the episode budget (P1).
+                # For shadow/off, fall through to the old forced-hedge
+                # path unchanged.
+                if episode_mode == "active":
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            cid, "budget_exhausted_no_hedge", unpaired,
+                            recovery_path="budget_exhausted",
+                            cost_basis=basis,
+                            complement_ask=complement_ask,
+                            original_bid=original_bid,
+                            mkt_fee_bps=m.fee_bps,
+                            mkt_fee_exponent=m.fee_exponent,
+                        )
+                    # Cancel exit; do NOT re-issue at an unvalidated price.
+                    await self._broker_call(self.broker.set_exit, m, None)
+                    return
+                # shadow/off: fall through to old forced-hedge path
+            else:
+                quote = choose_recovery_action(
+                    market=m, unpaired=unpaired, basis=basis,
+                    complement_ask=complement_ask, original_bid=original_bid,
+                    elapsed_secs=elapsed, max_loss_usd=remaining_budget,
+                    force_execute=near_end,
+                )
+
+                if self.metrics:
+                    self.metrics.open_recovery_episode(
+                        cid=cid, started_ts=start, initial_unpaired=unpaired,
+                        peak_abs_exposure_usd=abs(exposure), stage=stage,
+                    )
+                    self.metrics.update_recovery_episode(
+                        cid=cid, peak_abs_exposure_usd=abs(exposure), stage=stage,
+                        # P2: do NOT write chosen_path here — this is a poll
+                        # decision (not an executed action).  chosen_path is
+                        # only written in the sell_original / buy_complement
+                        # execution blocks below, so the episode's final
+                        # recorded path reflects what was actually done.
+                        expected_loss_usd=quote.expected_loss_usd,
+                    )
+
+                log.info(
+                    "RECOVERY_EPISODE_DECISION market='%s' mode=%s path=%s stage=%s "
+                    "unpaired=%.0f elapsed=%.0fs expected_loss_usd=%s reason=%s "
+                    "near_end=%s "
+                    "说明=P1恢复策略决策",
+                    m.question[:45], episode_mode, quote.path, stage,
+                    unpaired, elapsed,
+                    "unknown" if quote.expected_loss_usd is None
+                    else f"{quote.expected_loss_usd:.4f}",
+                    quote.reason or "n/a",
+                    "yes" if near_end else "no",
+                )
+
+                # P1-2: in passive stage, the episode controller only
+                # records — don't execute until escalated or terminal.
+                # P1-4: on manual_hold, cancel exit quotes and return to
+                # prevent the quote loop from issuing new recovery-maker
+                # orders; the old forced-hedge path below controls the
+                # complement-side exit instead.
+                if quote.path == "manual_hold":
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            cid, "manual_hold", unpaired, reason=quote.reason,
+                            recovery_path="manual_hold", cost_basis=basis,
+                            complement_ask=complement_ask,
+                            original_bid=original_bid,
+                            mkt_fee_bps=m.fee_bps,
+                            mkt_fee_exponent=m.fee_exponent,
+                        )
+                    # P1-1: In active mode only, cancel the exit quote.
+                    # In shadow/off modes, do NOT touch broker state — the
+                    # old forced-hedge path below handles exits unchanged.
+                    if episode_mode == "active":
+                        await self._broker_call(self.broker.set_exit, m, None)
+                        # Return — do NOT fall through to old forced-hedge
+                        # path.  manual_hold means all automatic paths are
+                        # exhausted; letting the old path run would re-issue
+                        # exit quotes via _update_exit_sell(), undoing the
+                        # cancellation and re-entering a rejected path.
+                        return
+                    # shadow/off: fall through to old forced-hedge path
+
+                elif quote.path == "wait":
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            cid, "wait", unpaired, reason=quote.reason,
+                            recovery_path="wait", cost_basis=basis,
+                            complement_ask=complement_ask,
+                            original_bid=original_bid,
+                            mkt_fee_bps=m.fee_bps,
+                            mkt_fee_exponent=m.fee_exponent,
+                        )
+                    # P1-1: fall through to old forced-hedge path
+
+                elif episode_mode == "shadow":
+                    # P1-1: shadow records the decision but does not return
+                    # — the old forced-hedge path below still runs, so
+                    # broker behaviour is unchanged from "off".
+                    if self.metrics:
+                        self.metrics.record_recovery_event(
+                            cid, quote.path, unpaired,
+                            recovery_path=quote.path,
+                            proposed_price=quote.price,
+                            cost_basis=basis,
+                            expected_pair_pnl=(
+                                -(quote.expected_loss_usd or 0.0) / quote.size
+                                if quote.size > 0 else None),
+                            complement_ask=complement_ask,
+                            original_bid=original_bid,
+                            mkt_fee_bps=m.fee_bps,
+                            mkt_fee_exponent=m.fee_exponent,
+                        )
+                    # P1-1: fall through to old forced-hedge path
+
+                elif episode_mode == "active":
+                    # P0-2 guard: only exact "active" reaches this branch.
+
+                    # P1-2: in passive stage, only record — wait for
+                    # escalation before taking action.
+                    if stage == "passive":
+                        if self.metrics:
+                            self.metrics.record_recovery_event(
+                                cid, f"recovery_waiting_{stage}", unpaired,
+                                recovery_path=quote.path, proposed_price=quote.price,
+                                cost_basis=basis,
+                            )
+                        # P1-2: return — do NOT fall through to old forced-hedge
+                        # path. In passive stage the episode controller is
+                        # responsible for managing inventory; allowing the old
+                        # path to run would bypass the episode's escalate
+                        # waiting period (e.g. old flatten_after_secs=90s may
+                        # FAK before episode escalates at 180s).
+                        return
+
+                    else:
+                        # ── escalated or terminal: execute the chosen path ──
+                        if quote.price is None or quote.token_id is None:
+                            log.error(
+                                "RECOVERY_EPISODE_BAD_QUOTE market='%s' path=%s "
+                                "price=%s token=%s 说明=有效路径但报价不完整",
+                                m.question[:45], quote.path, quote.price,
+                                quote.token_id,
+                            )
+                            # fall through to old forced-hedge path
+                        else:
+                            price: float = quote.price
+                            token_id: str = quote.token_id
+                            size: float = quote.size
+
+                            if quote.path == "sell_original":
+                                # P0-1: place a reduce-only limit SELL (GTD),
+                                # not taker_buy.  The matching engine fills
+                                # against the bid.  Do NOT record as "filled"
+                                # here — the order is resting, not executed.
+                                #
+                                # P1-1: only cancel+replace when the quote has
+                                # changed materially (same diff check as
+                                # _update_exit_sell).  This preserves queue
+                                # position on a resting exchange order book.
+                                cur = self.broker.exit_quote(m)
+                                move = self.cfg["quoting"]["requote_move_cents"]
+                                if (cur is not None and cur.token_id == token_id
+                                        and abs(cur.price - price) * 100 < move
+                                        and abs(cur.size - size) <= 0.1 * size):
+                                    # unchanged — keep the existing resting order
+                                    placed_ok = True
+                                else:
+                                    sell_quote = strategy.Quote(token_id, price, size)
+                                    placed_ok = bool(await self._broker_call(
+                                        self.broker.set_exit, m, sell_quote))
+                                if placed_ok:
+                                    log.warning(
+                                    "RECOVERY_SELL_ORIGINAL_PLACED market='%s' "
+                                    "token=%s size=%.0f price=%.3f "
+                                    "expected_loss_usd=%s stage=%s "
+                                    "说明=已挂 reduce-only GTD 卖单，不记录"
+                                    "为已成交；由 userfeed 后续确认",
+                                    m.question[:45],
+                                    "YES" if token_id == m.yes_token else "NO",
+                                    size, price,
+                                    "unknown"
+                                    if quote.expected_loss_usd is None
+                                    else f"{quote.expected_loss_usd:.4f}",
+                                    stage,
+                                )
+                                else:
+                                    log.warning(
+                                        "RECOVERY_SELL_ORIGINAL_FAILED market='%s' "
+                                        "token=%s size=%.0f price=%.3f "
+                                        "expected_loss_usd=%s stage=%s "
+                                        "说明=退出卖单提交失败，余额不足或竞态（仓位已平）",
+                                        m.question[:45],
+                                        "YES" if token_id == m.yes_token else "NO",
+                                        size, price,
+                                        "unknown"
+                                        if quote.expected_loss_usd is None
+                                        else f"{quote.expected_loss_usd:.4f}",
+                                        stage,
+                                    )
+                                if self.metrics and placed_ok:
+                                    self.metrics.record_recovery_event(
+                                        cid,
+                                        f"recovery_{quote.path}_placed",
+                                        unpaired,
+                                        recovery_path=quote.path,
+                                        proposed_price=price,
+                                        cost_basis=basis,
+                                        expected_pair_pnl=(
+                                            -(quote.expected_loss_usd or 0.0)
+                                            / size if size > 0 else None),
+                                        complement_ask=complement_ask,
+                                        original_bid=original_bid,
+                                        mkt_fee_bps=m.fee_bps,
+                                        mkt_fee_exponent=m.fee_exponent,
+                                    )
+                                    # P1: reserve the expected loss against
+                                    # the episode budget exactly once per
+                                    # episode.  sell_reserved_loss_usd
+                                    # guards against re-reserving the same
+                                    # GTD order on every tick.
+                                    # P1-2: when the quoted price worsens
+                                    # (expected_loss_usd increases), update
+                                    # the reservation so the budget
+                                    # correctly reflects the new risk.
+                                    sell_expected = (
+                                        quote.expected_loss_usd
+                                        if quote.expected_loss_usd is not None
+                                        else 0.0)
+                                    self.metrics.set_sell_reserved_loss(
+                                        cid, sell_expected)
+                                    self.metrics.update_recovery_episode(
+                                        cid=cid,
+                                        peak_abs_exposure_usd=abs(exposure),
+                                        stage=stage,
+                                        chosen_path=quote.path,
+                                        expected_loss_usd=quote.expected_loss_usd,
+                                    )
+                                # P0 new: return — do NOT fall through to
+                                # old forced-hedge path.  A resting SELL
+                                # exit is our action; the old path would
+                                # issue a duplicate complement BUY.
+                                return
+
+                            # buy_complement: FAK taker buy.
+                            # Cancel any stale exit quote first — if a prior
+                            # tick chose sell_original and a GTD SELL is
+                            # still resting, that order could fill *after* the
+                            # FAK flattens the position, creating a fresh
+                            # naked position in the opposite direction.
+                            #
+                            # LiveBroker.set_exit(None) returns False on cancel
+                            # failure (reconcile_orders + early return at
+                            # L1106).  Verify the exit was actually cleared
+                            # before sending the FAK; otherwise skip this tick
+                            # and retry cancellation next poll.
+                            await self._broker_call(
+                                self.broker.set_exit, m, None)
+                            exit_still_resting = getattr(
+                                self.broker, "exit_quote", lambda _m: None)(m)
+                            if exit_still_resting is not None:
+                                log.warning(
+                                    "RECOVERY_FAK_ABORTED market='%s' cid=%s "
+                                    "原因=撤旧卖单失败，跳过本 tick 避免逆向裸仓",
+                                    m.question[:45], cid)
+                                return
+                            # The exit order may have partially filled between
+                            # the cancel request and its execution on the
+                            # exchange.  Re-read unpaired shares after a
+                            # fresh Data API position refresh — the local
+                            # cache from the last poll is stale until the
+                            # userfeed or refresh_state() catches up.
+                            # If the refresh fails, skip this tick — stale
+                            # position data would cause an over-sized FAK
+                            # and potential reverse inventory.
+                            if not self.paper:
+                                refreshed = await asyncio.to_thread(
+                                    self.broker.refresh_state)
+                                if not refreshed:
+                                    log.warning(
+                                        "RECOVERY_FAK_ABORTED market='%s' cid=%s "
+                                        "原因=仓位刷新失败，跳过本 tick 避免使用过期数据",
+                                        m.question[:45], cid)
+                                    return
+                            unpaired = self.broker.unpaired_shares(m)
+                            if abs(unpaired) < MIN_TAKER_SHARES:
+                                # The exit fill fully flattened the position;
+                                # the episode controller will close the
+                                # episode on the next poll.
+                                log.warning(
+                                    "RECOVERY_FAK_SKIPPED_FLAT market='%s' cid=%s "
+                                    "unpaired=%.0f 说明=撤单期间成交已配平仓位，跳过 FAK",
+                                    m.question[:45], cid, unpaired)
+                                return
+                            size = abs(unpaired)
+                            if self.paper:
+                                episode_filled = self.broker.taker_buy(
+                                    m, token_id, size, price)
+                            else:
+                                audit_context = {
+                                    "path": f"recovery_{quote.path}",
+                                    "unpaired_cost": basis,
+                                    "expected_loss": quote.expected_loss_usd,
+                                }
+                                episode_filled = await asyncio.to_thread(
+                                    self.broker.taker_buy, m, token_id,
+                                    size, price, audit_context)
+
+                            if episode_filled > 0:
+                                fee_rate = (m.fee_bps / 10_000.0
+                                            * (price * (1.0 - price))
+                                            ** m.fee_exponent)
+                                if quote.path == "buy_complement":
+                                    actual_loss = (
+                                        episode_filled
+                                        * max(0.0, (basis or 0.0) + price
+                                              + fee_rate - 1.0))
+                                else:
+                                    actual_loss = (
+                                        episode_filled
+                                        * max(0.0, (basis or 0.0) - price
+                                              + fee_rate))
+                                label = ("YES" if token_id == m.yes_token
+                                         else "NO")
+                                log.warning(
+                                    "RECOVERY_EXECUTED market='%s' path=%s "
+                                    "token=%s size=%.0f price=%.3f "
+                                    "expected_loss_usd=%s filled=%.6f "
+                                    "actual_loss_usd=%.4f stage=%s "
+                                    "说明=恢复策略执行（episode 仅在被检"
+                                    "测为平仓时关闭以免 partial fill 重开）",
+                                    m.question[:45], quote.path, label,
+                                    size, price,
+                                    "unknown"
+                                    if quote.expected_loss_usd is None
+                                    else f"{quote.expected_loss_usd:.4f}",
+                                    episode_filled, actual_loss, stage,
+                                )
+                                if self.metrics:
+                                    self.metrics.record_recovery_event(
+                                        cid,
+                                        f"recovery_{quote.path}_filled",
+                                        unpaired,
+                                        recovery_path=quote.path,
+                                        quote_price=price,
+                                        proposed_price=price,
+                                        cost_basis=basis,
+                                        expected_pair_pnl=(
+                                            -(quote.expected_loss_usd or 0.0)
+                                            / size if size > 0 else None),
+                                        complement_ask=complement_ask,
+                                        original_bid=original_bid,
+                                        mkt_fee_bps=m.fee_bps,
+                                        mkt_fee_exponent=m.fee_exponent,
+                                    )
+                                    # P2: accumulate actual_loss across
+                                    # partial fills via the locked method
+                                    # so concurrent writes (e.g. userfeed
+                                    # callbacks) don't race.
+                                    self.metrics.add_actual_loss(
+                                        cid, actual_loss)
+                                    self.metrics.update_recovery_episode(
+                                        cid=cid,
+                                        peak_abs_exposure_usd=abs(exposure),
+                                        stage=stage,
+                                        chosen_path=quote.path,
+                                        expected_loss_usd=quote.expected_loss_usd,
+                                    )
+                                    # P1.3.2: cumulative loss ban — when
+                                    # the total realised recovery loss across
+                                    # all episodes for this market exceeds
+                                    # the configured cap, ban it permanently
+                                    # (persisted to banned_markets.json).
+                                    ban_thresh = float(
+                                        r.get("recovery_loss_ban_threshold_usd",
+                                              1e9))
+                                    cum_loss = (
+                                        self.metrics.recovery_cumulative_loss(
+                                            cid))
+                                    if cum_loss > ban_thresh + 1e-9:
+                                        self._banned_cids.add(cid)
+                                        self._persist_banned_cids()
+                                        log.warning(
+                                            "RECOVERY_LOSS_BAN market='%s' "
+                                            "cid=%s cumulative_loss=%.4f>%.4f "
+                                            "说明=该市场累计恢复损失超过"
+                                            "阈值，已永久禁入（重启后仍有效）",
+                                            m.question[:45], cid,
+                                            cum_loss, ban_thresh,
+                                        )
+                            # P0 new: return — do NOT fall through to old
+                            # forced-hedge path.  The FAK already executed;
+                            # the old path would re-read stale unpaired and
+                            # submit a duplicate complement BUY.
+                            return
+                    # end active escalated/terminal block
+                    # active passive stage returned above (P1-2);
+                    # active manual_hold with mode=active returned above (P1-1).
+                    # Remaining paths that fall through to old forced-hedge:
+                    #   shadow    — all paths (by design: observe-only)
+                    #   wait      — all modes (below min shares, safe)
+                    #   price=None in active escalated/terminal (fallback)
+
+        # ── existing forced-hedge path (always reached) ──
         excess_yes = unpaired > 0
         token = m.no_token if excess_yes else m.yes_token
         book = self.tracker.books.get(token)
@@ -2413,7 +3137,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name in ("scan", "run", "report", "trades", "performance", "quote-risk-report", "reward-calibration",
-                 "recovery-history", "outcomes"):
+                 "recovery-history", "recovery-episodes", "recovery-replay", "outcomes"):
         sub.add_parser(name)
 
     report_p = sub.choices["report"]
@@ -2439,6 +3163,10 @@ def main() -> None:
     recovery_p = sub.choices["recovery-history"]
     recovery_p.add_argument("condition_id", help="condition id to inspect")
 
+    episodes_p = sub.choices["recovery-episodes"]
+    episodes_p.add_argument("--limit", type=int, default=50,
+                           help="max episodes to show (default 50)")
+
     outcomes_p = sub.choices["outcomes"]
     outcomes_p.add_argument("--date", default=None,
                            help="UTC date YYYY-MM-DD (default: today)")
@@ -2457,6 +3185,7 @@ def main() -> None:
 
     configure_logging(log_dir)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("py_clob_client_v2.http_helpers.helpers").setLevel(logging.WARNING)
     if args.command == "scan":
         cmd_scan(cfg)
     elif args.command == "report":
@@ -2471,6 +3200,10 @@ def main() -> None:
         cmd_reward_calibration(cfg, args.days)
     elif args.command == "recovery-history":
         cmd_recovery_history(cfg, args.condition_id)
+    elif args.command == "recovery-episodes":
+        cmd_recovery_episodes(cfg, args.limit)
+    elif args.command == "recovery-replay":
+        cmd_recovery_replay(cfg)
     elif args.command == "outcomes":
         cmd_outcomes(cfg, args.date, args.days)
     else:

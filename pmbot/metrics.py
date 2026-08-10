@@ -134,7 +134,9 @@ class MetricsStore:
                 unpaired REAL, recovery_path TEXT,
                 quote_price REAL, pair_cap REAL, proposed_price REAL,
                 cost_basis REAL, fee_per_share REAL,
-                expected_pair_pnl REAL, hard_cap REAL
+                expected_pair_pnl REAL, hard_cap REAL,
+                complement_ask REAL, original_bid REAL,
+                mkt_fee_bps INTEGER, mkt_fee_exponent REAL
             );
             CREATE TABLE IF NOT EXISTS inventory_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +160,21 @@ class MetricsStore:
             );
             CREATE INDEX IF NOT EXISTS idx_guard_events_cid_ts
                 ON guard_events (cid, ts);
+            CREATE TABLE IF NOT EXISTS recovery_episodes (
+                cid TEXT NOT NULL,
+                started_ts REAL NOT NULL,
+                initial_unpaired REAL NOT NULL,
+                peak_abs_exposure_usd REAL NOT NULL DEFAULT 0.0,
+                stage TEXT NOT NULL DEFAULT 'passive',
+                chosen_path TEXT,
+                expected_loss_usd REAL,
+                actual_loss_usd REAL,
+                sell_reserved_loss_usd REAL DEFAULT 0.0,
+                is_closed INTEGER NOT NULL DEFAULT 0,
+                closed_ts REAL,
+                closed_reason TEXT,
+                PRIMARY KEY (cid, started_ts)
+            );
             CREATE TABLE IF NOT EXISTS pause_day_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, event TEXT, reason TEXT, equity REAL,
@@ -198,10 +215,16 @@ class MetricsStore:
         if "pair_cap" not in rec_cols:
             self._conn.execute("ALTER TABLE recovery_events ADD COLUMN pair_cap REAL")
         for column in ("proposed_price", "cost_basis", "fee_per_share",
-                       "expected_pair_pnl", "hard_cap"):
+                       "expected_pair_pnl", "hard_cap",
+                       "complement_ask", "original_bid",
+                       "mkt_fee_bps", "mkt_fee_exponent"):
             if column not in rec_cols:
                 self._conn.execute(
                     f"ALTER TABLE recovery_events ADD COLUMN {column} REAL")
+        ep_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(recovery_episodes)")}
+        if "sell_reserved_loss_usd" not in ep_cols:
+            self._conn.execute(
+                "ALTER TABLE recovery_episodes ADD COLUMN sell_reserved_loss_usd REAL DEFAULT 0.0")
         self._conn.commit()
         inv_cols = {r[1] for r in self._conn.execute(
             "PRAGMA table_info(inventory_snapshots)")}
@@ -471,6 +494,10 @@ class MetricsStore:
                               fee_per_share: float | None = None,
                               expected_pair_pnl: float | None = None,
                               hard_cap: float | None = None,
+                              complement_ask: float | None = None,
+                              original_bid: float | None = None,
+                              mkt_fee_bps: int | None = None,
+                              mkt_fee_exponent: float | None = None,
                               ts: float | None = None) -> None:
         """Log one inventory-recovery lifecycle event for monitoring.
 
@@ -486,12 +513,442 @@ class MetricsStore:
             self._conn.execute(
                 "INSERT INTO recovery_events (ts,cid,event,reason,unpaired,recovery_path,"
                 "quote_price,pair_cap,proposed_price,cost_basis,fee_per_share,"
-                "expected_pair_pnl,hard_cap) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "expected_pair_pnl,hard_cap,complement_ask,original_bid,"
+                "mkt_fee_bps,mkt_fee_exponent) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time() if ts is None else ts, cid, event, reason, unpaired,
                  recovery_path, quote_price, pair_cap, proposed_price, cost_basis,
-                 fee_per_share, expected_pair_pnl, hard_cap),
+                 fee_per_share, expected_pair_pnl, hard_cap,
+                 complement_ask, original_bid,
+                 mkt_fee_bps, mkt_fee_exponent),
             )
             self._conn.commit()
+
+    # ── P1 recovery episode lifecycle ──
+
+    def open_recovery_episode(
+            self, *, cid: str, started_ts: float, initial_unpaired: float,
+            peak_abs_exposure_usd: float, stage: str,
+    ) -> None:
+        """Create or refresh the single open episode for *cid*.
+
+        If an open episode already exists for this CID, update its
+        peak_exposure and stage without creating a second row.
+        """
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT started_ts FROM recovery_episodes "
+                "WHERE cid=? AND is_closed=0", (cid,),
+            ).fetchone()
+            if existing is not None:
+                self._conn.execute(
+                    "UPDATE recovery_episodes SET "
+                    "peak_abs_exposure_usd=MAX(peak_abs_exposure_usd,?), "
+                    "stage=? WHERE cid=? AND is_closed=0",
+                    (peak_abs_exposure_usd, stage, cid),
+                )
+            else:
+                # INSERT … ON CONFLICT handles the restart case where a
+                # previously-closed episode for the same (cid, started_ts)
+                # already exists.  Re-open it with fresh values instead of
+                # crashing on the UNIQUE constraint.
+                self._conn.execute(
+                    "INSERT INTO recovery_episodes "
+                    "(cid,started_ts,initial_unpaired,peak_abs_exposure_usd,stage) "
+                    "VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(cid, started_ts) DO UPDATE SET "
+                    "initial_unpaired=excluded.initial_unpaired, "
+                    "peak_abs_exposure_usd=MAX(peak_abs_exposure_usd, excluded.peak_abs_exposure_usd), "
+                    "stage=excluded.stage, "
+                    "is_closed=0, "
+                    "closed_ts=NULL, "
+                    "closed_reason=NULL, "
+                    "chosen_path=NULL, "
+                    "expected_loss_usd=NULL, "
+                    "actual_loss_usd=NULL, "
+                    "sell_reserved_loss_usd=0.0",
+                    (cid, started_ts, initial_unpaired, peak_abs_exposure_usd, stage),
+                )
+            self._conn.commit()
+
+    def update_recovery_episode(
+            self, *, cid: str, peak_abs_exposure_usd: float | None = None,
+            stage: str | None = None,
+            chosen_path: str | None = None,
+            expected_loss_usd: float | None = None,
+            sell_reserved_loss_usd: float | None = None,
+    ) -> None:
+        """Update fields on the open episode for *cid*.
+
+        peak_abs_exposure_usd is ratcheted via MAX in SQL.  Other fields
+        are overwritten with the latest value — the caller is expected to
+        pass the current decision on every tick.
+        """
+        with self._lock:
+            sets: list[str] = []
+            params: list = []
+            if peak_abs_exposure_usd is not None:
+                sets.append(
+                    "peak_abs_exposure_usd=MAX(peak_abs_exposure_usd,?)")
+                params.append(peak_abs_exposure_usd)
+            if stage is not None:
+                sets.append("stage=?")
+                params.append(stage)
+            if chosen_path is not None:
+                sets.append("chosen_path=?")
+                params.append(chosen_path)
+            if expected_loss_usd is not None:
+                sets.append("expected_loss_usd=?")
+                params.append(expected_loss_usd)
+            if sell_reserved_loss_usd is not None:
+                sets.append("sell_reserved_loss_usd=?")
+                params.append(sell_reserved_loss_usd)
+            if not sets:
+                return
+            params.append(cid)
+            self._conn.execute(
+                f"UPDATE recovery_episodes SET {', '.join(sets)} "
+                "WHERE cid=? AND is_closed=0", params,
+            )
+            self._conn.commit()
+
+    def close_recovery_episode(
+            self, *, cid: str, closed_ts: float, chosen_path: str | None = None,
+            expected_loss_usd: float | None = None,
+            actual_loss_usd: float | None = None,
+            reason: str | None = None,
+    ) -> None:
+        """Mark the open episode for *cid* as closed with outcome data."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE recovery_episodes SET is_closed=1, closed_ts=?, "
+                "chosen_path=?, expected_loss_usd=?, actual_loss_usd=?, "
+                "closed_reason=? "
+                "WHERE cid=? AND is_closed=0",
+                (closed_ts, chosen_path, expected_loss_usd, actual_loss_usd,
+                 reason, cid),
+            )
+            self._conn.commit()
+
+    def get_open_episode(self, cid: str) -> dict | None:
+        """Return the open episode for *cid*, or None."""
+        row = self._conn.execute(
+            "SELECT cid, started_ts, initial_unpaired, peak_abs_exposure_usd, "
+            "stage, chosen_path, expected_loss_usd, actual_loss_usd, "
+            "sell_reserved_loss_usd, "
+            "is_closed, closed_ts, closed_reason "
+            "FROM recovery_episodes WHERE cid=? AND is_closed=0",
+            (cid,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "cid": row[0], "started_ts": row[1], "initial_unpaired": row[2],
+            "peak_abs_exposure_usd": row[3], "stage": row[4],
+            "chosen_path": row[5], "expected_loss_usd": row[6],
+            "actual_loss_usd": row[7], "sell_reserved_loss_usd": row[8],
+            "is_closed": row[9], "closed_ts": row[10], "closed_reason": row[11],
+        }
+
+    def recovery_episode_summary(self) -> dict:
+        """Read-only aggregate of all episodes."""
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM recovery_episodes").fetchone()[0]
+        open_count = self._conn.execute(
+            "SELECT COUNT(*) FROM recovery_episodes WHERE is_closed=0"
+        ).fetchone()[0]
+        closed_count = self._conn.execute(
+            "SELECT COUNT(*) FROM recovery_episodes WHERE is_closed=1"
+        ).fetchone()[0]
+        return {
+            "total_episodes": total,
+            "open_episodes": open_count,
+            "closed_episodes": closed_count,
+        }
+
+    def recovery_cumulative_loss(self, cid: str) -> float:
+        """Total actual_loss_usd across all episodes (open + closed) for *cid*.
+
+        This is the realised cost of all recovery actions for this market,
+        irrespective of episode boundaries.  When the cumulative loss exceeds
+        ``recovery_loss_ban_threshold_usd`` the market should be banned so it
+        cannot re-enter the quote set — even after a restart the persistent
+        ban stays until the operator manually clears it.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(actual_loss_usd), 0) FROM recovery_episodes "
+            "WHERE cid=?",
+            (cid,),
+        ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def add_actual_loss(self, cid: str, delta: float) -> None:
+        """Atomically add *delta* to actual_loss_usd for the open episode."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE recovery_episodes SET actual_loss_usd="
+                "COALESCE(actual_loss_usd,0)+? "
+                "WHERE cid=? AND is_closed=0",
+                (delta, cid),
+            )
+            self._conn.commit()
+
+    def set_sell_reserved_loss(self, cid: str, value: float) -> None:
+        """Atomically set sell_reserved_loss_usd for the open episode.
+
+        Updates the reservation when *value* exceeds the current stored value
+        (e.g. the ask has widened and expected_loss_usd has grown).  Never
+        decreases — a shrinking expected loss is fine because the actual loss
+        can only be less than the reservation, not more.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sell_reserved_loss_usd FROM recovery_episodes "
+                "WHERE cid=? AND is_closed=0",
+                (cid,),
+            ).fetchone()
+            prev = row[0] if row and row[0] is not None else 0.0
+            if value > prev:
+                self._conn.execute(
+                    "UPDATE recovery_episodes SET sell_reserved_loss_usd=? "
+                    "WHERE cid=? AND is_closed=0",
+                    (value, cid),
+                )
+                self._conn.commit()
+
+    def recovery_event_cost_basis(self, cid: str,
+                                   since_ts: float) -> float | None:
+        """Return the last known cost_basis for *cid* from events >= *since_ts*.
+
+        Used when the position has gone flat and the broker can no longer
+        supply an unpaired_cost_basis — the last recorded event still has
+        the basis that was used for the episode's decisions.
+        """
+        row = self._conn.execute(
+            "SELECT cost_basis FROM recovery_events "
+            "WHERE cid=? AND ts>=? AND cost_basis IS NOT NULL "
+            "ORDER BY ts DESC LIMIT 1",
+            (cid, since_ts),
+        ).fetchone()
+        return row[0] if row else None
+
+    def list_recovery_episodes(
+            self, *, limit: int = 100, offset: int = 0,
+            open_only: bool = False, closed_only: bool = False,
+    ) -> list[dict]:
+        """Read-only listing of all episodes sorted by started_ts DESC."""
+        where: list[str] = []
+        params: list = []
+        if open_only:
+            where.append("is_closed=0")
+        elif closed_only:
+            where.append("is_closed=1")
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = self._conn.execute(
+            f"SELECT cid, started_ts, initial_unpaired, peak_abs_exposure_usd, "
+            f"stage, chosen_path, expected_loss_usd, actual_loss_usd, "
+            f"is_closed, closed_ts, closed_reason "
+            f"FROM recovery_episodes {clause} "
+            f"ORDER BY started_ts DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()
+        return [
+            {
+                "cid": r[0], "started_ts": r[1], "initial_unpaired": r[2],
+                "peak_abs_exposure_usd": r[3], "stage": r[4],
+                "chosen_path": r[5], "expected_loss_usd": r[6],
+                "actual_loss_usd": r[7], "is_closed": r[8],
+                "closed_ts": r[9], "closed_reason": r[10],
+                "duration_secs": (r[9] - r[1]) if r[9] is not None else None,
+            }
+            for r in rows
+        ]
+
+    def replay_old_recovery_events(
+            self, gap_secs: float = 1800.0,
+            market_hints: dict[str, object] | None = None,
+    ) -> list[dict]:
+        """Fold old recovery_events into per-episode summaries.
+
+        Events are split into episodes by a *gap_secs* quiet period
+        (default 30 min).  Within each episode the earliest/latest timestamps,
+        peak exposure, and fill outcome are tracked independently.
+
+        When complement_ask + original_bid + cost_basis are present on at
+        least one event, the replay re-runs choose_recovery_action() to
+        compare the old-strategy result against the new decision engine.
+        *market_hints* is an optional dict mapping cid→Market-like object
+        (needed for fee calculation); without it the comparison column
+        shows "no market hints".
+        """
+        rows = self._conn.execute(
+            "SELECT cid, ts, event, reason, unpaired, recovery_path, "
+            "quote_price, proposed_price, cost_basis, expected_pair_pnl, "
+            "complement_ask, original_bid, mkt_fee_bps, mkt_fee_exponent "
+            "FROM recovery_events ORDER BY cid, ts, id"
+        ).fetchall()
+
+        episodes: list[dict] = []
+        current: dict | None = None
+
+        for r in rows:
+            cid = r[0]
+            ts = r[1]
+            unpaired = r[4]
+            event = r[2]
+            proposed_price = r[7]
+            cost_basis = r[8]
+            complement_ask = r[10] if len(r) > 10 else None
+            original_bid = r[11] if len(r) > 11 else None
+            mkt_fee_bps = r[12] if len(r) > 12 else None
+            mkt_fee_exponent = r[13] if len(r) > 13 else None
+
+            # Split into a new episode when CID changes or a long gap
+            # appears between consecutive events for the same market.
+            start_new = False
+            if current is None:
+                start_new = True
+            elif current["cid"] != cid:
+                start_new = True
+            elif ts - current["latest_ts"] > gap_secs:
+                start_new = True
+
+            if start_new:
+                if current is not None:
+                    episodes.append(self._finalize_replay_episode(
+                        current, market_hints))
+                current = {
+                    "cid": cid,
+                    "earliest_ts": ts,
+                    "latest_ts": ts,
+                    "event_count": 0,
+                    "quote_placed_count": 0,
+                    "max_abs_unpaired": 0.0,
+                    "has_proposed_price": False,
+                    "has_dual_prices": False,
+                    "filled": False,
+                    "fill_event": None,
+                    "insufficient_evidence": True,
+                    "sample_quotes": [],
+                    "mkt_fee_bps": mkt_fee_bps,
+                    "mkt_fee_exponent": mkt_fee_exponent,
+                    # Best dual-path snapshot for comparison
+                    "dual_path_snapshot": None,
+                }
+
+            assert current is not None
+            current["earliest_ts"] = min(current["earliest_ts"], ts)
+            current["latest_ts"] = max(current["latest_ts"], ts)
+            current["event_count"] += 1
+            current["max_abs_unpaired"] = max(
+                current["max_abs_unpaired"], abs(unpaired))
+            if proposed_price is not None:
+                current["has_proposed_price"] = True
+                if len(current["sample_quotes"]) < 5:
+                    current["sample_quotes"].append({
+                        "ts": ts, "proposed_price": proposed_price,
+                        "cost_basis": cost_basis, "unpaired": unpaired,
+                    })
+            # Only clear insufficient_evidence when *both* sides of the
+            # order book are present — a single proposed_price without the
+            # complementary ask/original-bid pair cannot produce a
+            # meaningful buy-vs-sell comparison.
+            if complement_ask is not None and original_bid is not None:
+                current["has_dual_prices"] = True
+                current["insufficient_evidence"] = False
+                current["dual_path_snapshot"] = {
+                    "ts": ts,
+                    "unpaired": unpaired,
+                    "cost_basis": cost_basis,
+                    "complement_ask": complement_ask,
+                    "original_bid": original_bid,
+                    "mkt_fee_bps": mkt_fee_bps,
+                    "mkt_fee_exponent": mkt_fee_exponent,
+                }
+            if event == "quote_placed":
+                current["quote_placed_count"] += 1
+            if event in ("forced_hedge_filled",):
+                current["filled"] = True
+                current["fill_event"] = {
+                    "ts": ts, "event": event, "reason": r[3],
+                    "quote_price": r[6], "expected_pair_pnl": r[9],
+                }
+
+        if current is not None:
+            episodes.append(self._finalize_replay_episode(current, market_hints))
+
+        return episodes
+
+    @staticmethod
+    def _finalize_replay_episode(ep: dict,
+                                 market_hints: dict | None = None) -> dict:
+        """Convert internal dict to the public per-episode summary shape.
+
+        When dual-path prices (complement_ask + original_bid) and
+        market_hints are available, re-run choose_recovery_action() to
+        compare the old-strategy result against the new decision engine.
+        """
+        result: dict = {
+            "cid": ep["cid"],
+            "duration_secs": ep["latest_ts"] - ep["earliest_ts"],
+            "event_count": ep["event_count"],
+            "quote_placed_count": ep["quote_placed_count"],
+            "max_abs_unpaired": ep["max_abs_unpaired"],
+            "filled": ep["filled"],
+            "insufficient_evidence": ep["insufficient_evidence"],
+            "sample_quotes": ep["sample_quotes"][:5],
+            "fill_event": ep["fill_event"],
+        }
+
+        # Replay comparison: re-run the new decision engine on the old
+        # event data to surface whether it would have chosen differently.
+        snap = ep.get("dual_path_snapshot")
+        result["comparison"] = None
+        if snap is not None:
+            from pmbot.recovery import choose_recovery_action  # noqa: F811
+
+            # Build a minimal Market-like object from persisted metadata
+            # so historical CID comparison works even when gamma.scan()
+            # no longer returns the market.
+            mkt_fee_bps_val = snap.get("mkt_fee_bps")
+            mkt_fee_exp_val = snap.get("mkt_fee_exponent")
+            if mkt_fee_bps_val is not None and mkt_fee_exp_val is not None:
+                class _ReplayMarket:
+                    fee_bps: int = int(mkt_fee_bps_val)
+                    fee_exponent: float = float(mkt_fee_exp_val)
+
+                replay_market = _ReplayMarket()
+            elif market_hints is not None:
+                replay_market = market_hints.get(ep["cid"])
+            else:
+                replay_market = None
+
+            if replay_market is not None:
+                max_loss_usd = float(
+                    (market_hints or {}).get("_max_loss_usd", 3.0))
+                old_quote = choose_recovery_action(
+                    market=replay_market,
+                    unpaired=snap["unpaired"],
+                    basis=snap["cost_basis"],
+                    complement_ask=snap["complement_ask"],
+                    original_bid=snap["original_bid"],
+                    elapsed_secs=0.0,  # no elapsed info in old events
+                    max_loss_usd=max_loss_usd,
+                )
+                result["comparison"] = {
+                    "path": old_quote.path,
+                    "expected_loss_usd": old_quote.expected_loss_usd,
+                    "token_id": old_quote.token_id,
+                    "price": old_quote.price,
+                    "reason": old_quote.reason,
+                }
+            else:
+                result["comparison"] = {
+                    "status": "no_market_hints",
+                    "detail": "dual prices available but no fee metadata "
+                              "persisted and no market hints provided",
+                }
+        return result
 
     def record_equity(self, equity: float, inventory_usd: float) -> None:
         if equity != equity:

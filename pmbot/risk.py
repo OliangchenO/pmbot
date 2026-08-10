@@ -49,7 +49,12 @@ class RiskManager:
         self.paused = False
         self._equity_history: deque[float] = deque(maxlen=20)
         self.last_observation: dict[str, float | str] = {}
-
+        # Log the initial equity baseline so restart and day-start events
+        # are consistently recorded — the check() method only logs this on
+        # transition from NaN, which skips the first valid reading after
+        # RiskManager creation when start_equity was already valid.
+        if start_equity == start_equity:
+            log.info("权益基准已设置：$%.2f", start_equity)
     @staticmethod
     def _today() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
