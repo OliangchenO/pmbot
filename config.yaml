@@ -373,6 +373,7 @@ risk:
   # selects, quotes, recovers, hedges, nor cancels orders for them.
   manual_hold_cids:
     - "0xa1a4a8b493cd978b359c3deab56955d80a4b0b14c806beea6bd37b4b3a3e4415"
+    - "0xb9846df61a1c23ddf4c30afcced568a96a88229adcf04ee005e05e1d22c6da0b"
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
   # hedge threshold all scale by (current equity / capital_usd). Deposit more
   # and the bot sizes up automatically; draw down and it sizes down. Clamped

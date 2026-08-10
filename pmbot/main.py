@@ -1647,10 +1647,10 @@ class Bot:
             yes_book.best_ask, yes_book.asks.get(yes_book.best_ask, 0.0),
             no_book.best_bid, no_book.bids.get(no_book.best_bid, 0.0),
             no_book.best_ask, no_book.asks.get(no_book.best_ask, 0.0),
-            pricing["yes_microprice"], pricing["flow_imbalance"], pricing["flow_drift"],
-            pricing["fair"], pricing["base_offset"], pricing["adaptive_offset"],
-            pricing["offset"], pricing["skew"], pricing["fade_yes"], pricing["fade_no"],
-            pricing["yes_bid_quote"], pricing["no_bid_quote"],
+            pricing.get("yes_microprice", 0.0), pricing.get("flow_imbalance", 0.0), pricing.get("flow_drift", 0.0),
+            pricing.get("fair", 0.0), pricing.get("base_offset", 0.0), pricing.get("adaptive_offset", 0.0),
+            pricing.get("offset", 0.0), pricing.get("skew", 0.0), pricing.get("fade_yes", 0.0), pricing.get("fade_no", 0.0),
+            pricing.get("yes_bid_quote", 0.0), pricing.get("no_bid_quote", 0.0),
         )
 
     def _log_inventory_recovery_skip(
@@ -1842,7 +1842,7 @@ class Bot:
 
         Cooldown markets also escalate after the window, same as held-only."""
         if abs(unpaired) < MIN_TAKER_SHARES:
-            return []
+            return desired  # 空仓无需 recovery，保留策略原报价
         risk_cfg = self.cfg.get("risk") or {}
         escalate_secs = float(risk_cfg.get("recovery_escalate_after_minutes", 0)) * 60.0
         if now is not None and escalate_secs > 0 and self.broker is not None:
@@ -1862,7 +1862,7 @@ class Bot:
         that can never fill.
         """
         if abs(unpaired) < MIN_TAKER_SHARES:
-            return []
+            return desired  # 空仓无需 recovery，保留策略原报价
         risk_cfg = self.cfg.get("risk") or {}
         escalate_secs = float(risk_cfg.get("recovery_escalate_after_minutes", 0)) * 60.0
         if now is not None and escalate_secs > 0 and self.broker is not None:
@@ -1888,7 +1888,7 @@ class Bot:
         market has no normal quote to filter, but still needs a reducing bid.
         """
         if abs(unpaired) < MIN_TAKER_SHARES:
-            return []
+            return desired  # 空仓无需 recovery，保留策略原报价
         complement = m.no_token if unpaired > 0 else m.yes_token
         min_order_size = self._clob_min_order_size(complement)
         if min_order_size is not None and abs(unpaired) < min_order_size:
