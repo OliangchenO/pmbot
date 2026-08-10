@@ -1082,11 +1082,11 @@ class Bot:
                         self._was_paused = True
                     for m in self.markets:
                         self.metrics.sample_uptime(m.condition_id, False)
-                # Reward-exit batches still need to run during pauses so
-                # active SELL orders and shadow tracking continue.
-                await self._run_reward_exit_batch_tick(now)
-                await self._manage_inventory(now)
-                continue
+                    # Reward-exit batches still need to run during pauses so
+                    # active SELL orders and shadow tracking continue.
+                    await self._run_reward_exit_batch_tick(now)
+                    await self._manage_inventory(now)
+                    continue
 
                 self._was_paused = False
                 # Run reward-exit tick first so newly created batches lock
