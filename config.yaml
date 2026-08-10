@@ -100,7 +100,7 @@ scanner:
   # cap and widened spread for only a couple of hours before forced exit).
   min_hours_to_end: 14
   # Re-run the scanner this often to rotate into fresh markets.
-  refresh_minutes: 20
+  refresh_minutes: 15
   # Check the selected markets' reward minimum size without re-ranking or
   # resubscribing books.  Set to 0 to disable this lightweight refresh.
   reward_min_size_refresh_seconds: 60
@@ -147,7 +147,7 @@ scanner:
   # net_shadow_score is used for candidate ranking. These are deliberately high
   # — they require proven, verifiable per-market net-outcome history.
   net_outcome_gate:
-    min_utc_days: 14
+    min_utc_days: 7
     min_closed_cycles: 30
     min_complete_ratio: 0.90
     min_advantage_usd_per_hour: 0.0

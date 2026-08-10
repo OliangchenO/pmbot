@@ -1995,6 +1995,11 @@ class Bot:
         taker fills (path == 'reward_exit_take' or 'forced_hedge') and accumulate
         take_filled_size, take_notional_usd, take_fee_usd.  When filled >= 2q,
         transition to SELL_PENDING via compute_sell_target.
+
+        NOTE: batch_take fills are credited directly by _advance_take_pending()
+        immediately after FAK execution.  This method reads the already-persisted
+        fill facts (list_reward_exit_fills) to update batch progress and
+        transition to SELL_PENDING — it does NOT write duplicate fills.
         """
         if self.broker is None or self.metrics is None or self.tracker is None:
             return
@@ -2006,26 +2011,9 @@ class Bot:
 
         for b in take_batches:
             bid = b["batch_id"]
-            # Broker writes the immutable fact; this call is idempotent for
-            # paper/recovery paths that were recorded before this tick.
-            for entry in self.broker.fills_log:
-                if (str(entry.get("batch_id") or "") != bid
-                        or str(entry.get("intent") or "") != "batch_take"):
-                    continue
-                fill_id = str(entry.get("fill_id") or entry.get("id") or "")
-                if not fill_id:
-                    continue
-                self.metrics.record_reward_exit_fill(
-                    fill_id=fill_id, batch_id=bid,
-                    order_id=str(entry.get("order_id") or ""),
-                    intent="batch_take", cid=str(entry.get("cid") or ""),
-                    token_id=str(entry.get("token") or ""),
-                    side=str(entry.get("side") or "BUY"),
-                    price=float(entry.get("price") or 0),
-                    size=float(entry.get("size") or 0),
-                    fee_usd=float(entry.get("fee") or 0),
-                    ts=float(entry.get("ts") or now),
-                )
+            # Direct credit in _advance_take_pending() is the authority for
+            # batch_take fills — do NOT scan fills_log and write duplicates.
+            # Just read what was already persisted.
 
             persisted = self.metrics.list_reward_exit_fills(bid, intent="batch_take")
             total_filled = sum(float(f["size"]) for f in persisted)
@@ -2246,6 +2234,18 @@ class Bot:
             )
             known_fill_ids.add(fill_id)
 
+            # ── Immediately lock the CID to stop ordinary quoting ──
+            # Do not wait for the end-of-tick CID sync in Step 3 — the
+            # batch has an open take to execute and ordinary quoting
+            # should stop right now to avoid interfering with the exit.
+            if cid not in self._reward_exit_locked:
+                self._reward_exit_locked.add(cid)
+                log.warning(
+                    "MARKET_REWARD_EXIT_LOCKED cid=%s market='%s' "
+                    "说明=该市场有活跃奖励退出批次，停止普通报价和旧 recovery",
+                    cid, str(m.question)[:50],
+                )
+
     # ── Batch advancement ──
 
     async def _advance_reward_exit_batches(self, now: float) -> None:
@@ -2331,26 +2331,81 @@ class Bot:
             batch_id, cid, complement_token[:12], target, remaining, max_buy_price,
         )
 
+        # ── Balance check: skip if remaining * best_ask > available ──
+        # Compute amount tightly to avoid FAK overfill.  The CLOB FAK
+        # fills at the *maker* ask prices (which can be lower than
+        # max_buy_price), so amount = max_buy_price × remaining can
+        # produce up to (max_buy_price / best_ask) × more shares than
+        # requested.  Use best_ask for the spend budget instead.
+        safe_price = best_ask if best_ask and best_ask <= max_buy_price else max_buy_price
+        budget_needed = round(safe_price * remaining, 2)
+        balance_ok = True
+        if hasattr(self.broker, '_collateral'):
+            bal = None
+            try:
+                bal = getattr(self.broker, '_collateral', None)
+            except Exception:
+                pass
+            if bal is not None and isinstance(bal, (int, float)) and bal == bal:
+                if bal < budget_needed * 0.99:
+                    balance_ok = False
+                    log.warning(
+                        "BATCH_TAKE_BALANCE_INSUFFICIENT batch_id=%s cid=%s "
+                        "needed=%.2f balance=%.2f "
+                        "说明=余额不足，跳过本次take（等待入金或市场变化）",
+                        batch_id, cid, budget_needed, bal,
+                    )
+
         # Use broker.taker_buy() for true FAK execution
         filled_now = 0.0
-        if hasattr(self.broker, 'taker_buy') and m is not None:
+        if balance_ok and hasattr(self.broker, 'taker_buy') and m is not None:
             async with self._market_lock(cid):
                 filled_now = await self._broker_call(
                     self.broker.taker_buy,
                     m, complement_token, remaining, max_buy_price,
                     {"path": "reward_exit_take", "intent": "batch_take",
-                     "batch_id": batch_id},
+                     "batch_id": batch_id, "best_ask": best_ask},
                 )
 
+        # ── Direct credit: update batch take_filled immediately ──
+        # Do not wait for _credit_take_fills to find the fill in
+        # fills_log — the WebSocket fill may not carry the correct
+        # batch_id/orient_id, causing the batch to never advance.
+        remaining_before = remaining
+        if filled_now > 0 and self.metrics is not None:
+            # Persist the fill fact for idempotent replay
+            fill_proof = {
+                "fill_id": f"take-{batch_id}-{time.time():.3f}",
+                "cid": cid, "batch_id": batch_id,
+                "token": complement_token, "side": "BUY",
+                "price": safe_price, "size": filled_now,
+                "fee_usd": 0.0, "ts": now,
+                "intent": "batch_take",
+            }
+            self.metrics.record_reward_exit_fill(**fill_proof)
+            new_total = filled + filled_now
+            self.metrics.update_reward_exit_batch(
+                batch_id=batch_id,
+                take_filled_size=new_total,
+                take_notional_usd=float(batch.get("take_notional_usd") or 0)
+                                   + safe_price * filled_now,
+            )
+            # Re-read remaining after credit for the EXECUTED log line
+            remaining_after = reward_exit.remaining_take(target, new_total)
+
         if filled_now > 0:
-            # We record this fill in fills_log via record_user_fill (called
-            # by the live broker) or via _fill (paper broker).  The next
-            # _credit_take_fills tick will pick it up and update the batch.
             log.warning(
                 "BATCH_TAKE_EXECUTED batch_id=%s cid=%s "
-                "filled=%.2f remaining_before=%.0f 说明=FAK买入了互补token",
-                batch_id, cid, filled_now, remaining,
+                "filled=%.2f remaining_before=%.0f remaining_after=%.0f "
+                "说明=FAK买入了互补token",
+                batch_id, cid, filled_now, remaining_before, remaining_after,
             )
+
+            # ── Transition: if take target is fully filled, seal and set SELL ──
+            if new_total >= target - 1e-9 and self.metrics is not None:
+                persisted = self.metrics.list_reward_exit_fills(
+                    batch_id, intent="batch_take")
+                await self._seal_and_set_sell_target(batch, persisted, now)
 
     # ── SELL stage: per-batch GTD maker SELL ──
 

@@ -446,7 +446,7 @@ class PaperBroker:
         if not self.metrics or not hasattr(self.metrics, "record_reward_exit_fill"):
             return
         intent = str(entry.get("intent") or "")
-        if intent not in {"normal_reward", "batch_take", "batch_exit"}:
+        if intent not in {"normal_reward", "batch_exit"}:
             return
         self.metrics.record_reward_exit_fill(
             fill_id=str(entry["fill_id"]),
@@ -1351,29 +1351,37 @@ class LiveBroker:
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float,
                   audit_context: dict | None = None) -> float:
         from py_clob_client_v2 import (
-            AssetType, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+            AssetType, MarketOrderArgsV2, OrderType,
+            PartialCreateOrderOptions, Side,
         )
 
         size = round(size, 2)
-        # Hedge buys spend pUSD collateral; refresh the CLOB's deposit-wallet view.
-        self._sync_clob_balance(AssetType.COLLATERAL)
-        # A marketable FAK buy is validated by the backend as a *market* buy, whose
-        # maker (collateral) amount must round to <=2 decimals. create_order(price,
-        # size) sends maker = price*size, which carries up to 4 decimals and is
-        # rejected ("invalid amounts ... maker amount supports a max accuracy of 2
-        # decimals"). The market-order builder takes the spend amount directly and
-        # rounds it correctly, so quote in collateral terms instead.
         if size <= 0 or max_price <= 0:
             return 0.0
+
+        # FAK overfill prevention: using amount = max_price × size can
+        # overshoot when the book has ask prices well below max_price
+        # (e.g. price=0.99, size=88 → amount=$87.12, but fills at
+        # ask=0.51 → 170+ shares instead of 88).  Cap the spend budget
+        # at best_ask × remaining so we never buy more than requested.
+        context = audit_context or {}
+        best_ask = context.get("best_ask")
+        effective_price = (best_ask if best_ask is not None and 0 < best_ask <= max_price
+                           else max_price)
+        amount = round(effective_price * size, 2)
+        # Deposit wallets (signature_type 3) need a CLOB balance sync before
+        # placing orders, otherwise the CLOB may reject with "not enough
+        # balance" even though on-chain collateral is sufficient.
+        self._sync_clob_balance(AssetType.COLLATERAL)
         try:
             with self._state_lock:
                 with self._client_lock:
-                    signed = self.client.create_order(OrderArgs(
-                        token_id=token_id, price=max_price, size=size,
-                        side=Side.BUY, expiration=0,
+                    signed = self.client.create_market_order(MarketOrderArgsV2(
+                        token_id=token_id, amount=amount, side=Side.BUY,
+                        price=max_price, order_type=OrderType.FAK,
                     ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
                     resp = self.client.post_order(signed, OrderType.FAK)
-                filled = _parse_fill_amount(resp, size)
+                filled = min(_parse_fill_amount(resp, size), size)
                 order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")
                             or "") if isinstance(resp, dict) else ""
                 context = {"path": "forced_hedge", **(audit_context or {})}
@@ -1531,7 +1539,7 @@ class LiveBroker:
         self.fills_log = self.fills_log[-500:]
         if self.metrics:
             self.metrics.record_fill(entry)
-            if intent in {"normal_reward", "batch_take", "batch_exit"} and \
+            if intent in {"normal_reward"} and \
                     hasattr(self.metrics, "record_reward_exit_fill"):
                 self.metrics.record_reward_exit_fill(
                     fill_id=str(entry.get("fill_id") or

@@ -46,7 +46,8 @@ class _FillBroker:
 
 
 def test_take_credit_persists_only_own_batch_fill_once_and_ignores_forced_hedge(tmp_path):
-    """Changing batch/intent filtering or dedupe must not inflate a take batch."""
+    """Direct credit in _advance_take_pending is the authoritative writer;
+    _credit_take_fills reads persisted fills and updates batch totals."""
     async def scenario():
         bot, market = _bot(tmp_path)
         _open_take_batch(bot, market)
@@ -56,6 +57,16 @@ def test_take_credit_persists_only_own_batch_fill_once_and_ignores_forced_hedge(
             "cid": market.condition_id, "token": market.no_token, "side": "BUY",
             "price": 0.51, "size": 6.0, "fee": 0.03, "ts": 10.0,
         }
+        # Direct credit pre-populates the reward_exit_fills table — this is
+        # what _advance_take_pending() does after FAK execution.
+        bot.metrics.record_reward_exit_fill(
+            fill_id="take-fill-1", batch_id="batch-1",
+            order_id="take-order", intent="batch_take",
+            cid=market.condition_id, token_id=market.no_token,
+            side="BUY", price=0.51, size=6.0, fee_usd=0.03, ts=10.0,
+        )
+        # fills_log is present but _credit_take_fills no longer writes from it
+        # for batch_take fills — it reads already-persisted fills.
         bot.broker = _FillBroker([own, dict(own), {
             "id": "forced-fill", "order_id": "forced-order", "intent": "forced_hedge",
             "path": "forced_hedge", "taker": True, "cid": market.condition_id,
@@ -101,9 +112,10 @@ def test_take_submission_uses_remaining_size_and_batch_audit_context(tmp_path):
             market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 10.0)
 
         assert broker.calls[0][2] == 14.0
-        assert broker.calls[0][4] == {
-            "path": "reward_exit_take", "intent": "batch_take", "batch_id": "batch-1",
-        }
+        assert broker.calls[0][4]["path"] == "reward_exit_take"
+        assert broker.calls[0][4]["intent"] == "batch_take"
+        assert broker.calls[0][4]["batch_id"] == "batch-1"
+        assert broker.calls[0][4]["best_ask"] == 0.51
         bot.metrics.close()
 
     asyncio.run(scenario())
