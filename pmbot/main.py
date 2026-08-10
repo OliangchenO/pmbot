@@ -34,12 +34,18 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from . import gamma, strategy
+from . import gamma, reward_exit, strategy
 from .books import Book, BookTracker
 from .brokers import LiveBroker, PaperBroker
 from .controller import AdaptiveController
 from .metrics import MetricsStore
 from .recovery import choose_recovery_action, RecoveryQuote
+from .reward_exit import (
+    RewardExitBatch, TakeFill, create_batch,
+    compute_sell_target, transition_to_seal_pending,
+    transition_to_closed, transition_to_manual_hold,
+    remaining_take, remaining_exit,
+)
 from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
 console = Console()
@@ -872,6 +878,14 @@ class Bot:
             / "banned_markets.json"
         )
         self._load_banned_cids()
+        # P1.x reward exit batch: per-fill double-take + maker SELL
+        r_cfg = cfg.get("risk") or {}
+        self._reward_exit_mode: str = r_cfg.get("reward_exit_batch_mode", "shadow")
+        self._reward_exit_locked: set[str] = set()  # CID → reward_exit_locked
+        self._awaiting_top_n_rescan: set[str] = set()
+        self._batch_task_tracker: dict[str, asyncio.Task] = {}  # batch_id → async task
+        self._batch_last_take_attempt: dict[str, float] = {}  # batch_id → last attempt ts
+        self._batch_exit_orders: dict[str, object] = {}  # batch_id → RestingOrder
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
         self._recovery_pricing: dict[str, dict[str, float | str]] = {}
@@ -1068,10 +1082,16 @@ class Bot:
                         self._was_paused = True
                     for m in self.markets:
                         self.metrics.sample_uptime(m.condition_id, False)
-                    await self._manage_inventory(now)
-                    continue
+                # Reward-exit batches still need to run during pauses so
+                # active SELL orders and shadow tracking continue.
+                await self._run_reward_exit_batch_tick(now)
+                await self._manage_inventory(now)
+                continue
 
                 self._was_paused = False
+                # Run reward-exit tick first so newly created batches lock
+                # before _quote_all and _manage_inventory run.
+                await self._run_reward_exit_batch_tick(now)
                 await self._quote_all()
                 await self._manage_inventory(now)
 
@@ -1453,6 +1473,7 @@ class Bot:
                 return
         locked = self._locked_inventory_markets(self.markets)
         markets = self._select_markets(ranked, locked)
+        ranked_cids = {m.condition_id for m in ranked}
 
         old_markets = list(self.markets)
         new_cids = {m.condition_id for m in markets}
@@ -1469,6 +1490,9 @@ class Bot:
         self._sync_markets_toml(markets)
 
         self.markets = markets
+        # A completed reward-exit market may resume ordinary quoting only
+        # after it re-enters the current ranked top-N scan.
+        self._awaiting_top_n_rescan.difference_update(new_cids & ranked_cids)
         self._token_market = {}
         for m in markets:
             self._token_market[m.yes_token] = m
@@ -1914,6 +1938,657 @@ class Bot:
             price = round(price - tick, 6)
         return 0.0
 
+    async def _run_reward_exit_batch_tick(self, now: float) -> None:
+        """Coordinate all active reward exit batches for the current tick.
+
+        Dispatches to:
+        - _process_reward_fills(): detect new normal reward fills, create batches
+        - _advance_reward_exit_batches(): take → seal → SELL per batch
+        - Lock/unlock CIDs as needed
+        """
+        if self._reward_exit_mode == "off" or self.broker is None or self.tracker is None:
+            return
+
+        # ── Step 0: Detect and credit take fills ──
+        # Must run before _process_reward_fills so we don't mistake take fills
+        # for new origin fills.
+        await self._credit_take_fills(now)
+
+        # ── Step 1: detect new normal reward fills ──
+        await self._process_reward_fills(now)
+
+        # Shadow observes and computes only.  It must not lock a CID or alter
+        # the existing quote/recovery path.
+        if self._reward_exit_mode == "shadow":
+            return
+
+        # ── Step 2: advance existing batches ──
+        await self._advance_reward_exit_batches(now)
+
+        # ── Step 3: sync CIDs ──
+        # Any CID with an open (non-CLOSED) batch is reward_exit_locked.
+        if self.metrics:
+            open_batches = self.metrics.get_open_reward_exit_batches()
+            active_cids = {b["cid"] for b in open_batches}
+            # Lock new CIDs
+            for cid in active_cids - self._reward_exit_locked:
+                self._reward_exit_locked.add(cid)
+                m_name = next((m.question for m in self.markets if m.condition_id == cid), cid)
+                log.warning("MARKET_REWARD_EXIT_LOCKED cid=%s market='%s' "
+                            "说明=该市场有活跃奖励退出批次，停止普通报价和旧 recovery",
+                            cid, str(m_name)[:50])
+            # Unlock CIDs where all batches are CLOSED
+            for cid in self._reward_exit_locked - active_cids:
+                self._reward_exit_locked.discard(cid)
+                self._awaiting_top_n_rescan.add(cid)
+                m_name = next((m.question for m in self.markets if m.condition_id == cid), cid)
+                log.warning("MARKET_REWARD_EXIT_UNLOCKED cid=%s market='%s' "
+                            "说明=所有批次已关闭，市场可在下次扫描后恢复报价",
+                            cid, str(m_name)[:50])
+
+    # ── Take fill credit: detect FAK fills and update batch ──
+
+    async def _credit_take_fills(self, now: float) -> None:
+        """Check fills_log for taker fills and credit them to TAKE_PENDING batches.
+
+        For each active take batch, find fills on the complement token that are
+        taker fills (path == 'reward_exit_take' or 'forced_hedge') and accumulate
+        take_filled_size, take_notional_usd, take_fee_usd.  When filled >= 2q,
+        transition to SELL_PENDING via compute_sell_target.
+        """
+        if self.broker is None or self.metrics is None or self.tracker is None:
+            return
+
+        open_batches = self.metrics.get_open_reward_exit_batches()
+        take_batches = [b for b in open_batches if b["status"] == "TAKE_PENDING"]
+        if not take_batches:
+            return
+
+        for b in take_batches:
+            bid = b["batch_id"]
+            # Broker writes the immutable fact; this call is idempotent for
+            # paper/recovery paths that were recorded before this tick.
+            for entry in self.broker.fills_log:
+                if (str(entry.get("batch_id") or "") != bid
+                        or str(entry.get("intent") or "") != "batch_take"):
+                    continue
+                fill_id = str(entry.get("fill_id") or entry.get("id") or "")
+                if not fill_id:
+                    continue
+                self.metrics.record_reward_exit_fill(
+                    fill_id=fill_id, batch_id=bid,
+                    order_id=str(entry.get("order_id") or ""),
+                    intent="batch_take", cid=str(entry.get("cid") or ""),
+                    token_id=str(entry.get("token") or ""),
+                    side=str(entry.get("side") or "BUY"),
+                    price=float(entry.get("price") or 0),
+                    size=float(entry.get("size") or 0),
+                    fee_usd=float(entry.get("fee") or 0),
+                    ts=float(entry.get("ts") or now),
+                )
+
+            persisted = self.metrics.list_reward_exit_fills(bid, intent="batch_take")
+            total_filled = sum(float(f["size"]) for f in persisted)
+            total_notional = sum(float(f["price"]) * float(f["size"])
+                                 for f in persisted)
+            total_fee = sum(float(f.get("fee_usd") or 0) for f in persisted)
+            prev_filled = float(b.get("take_filled_size") or 0)
+            if abs(total_filled - prev_filled) < 1e-9 and \
+                    abs(total_notional - float(b.get("take_notional_usd") or 0)) < 1e-9:
+                continue
+
+            # Update persisted batch with accumulated totals
+            self.metrics.update_reward_exit_batch(
+                batch_id=bid,
+                take_filled_size=total_filled,
+                take_notional_usd=total_notional,
+                take_fee_usd=total_fee,
+            )
+
+            log.warning(
+                "BATCH_TAKE_CREDITED batch_id=%s cid=%s "
+                "prev_filled=%.0f new=%.0f total=%.0f target=%.0f "
+                "说明=take成交已计入批次",
+                bid, b["cid"], prev_filled, total_filled - prev_filled,
+                total_filled, float(b["take_target_size"]),
+            )
+
+            # If take is fully filled, seal and compute SELL target
+            target = float(b["take_target_size"])
+            if total_filled >= target - 1e-9:
+                await self._seal_and_set_sell_target(b, persisted, now)
+
+    async def _seal_and_set_sell_target(
+        self, batch: dict, take_fill_dicts: list[dict], now: float,
+    ) -> None:
+        """Seal a fully-filled take batch: compute paired loss, set SELL target."""
+        if self.metrics is None or self.tracker is None or self.broker is None:
+            return
+
+        cid = batch["cid"]
+        batch_id = batch["batch_id"]
+
+        # Build TakeFill objects from the complete persisted batch history.
+        take_fills = sorted(
+            [reward_exit.TakeFill(
+                fill_id=f["fill_id"],
+                ts=f["ts"],
+                price=f["price"],
+                size=f["size"],
+                notional=float(f["price"]) * float(f["size"]),
+                fee_usd=float(f.get("fee_usd") or 0),
+            ) for f in take_fill_dicts],
+            key=lambda x: (x.ts, x.fill_id),
+        )
+
+        orig_size = float(batch["origin_size"])
+        orig_notional = float(batch["origin_notional_usd"])
+        orig_fee = float(batch["origin_fee_usd"])
+
+        # FIFO split + paired loss
+        split = reward_exit.split_take_fills_fifo(take_fills, orig_size)
+        paired_loss = reward_exit.compute_paired_loss(
+            origin_notional_usd=orig_notional,
+            origin_fee_usd=orig_fee,
+            paired_complement_notional=split.paired_notional,
+            paired_complement_fee=split.paired_fee,
+            origin_size=orig_size,
+        )
+
+        # Determine the market for fee computation
+        m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+        if m is None:
+            m = self._token_market.get(batch["complement_token_id"])
+        if m is None:
+            log.error(
+                "BATCH_SEAL_FAILED batch_id=%s cid=%s 说明=无法定位市场",
+                batch_id, cid,
+            )
+            return
+
+        complement_token = batch["complement_token_id"]
+        book = self.tracker.books.get(complement_token)
+        best_bid = book.best_bid if book else None
+
+        # Compute SELL target price
+        target_result = reward_exit.compute_sell_target(
+            market=m,
+            exit_size=orig_size,
+            exit_cost_notional=split.exit_notional,
+            exit_cost_fee=split.exit_fee,
+            paired_loss_usd=paired_loss,
+            best_bid=best_bid,
+        )
+
+        if target_result.price is None:
+            # Cannot compute a valid target — move to MANUAL_HOLD
+            self.metrics.update_reward_exit_batch(
+                batch_id=batch_id,
+                paired_size=orig_size,
+                paired_loss_usd=paired_loss,
+                exit_initial_size=orig_size,
+                status="MANUAL_HOLD",
+                manual_reason=target_result.reason,
+                updated_ts=now,
+            )
+            log.warning(
+                "BATCH_MANUAL_HOLD batch_id=%s cid=%s reason=%s "
+                "origin_notional=%.4f paired_notional=%.4f exit_notional=%.4f "
+                "paired_loss=%.4f 说明=无法计算有效卖出目标价",
+                batch_id, cid, target_result.reason,
+                orig_notional, split.paired_notional, split.exit_notional,
+                paired_loss,
+            )
+            return
+
+        # Seal → SELL_PENDING
+        self.metrics.update_reward_exit_batch(
+            batch_id=batch_id,
+            paired_size=orig_size,
+            paired_loss_usd=paired_loss,
+            exit_initial_size=orig_size,
+            exit_target_price=target_result.price,
+            status="SELL_PENDING",
+            updated_ts=now,
+        )
+
+        log.warning(
+            "BATCH_SEALED batch_id=%s cid=%s paired_loss=%.4f "
+            "exit_cost_notional=%.4f exit_cost_fee=%.4f "
+            "exit_target_price=%.4f exit_size=%.0f "
+            "required_net=%.4f 说明=TAKE完成，批次已密封，进入SELL阶段",
+            batch_id, cid, paired_loss,
+            split.exit_notional, split.exit_fee,
+            target_result.price, orig_size,
+            target_result.required_net_usd,
+        )
+
+        self._batch_last_take_attempt.pop(batch_id, None)
+
+    # ── Fill detection and batch creation ──
+
+    async def _process_reward_fills(self, now: float) -> None:
+        """Identify new normal reward BUY fills and create RewardExitBatches.
+
+        A fill qualifies when:
+        - It is a BUY (not SELL)
+        - It is not a taker fill (maker only)
+        - It is not an exit fill
+        - Its fill_id has not already been recorded as an origin_fill_id
+        - Its fill was placed as a normal reward quote (intent == 'normal_reward';
+          legacy paper entries may use path == 'normal')
+        """
+        if self.broker is None or self.metrics is None or self.tracker is None:
+            return
+
+        fills = self.broker.fills_log
+        known_fill_ids = self.metrics.reward_exit_batch_origin_fill_ids()
+
+        for entry in fills:
+            fill_id = str(entry.get("id") or entry.get("fill_id") or "")
+            if not fill_id or fill_id in known_fill_ids:
+                continue
+            side = str(entry.get("side") or "").upper()
+            if side != "YES" and side != "NO":
+                continue
+            if entry.get("taker") or entry.get("exit"):
+                continue
+            # Must be a normal reward quote fill.  The explicit intent is the
+            # durable discriminator; retain the path check for legacy paper
+            # fills created before intent was added.
+            path = str(entry.get("path") or "")
+            intent = str(entry.get("intent") or "")
+            if intent and intent != "normal_reward":
+                continue
+            if not intent and path != "normal":
+                continue
+
+            token = str(entry.get("token") or "")
+            cid = str(entry.get("cid") or "")
+            size = float(entry.get("size") or 0)
+            price = float(entry.get("price") or 0)
+            order_id = str(entry.get("order_id") or "")
+
+            if not token or not cid or size <= 0:
+                continue
+
+            # Determine complement token
+            m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+            if m is None:
+                m = self._token_market.get(token)
+            if m is None:
+                continue
+            complement = m.no_token if token == m.yes_token else m.yes_token
+
+            batch_id = f"reward-exit-{fill_id}"
+
+            # Persist the batch
+            self.metrics.open_reward_exit_batch(
+                batch_id=batch_id, cid=cid,
+                origin_order_id=order_id, origin_fill_id=fill_id,
+                origin_token_id=token, complement_token_id=complement,
+                origin_size=size,
+                origin_notional_usd=price * size,
+                origin_fee_usd=float(entry.get("fee") or entry.get("fee_usd") or 0.0),
+                take_target_size=2.0 * size,
+                created_ts=now,
+            )
+
+            log.warning(
+                "REWARD_EXIT_BATCH_OPENED batch_id=%s cid=%s market='%s' "
+                "token=%s size=%.0f price=%.4f complement=%s "
+                "说明=普通奖励成交已创建退出批次，准备 take %.0f 股互补 token",
+                batch_id, cid, m.question[:50],
+                "YES" if token == m.yes_token else "NO",
+                size, price,
+                "YES" if complement == m.yes_token else "NO",
+                2.0 * size,
+            )
+            known_fill_ids.add(fill_id)
+
+    # ── Batch advancement ──
+
+    async def _advance_reward_exit_batches(self, now: float) -> None:
+        """Advance each open batch: take → seal → SELL.
+
+        Only the first (oldest) TAKE_PENDING batch for each CID gets
+        take orders submitted — market lock serialization.
+        """
+        if self.broker is None or self.metrics is None or self.tracker is None:
+            return
+
+        open_batches = self.metrics.get_open_reward_exit_batches()
+        # Group by CID, process oldest TAKE_PENDING first
+        by_cid: dict[str, list[dict]] = {}
+        for b in open_batches:
+            by_cid.setdefault(b["cid"], []).append(b)
+
+        for cid, batches in by_cid.items():
+            # Find the oldest TAKE_PENDING batch — only one take at a time
+            take_batches = [b for b in batches if b["status"] == "TAKE_PENDING"]
+            if take_batches:
+                take_batches.sort(key=lambda b: b["created_ts"])
+                await self._advance_take_pending(cid, take_batches[0], now)
+
+            # SELL_PENDING batches
+            sell_batches = [b for b in batches if b["status"] == "SELL_PENDING"]
+            for b in sell_batches:
+                await self._advance_sell_pending(cid, b, now)
+
+    # ── Take stage: submit FAK BUY ──
+
+    async def _advance_take_pending(self, cid: str, batch: dict, now: float) -> None:
+        """Submit FAK BUY for remaining complement shares of a TAKE_PENDING batch."""
+        if self.broker is None or self.tracker is None:
+            return
+
+        complement_token = batch["complement_token_id"]
+        orig_size = float(batch["origin_size"])
+        target = 2.0 * orig_size
+        filled = float(batch["take_filled_size"])
+        remaining = reward_exit.remaining_take(target, filled)
+
+        if remaining <= 0:
+            return
+
+        # Check if complement book is available
+        book = self.tracker.books.get(complement_token)
+        if book is None:
+            return
+
+        best_ask = book.best_ask
+        if best_ask is None:
+            return
+
+        batch_id = batch["batch_id"]
+
+        if self._reward_exit_mode == "shadow":
+            log.warning(
+                "BATCH_TAKE_SUBMITTED batch_id=%s cid=%s complement=%s "
+                "size=%.0f remaining=%.0f ask=%.4f mode=shadow "
+                "说明=shadow模式，不实际提交take订单",
+                batch_id, cid, complement_token[:12], target, remaining, best_ask,
+            )
+            return
+
+        # Retry with backoff
+        last = self._batch_last_take_attempt.get(batch_id, 0.0)
+        if now - last < 5.0:  # 5-second retry interval
+            return
+        self._batch_last_take_attempt[batch_id] = now
+
+        # Determine tick for max legal price
+        m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+        if m is None:
+            m = self._token_market.get(complement_token)
+        tick = getattr(m, 'tick', 0.01) if m else 0.01
+        max_buy_price = 1.0 - tick
+
+        log.warning(
+            "BATCH_TAKE_SUBMITTED batch_id=%s cid=%s complement=%s "
+            "size=%.0f remaining=%.0f price=%.4f mode=active "
+            "说明=提交FAK BUY互补token",
+            batch_id, cid, complement_token[:12], target, remaining, max_buy_price,
+        )
+
+        # Use broker.taker_buy() for true FAK execution
+        filled_now = 0.0
+        if hasattr(self.broker, 'taker_buy') and m is not None:
+            async with self._market_lock(cid):
+                filled_now = await self._broker_call(
+                    self.broker.taker_buy,
+                    m, complement_token, remaining, max_buy_price,
+                    {"path": "reward_exit_take", "intent": "batch_take",
+                     "batch_id": batch_id},
+                )
+
+        if filled_now > 0:
+            # We record this fill in fills_log via record_user_fill (called
+            # by the live broker) or via _fill (paper broker).  The next
+            # _credit_take_fills tick will pick it up and update the batch.
+            log.warning(
+                "BATCH_TAKE_EXECUTED batch_id=%s cid=%s "
+                "filled=%.2f remaining_before=%.0f 说明=FAK买入了互补token",
+                batch_id, cid, filled_now, remaining,
+            )
+
+    # ── SELL stage: per-batch GTD maker SELL ──
+
+    # Track per-batch exit orders: batch_id → RestingOrder
+    _batch_exit_orders: dict[str, object] = {}
+
+    async def _advance_sell_pending(self, cid: str, batch: dict, now: float) -> None:
+        """Manage maker SELL for a SELL_PENDING batch.
+
+        Uses per-batch exit order tracking (_batch_exit_orders) to avoid the
+        singleton _exit_orders[cid] collision when multiple batches share a CID.
+        """
+        if self.broker is None or self.tracker is None:
+            return
+
+        batch_id = batch["batch_id"]
+        complement_token = batch["complement_token_id"]
+        target_price = float(batch["exit_target_price"])
+        exit_size = float(batch["exit_initial_size"])
+        filled = float(batch.get("exit_filled_size") or 0.0)
+
+        # Rebuild exit progress from the durable fill facts.  Scanning the
+        # broker log and adding to the batch on every tick double-counts the
+        # same fill after a restart.
+        persisted_fills: list[dict] = []
+        if self.metrics is not None:
+            for entry in getattr(self.broker, "fills_log", []):
+                if (str(entry.get("batch_id") or "") == batch_id
+                        and str(entry.get("intent") or "") == "batch_exit"):
+                    fill_id = str(entry.get("fill_id") or entry.get("id") or "")
+                    if not fill_id:
+                        continue
+                    self.metrics.record_reward_exit_fill(
+                        fill_id=fill_id, batch_id=batch_id,
+                        order_id=str(entry.get("order_id") or ""),
+                        intent="batch_exit", cid=cid,
+                        token_id=str(entry.get("token") or complement_token),
+                        side=str(entry.get("side") or "SELL"),
+                        price=float(entry.get("price") or 0),
+                        size=float(entry.get("size") or 0),
+                        fee_usd=float(entry.get("fee") or entry.get("fee_usd") or 0),
+                        ts=float(entry.get("ts") or now),
+                    )
+            persisted_fills = self.metrics.list_reward_exit_fills(
+                batch_id, intent="batch_exit")
+            filled = sum(float(f.get("size") or 0) for f in persisted_fills)
+            notional = sum(float(f.get("price") or 0) * float(f.get("size") or 0)
+                           for f in persisted_fills)
+            fees = sum(float(f.get("fee_usd") or 0) for f in persisted_fills)
+            if (abs(filled - float(batch.get("exit_filled_size") or 0)) > 1e-9
+                    or abs(notional - float(batch.get("exit_notional_usd") or 0)) > 1e-9):
+                self.metrics.update_reward_exit_batch(
+                    batch_id=batch_id, exit_filled_size=filled,
+                    exit_notional_usd=notional, exit_fee_usd=fees,
+                )
+        rem = max(0.0, exit_size - filled)
+
+        if rem <= 0:
+            # All exit shares sold — close batch
+            if self.metrics:
+                self.metrics.close_reward_exit_batch(batch_id=batch_id, closed_ts=now)
+            log.warning(
+                "REWARD_EXIT_BATCH_CLOSED batch_id=%s cid=%s "
+                "exit_filled=%.0f exit_size=%.0f 说明=所有退出份额已售出",
+                batch_id, cid, filled, exit_size,
+            )
+            self._batch_last_take_attempt.pop(batch_id, None)
+            self._batch_exit_orders.pop(batch_id, None)
+            return
+
+        if target_price <= 0:
+            # Target price not yet computed
+            return
+
+        # Determine market — fall back to token_market if not in self.markets
+        m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+        if m is None:
+            m = self._token_market.get(complement_token)
+        if m is None:
+            return
+
+        book = self.tracker.books.get(complement_token)
+        if book is None:
+            return
+
+        if persisted_fills:
+            latest = persisted_fills[-1]
+            log.info(
+                "BATCH_SELL_PROGRESS batch_id=%s cid=%s latest_fill=%.0f@%.4f "
+                "total_filled=%.0f remaining=%.0f",
+                batch_id, cid, float(latest.get("size") or 0),
+                float(latest.get("price") or 0), filled, rem,
+            )
+        if rem <= 0:
+            if self.metrics:
+                self.metrics.close_reward_exit_batch(batch_id=batch_id, closed_ts=now)
+            log.warning(
+                "REWARD_EXIT_BATCH_CLOSED batch_id=%s cid=%s "
+                "exit_filled=%.0f exit_size=%.0f 说明=所有退出份额已售出",
+                batch_id, cid, filled, exit_size,
+            )
+            self._batch_last_take_attempt.pop(batch_id, None)
+            self._batch_exit_orders.pop(batch_id, None)
+            return
+
+        best_bid = book.best_bid
+        tick = getattr(m, 'tick', 0.01)
+
+        # Apply bid floor: the actual SELL price must be ≥ best_bid + tick
+        if best_bid is not None:
+            floor = min(1.0 - tick, best_bid + tick)
+            if target_price < floor - 1e-9:
+                log.warning(
+                    "BATCH_SELL_PRICING batch_id=%s cid=%s "
+                    "target=%.4f best_bid=%.4f floor=%.4f "
+                    "说明=目标价低于best_bid+tick，使用floor价",
+                    batch_id, cid, target_price, best_bid, floor,
+                )
+                target_price = floor
+
+        # Rehydrate order identity from the broker/exchange view before
+        # creating anything.  A restart must not duplicate an existing GTD.
+        cur = self._batch_exit_orders.get(batch_id)
+        if cur is None:
+            cur = getattr(self.broker, "_reward_exit_orders", {}).get(batch_id)
+        if cur is None and self.metrics is not None:
+            persisted_order = self.metrics.get_reward_exit_order(batch_id)
+            if persisted_order and str(persisted_order.get("status")) == "OPEN":
+                order_id = str(persisted_order.get("order_id") or "")
+                for order in getattr(self.broker, "_reward_exit_orders", {}).values():
+                    if getattr(order, "order_id", "") == order_id:
+                        cur = order
+                        break
+                if cur is None:
+                    for order in getattr(self.broker, "_exit_orders", {}).values():
+                        if getattr(order, "order_id", "") == order_id:
+                            cur = order
+                            break
+                if cur is None:
+                    # No exchange truth means we cannot safely repost.  Keep
+                    # the market locked until a subsequent reconciliation
+                    # makes the order visible.
+                    if hasattr(self.broker, "reconcile_orders"):
+                        with contextlib.suppress(Exception):
+                            await self._broker_call(self.broker.reconcile_orders)
+                    log.warning(
+                        "BATCH_SELL_REHYDRATE_PENDING batch_id=%s order_id=%s "
+                        "说明=持久化卖单未在当前订单视图出现，暂不重复挂单",
+                        batch_id, order_id,
+                    )
+                    return
+
+        from .brokers import RestingOrder
+        GTD_REFRESH_MARGIN_SECS = 30.0  # same as broker's constant
+        if cur is not None:
+            cur_quote = getattr(cur, "quote", None)
+            cur_expiration = float(getattr(cur, "expiration", now) or now)
+            if (cur_quote is not None
+                    and cur_quote.token_id == complement_token
+                    and abs(cur_quote.price - target_price) < 1e-9
+                    and abs(cur_quote.size - rem) < 1e-9
+                    and (not isinstance(cur, RestingOrder)
+                         or cur_expiration - now >= GTD_REFRESH_MARGIN_SECS)):
+                return  # unchanged resting order
+
+        if self._reward_exit_mode == "shadow":
+            log.warning(
+                "BATCH_SELL_PLACED batch_id=%s cid=%s "
+                "size=%.0f price=%.4f mode=shadow "
+                "说明=shadow模式，不实际挂单",
+                batch_id, cid, rem, target_price,
+            )
+            return
+
+        # Cancel previous per-batch exit order if any
+        if cur is not None:
+            order_id = str(getattr(cur, "order_id", ""))
+            if hasattr(self.broker, "cancel_reward_exit"):
+                cancelled = await self._broker_call(
+                    self.broker.cancel_reward_exit, batch_id)
+            elif hasattr(self.broker, '_batch_cancel'):
+                cancelled = await self._broker_call(
+                    self.broker._batch_cancel, [order_id])
+            else:
+                cancelled = False
+            if not cancelled:
+                log.warning(
+                    "BATCH_SELL_CANCEL_FAILED batch_id=%s order_id=%s "
+                    "说明=旧卖单撤销失败，保留现状避免重复挂单",
+                    batch_id, order_id,
+                )
+                return
+            if self.metrics:
+                self.metrics.update_reward_exit_order(
+                    order_id, status="CANCELLED")
+
+        # Place new GTD SELL via the broker's batch-specific API.
+        sell_quote = strategy.Quote(complement_token, target_price, rem)
+        placed: RestingOrder | None = None
+        audit_context = {
+            "path": "reward_exit_exit", "intent": "batch_exit",
+            "batch_id": batch_id,
+        }
+        if hasattr(self.broker, "place_reward_exit"):
+            async with self._market_lock(cid):
+                placed = await self._broker_call(
+                    self.broker.place_reward_exit,
+                    m, batch_id, sell_quote, audit_context)
+        elif hasattr(self.broker, '_place_sell'):
+            async with self._market_lock(cid):
+                placed = await self._broker_call(
+                    self.broker._place_sell, sell_quote, audit_context)
+
+        if placed:
+            self._batch_exit_orders[batch_id] = placed
+            if self.metrics:
+                self.metrics.record_reward_exit_order(
+                    order_id=placed.order_id, batch_id=batch_id,
+                    intent="batch_exit", cid=cid,
+                    token_id=complement_token, side="SELL",
+                    price=target_price, size=rem,
+                    expiration=float(getattr(placed, "expiration", 0) or 0),
+                    status="OPEN",
+                )
+            log.warning(
+                "BATCH_SELL_PLACED batch_id=%s cid=%s "
+                "size=%.0f price=%.4f mode=active order_id=%s "
+                "说明=批次退出卖单已挂出",
+                batch_id, cid, rem, target_price, placed.order_id,
+            )
+        else:
+            log.warning(
+                "BATCH_SELL_FAILED batch_id=%s cid=%s "
+                "size=%.0f price=%.4f 说明=退出卖单提交失败",
+                batch_id, cid, rem, target_price,
+            )
+
+
     async def _quote_all(self) -> None:
         r = self.cfg["risk"]
         max_inv = r["max_inventory_usd_per_market"]
@@ -1954,6 +2629,21 @@ class Bot:
         manual_hold = self._manual_hold_cids()
         for m in all_markets:
             if m.condition_id in manual_hold:
+                continue
+            # P1.x: skip normal quoting for reward_exit_locked CIDs
+            if m.condition_id in self._reward_exit_locked:
+                self._quote_block_reasons[m.condition_id] = "奖励退出批次进行中，暂停普通报价"
+                self.metrics.sample_uptime(m.condition_id, False)
+                # Still allow exit orders for SELL_PENDING batches to stay
+                if self.broker.open_quotes(m):
+                    log.info("奖励退出锁定市场 '%s' — 撤销普通报价", m.question[:45])
+                    updates.append((m, [], None))
+                continue
+            if m.condition_id in self._awaiting_top_n_rescan:
+                self._quote_block_reasons[m.condition_id] = "奖励退出完成，等待重新进入TopN"
+                self.metrics.sample_uptime(m.condition_id, False)
+                if self.broker.open_quotes(m):
+                    updates.append((m, [], None))
                 continue
             unpaired = self.broker.unpaired_shares(m)
             needs_recovery = abs(unpaired) >= MIN_TAKER_SHARES
@@ -2279,6 +2969,9 @@ class Bot:
     async def _manage_market_inventory(self, cid: str, m: gamma.Market,
                                        managed: dict[str, gamma.Market],
                                        quoted: set[str], now: float) -> None:
+        # P1.x: skip old recovery for reward_exit_locked CIDs
+        if cid in self._reward_exit_locked or cid in self._awaiting_top_n_rescan:
+            return
         r = self.cfg["risk"]
         threshold = r["flatten_threshold_usd"] * self._scale
         wait = r["flatten_after_secs"]

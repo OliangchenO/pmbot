@@ -117,7 +117,8 @@ class UserFeed:
                     token, side, price, size, taker=False,
                     order_id=str(mo.get("order_id") or mo.get("id") or "") or None,
                     fill_id=str(ev.get("id") or ev.get("trade_id") or "") or None,
-                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None)
+                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None,
+                    fee_usd=float(ev.get("fee_usd") or ev.get("fee") or 0) or None)
         if not we_are_maker:
             # None of the maker orders are ours, so this event is about our
             # own taker order (e.g. a forced hedge crossing the spread).
@@ -129,4 +130,5 @@ class UserFeed:
                     token, taker_side, price, size, taker=True,
                     order_id=str(ev.get("order_id") or ev.get("orderID") or "") or None,
                     fill_id=str(ev.get("id") or ev.get("trade_id") or "") or None,
-                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None)
+                    trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None,
+                    fee_usd=float(ev.get("fee_usd") or ev.get("fee") or 0) or None)

@@ -9,6 +9,71 @@ from pmbot.gamma import Market
 from pmbot.metrics import MetricsStore
 
 
+def test_reward_exit_fill_duplicate_preserves_original_fact(tmp_path):
+    """A duplicate fill id must not overwrite the first recorded fill fact."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    first = {
+        "fill_id": "fill-1", "batch_id": "batch-1", "order_id": "order-1",
+        "intent": "TAKE", "cid": "cid-1", "token_id": "token-yes",
+        "side": "BUY", "price": 0.51, "size": 10.0, "fee_usd": 0.02,
+        "ts": 1_700_000_000.0,
+    }
+    assert store.record_reward_exit_fill(**first) is True
+
+    duplicate = {**first, "price": 0.99, "size": 99.0, "fee_usd": 9.99}
+    assert store.record_reward_exit_fill(**duplicate) is False
+
+    fills = store.list_reward_exit_fills("batch-1")
+    store.close()
+    assert fills == [first]
+
+
+def test_reward_exit_fill_list_filters_batch_and_intent(tmp_path):
+    """Batch fill queries must isolate the batch and optionally its intent."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    take = {
+        "fill_id": "take-1", "batch_id": "batch-1", "order_id": "take-order",
+        "intent": "TAKE", "cid": "cid-1", "token_id": "token-no",
+        "side": "BUY", "price": 0.52, "size": 20.0, "fee_usd": 0.04,
+        "ts": 100.0,
+    }
+    sell = {
+        "fill_id": "sell-1", "batch_id": "batch-1", "order_id": "sell-order",
+        "intent": "SELL", "cid": "cid-1", "token_id": "token-yes",
+        "side": "SELL", "price": 0.57, "size": 10.0, "fee_usd": 0.03,
+        "ts": 200.0,
+    }
+    other_batch = {**sell, "fill_id": "sell-2", "batch_id": "batch-2"}
+    assert store.record_reward_exit_fill(**take) is True
+    assert store.record_reward_exit_fill(**sell) is True
+    assert store.record_reward_exit_fill(**other_batch) is True
+
+    assert store.list_reward_exit_fills("batch-1") == [take, sell]
+    assert store.list_reward_exit_fills("batch-1", intent="SELL") == [sell]
+    store.close()
+
+
+def test_reward_exit_order_is_unique_and_update_persists_selected_fields(tmp_path):
+    """Duplicate order ids preserve the fact, while status updates remain durable."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    original = {
+        "order_id": "order-1", "batch_id": "batch-1", "intent": "SELL",
+        "cid": "cid-1", "token_id": "token-yes", "side": "SELL",
+        "price": 0.58, "size": 10.0, "expiration": 1_700_000_900.0,
+        "status": "OPEN",
+    }
+    assert store.record_reward_exit_order(**original) is True
+    assert store.record_reward_exit_order(**{**original, "status": "CANCELLED"}) is False
+    assert store.get_reward_exit_order("batch-1") == original
+
+    store.update_reward_exit_order(
+        "order-1", status="FILLED", expiration=1_700_001_000.0,
+    )
+    updated = store.get_reward_exit_order("batch-1")
+    store.close()
+    assert updated == {**original, "status": "FILLED", "expiration": 1_700_001_000.0}
+
+
 def test_report_totals_use_the_requested_utc_day(tmp_path):
     store = MetricsStore(str(tmp_path / "metrics.db"))
     old = datetime(2026, 7, 30, tzinfo=timezone.utc)

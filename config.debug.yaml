@@ -330,6 +330,12 @@ risk:
   recovery_escalate_after_secs: 180
   recovery_terminal_after_secs: 900
   recovery_loss_ban_threshold_usd: 15.0
+  # ── P1.x reward exit batch (per-fill double-take + maker SELL) ──
+  # off    = no batch creation or execution
+  # shadow = recognise fills, create batches, compute prices, log — but no real
+  #          cancel/take/SELL ops and old recovery still runs unchanged
+  # active = lock markets, cancel normal quotes, submit take and SELL broker calls
+  reward_exit_batch_mode: shadow
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
   # hedge threshold all scale by (current equity / capital_usd). Deposit more
   # and the bot sizes up automatically; draw down and it sizes down. Clamped

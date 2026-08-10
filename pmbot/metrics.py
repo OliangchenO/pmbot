@@ -202,6 +202,66 @@ class MetricsStore:
             CREATE INDEX IF NOT EXISTS idx_net_shadow_scans_ts ON net_shadow_scans (ts);
             CREATE INDEX IF NOT EXISTS idx_net_shadow_candidates_scan_rank
                 ON net_shadow_candidates (scan_id, shadow_rank);
+            CREATE TABLE IF NOT EXISTS reward_exit_batches (
+                batch_id       TEXT NOT NULL PRIMARY KEY,
+                cid            TEXT NOT NULL,
+                origin_order_id TEXT NOT NULL DEFAULT '',
+                origin_fill_id TEXT NOT NULL UNIQUE,  -- one batch per reward fill
+                origin_token_id TEXT NOT NULL DEFAULT '',
+                complement_token_id TEXT NOT NULL DEFAULT '',
+                origin_size    REAL NOT NULL DEFAULT 0.0,
+                origin_notional_usd REAL NOT NULL DEFAULT 0.0,
+                origin_fee_usd REAL NOT NULL DEFAULT 0.0,
+                take_target_size REAL NOT NULL DEFAULT 0.0,
+                take_filled_size REAL NOT NULL DEFAULT 0.0,
+                take_notional_usd REAL NOT NULL DEFAULT 0.0,
+                take_fee_usd  REAL NOT NULL DEFAULT 0.0,
+                paired_size   REAL NOT NULL DEFAULT 0.0,
+                paired_loss_usd REAL NOT NULL DEFAULT 0.0,
+                exit_initial_size REAL NOT NULL DEFAULT 0.0,
+                exit_filled_size REAL NOT NULL DEFAULT 0.0,
+                exit_notional_usd REAL NOT NULL DEFAULT 0.0,
+                exit_fee_usd  REAL NOT NULL DEFAULT 0.0,
+                exit_target_price REAL NOT NULL DEFAULT 0.0,
+                status        TEXT NOT NULL DEFAULT 'TAKE_PENDING',
+                manual_reason TEXT NOT NULL DEFAULT '',
+                created_ts    REAL NOT NULL DEFAULT 0.0,
+                updated_ts    REAL NOT NULL DEFAULT 0.0,
+                closed_ts     REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reward_exit_batches_cid
+                ON reward_exit_batches (cid);
+            CREATE INDEX IF NOT EXISTS idx_reward_exit_batches_status
+                ON reward_exit_batches (status);
+            CREATE TABLE IF NOT EXISTS reward_exit_fills (
+                fill_id      TEXT NOT NULL PRIMARY KEY,
+                batch_id     TEXT NOT NULL,
+                order_id     TEXT NOT NULL,
+                intent       TEXT NOT NULL,
+                cid          TEXT NOT NULL,
+                token_id     TEXT NOT NULL,
+                side         TEXT NOT NULL,
+                price        REAL NOT NULL,
+                size         REAL NOT NULL,
+                fee_usd      REAL NOT NULL,
+                ts           REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reward_exit_fills_batch_intent_ts
+                ON reward_exit_fills (batch_id, intent, ts, fill_id);
+            CREATE TABLE IF NOT EXISTS reward_exit_orders (
+                order_id     TEXT NOT NULL PRIMARY KEY,
+                batch_id     TEXT NOT NULL,
+                intent       TEXT NOT NULL,
+                cid          TEXT NOT NULL,
+                token_id     TEXT NOT NULL,
+                side         TEXT NOT NULL,
+                price        REAL NOT NULL,
+                size         REAL NOT NULL,
+                expiration   REAL NOT NULL,
+                status       TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reward_exit_orders_batch
+                ON reward_exit_orders (batch_id);
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
@@ -715,6 +775,290 @@ class MetricsStore:
                     (value, cid),
                 )
                 self._conn.commit()
+
+    # ── P1.x reward exit batch lifecycle ──
+
+    def record_reward_exit_fill(
+            self, *, fill_id: str, batch_id: str, order_id: str, intent: str,
+            cid: str, token_id: str, side: str, price: float, size: float,
+            fee_usd: float, ts: float,
+    ) -> bool:
+        """Record one immutable reward-exit fill, returning False if known."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO reward_exit_fills "
+                "(fill_id,batch_id,order_id,intent,cid,token_id,side,price,"
+                "size,fee_usd,ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (fill_id, batch_id, order_id, intent, cid, token_id, side,
+                 price, size, fee_usd, ts),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def list_reward_exit_fills(
+            self, batch_id: str, intent: str | None = None,
+    ) -> list[dict]:
+        """List persisted fills for one batch, optionally filtered by intent."""
+        query = (
+            "SELECT fill_id,batch_id,order_id,intent,cid,token_id,side,price,"
+            "size,fee_usd,ts FROM reward_exit_fills WHERE batch_id=?"
+        )
+        params: list = [batch_id]
+        if intent is not None:
+            query += " AND intent=?"
+            params.append(intent)
+        rows = self._conn.execute(
+            query + " ORDER BY ts, fill_id", params,
+        ).fetchall()
+        keys = (
+            "fill_id", "batch_id", "order_id", "intent", "cid", "token_id",
+            "side", "price", "size", "fee_usd", "ts",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def record_reward_exit_order(
+            self, *, order_id: str, batch_id: str, intent: str, cid: str,
+            token_id: str, side: str, price: float, size: float,
+            expiration: float, status: str,
+    ) -> bool:
+        """Record one immutable reward-exit order, returning False if known."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO reward_exit_orders "
+                "(order_id,batch_id,intent,cid,token_id,side,price,size,"
+                "expiration,status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (order_id, batch_id, intent, cid, token_id, side, price,
+                 size, expiration, status),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def get_reward_exit_order(self, batch_id: str) -> dict | None:
+        """Return the latest persisted order for one batch, if any."""
+        row = self._conn.execute(
+            "SELECT order_id,batch_id,intent,cid,token_id,side,price,size,"
+            "expiration,status FROM reward_exit_orders WHERE batch_id=? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "order_id", "batch_id", "intent", "cid", "token_id", "side",
+            "price", "size", "expiration", "status",
+        )
+        return dict(zip(keys, row))
+
+    def update_reward_exit_order(self, order_id: str, **fields) -> None:
+        """Atomically update persisted mutable order fields."""
+        valid = frozenset({
+            "batch_id", "intent", "cid", "token_id", "side", "price",
+            "size", "expiration", "status",
+        })
+        filtered = {key: value for key, value in fields.items() if key in valid}
+        if not filtered:
+            return
+        sets = ", ".join(f"{key}=?" for key in filtered)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE reward_exit_orders SET {sets} WHERE order_id=?",
+                list(filtered.values()) + [order_id],
+            )
+            self._conn.commit()
+
+    def open_reward_exit_batch(
+            self, *, batch_id: str, cid: str, origin_order_id: str,
+            origin_fill_id: str, origin_token_id: str,
+            complement_token_id: str, origin_size: float,
+            origin_notional_usd: float, origin_fee_usd: float,
+            take_target_size: float, created_ts: float,
+    ) -> bool:
+        """Create a new reward exit batch.  Returns False on duplicate origin_fill_id."""
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO reward_exit_batches "
+                    "(batch_id, cid, origin_order_id, origin_fill_id, "
+                    "origin_token_id, complement_token_id, origin_size, "
+                    "origin_notional_usd, origin_fee_usd, take_target_size, "
+                    "status, created_ts, updated_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (batch_id, cid, origin_order_id, origin_fill_id,
+                     origin_token_id, complement_token_id, origin_size,
+                     origin_notional_usd, origin_fee_usd, take_target_size,
+                     "TAKE_PENDING", created_ts, created_ts),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def get_reward_exit_batch(self, batch_id: str) -> dict | None:
+        """Return one batch by its id, or None."""
+        row = self._conn.execute(
+            "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+            "origin_token_id, complement_token_id, origin_size, "
+            "origin_notional_usd, origin_fee_usd, take_target_size, "
+            "take_filled_size, take_notional_usd, take_fee_usd, "
+            "paired_size, paired_loss_usd, exit_initial_size, "
+            "exit_filled_size, exit_notional_usd, exit_fee_usd, "
+            "exit_target_price, status, manual_reason, "
+            "created_ts, updated_ts, closed_ts "
+            "FROM reward_exit_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MetricsStore._reward_exit_batch_row_to_dict(row)
+
+    def get_open_reward_exit_batches(self, cid: str | None = None) -> list[dict]:
+        """Return all open (non-CLOSED) batches, optionally filtered by cid."""
+        if cid is not None:
+            rows = self._conn.execute(
+                "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+                "origin_token_id, complement_token_id, origin_size, "
+                "origin_notional_usd, origin_fee_usd, take_target_size, "
+                "take_filled_size, take_notional_usd, take_fee_usd, "
+                "paired_size, paired_loss_usd, exit_initial_size, "
+                "exit_filled_size, exit_notional_usd, exit_fee_usd, "
+                "exit_target_price, status, manual_reason, "
+                "created_ts, updated_ts, closed_ts "
+                "FROM reward_exit_batches WHERE status != 'CLOSED' AND cid=? "
+                "ORDER BY created_ts",
+                (cid,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+                "origin_token_id, complement_token_id, origin_size, "
+                "origin_notional_usd, origin_fee_usd, take_target_size, "
+                "take_filled_size, take_notional_usd, take_fee_usd, "
+                "paired_size, paired_loss_usd, exit_initial_size, "
+                "exit_filled_size, exit_notional_usd, exit_fee_usd, "
+                "exit_target_price, status, manual_reason, "
+                "created_ts, updated_ts, closed_ts "
+                "FROM reward_exit_batches WHERE status != 'CLOSED' "
+                "ORDER BY created_ts",
+            ).fetchall()
+        return [MetricsStore._reward_exit_batch_row_to_dict(r) for r in rows]
+
+    def update_reward_exit_batch(
+            self, *, batch_id: str, **fields,
+    ) -> None:
+        """Atomic partial update of a reward exit batch.
+
+        Accepts the subset of batch fields that change mid-life:
+        take_filled_size, take_notional_usd, take_fee_usd,
+        paired_size, paired_loss_usd, exit_initial_size, exit_target_price,
+        exit_filled_size, exit_notional_usd, exit_fee_usd,
+        status, manual_reason, closed_ts, updated_ts.
+
+        All updates are applied in a single transaction — a state transition
+        and its economic fields are always committed together.
+        """
+        if not fields:
+            return
+        valid = frozenset({
+            "take_filled_size", "take_notional_usd", "take_fee_usd",
+            "paired_size", "paired_loss_usd", "exit_initial_size",
+            "exit_target_price",
+            "exit_filled_size", "exit_notional_usd", "exit_fee_usd",
+            "status", "manual_reason", "closed_ts", "updated_ts",
+        })
+        filtered = {k: v for k, v in fields.items() if k in valid}
+        if not filtered:
+            return
+        filtered.setdefault("updated_ts", time.time())
+        sets = ", ".join(f"{k}=?" for k in filtered)
+        params = list(filtered.values()) + [batch_id]
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE reward_exit_batches SET {sets} WHERE batch_id=?",
+                params,
+            )
+            self._conn.commit()
+
+    def close_reward_exit_batch(
+            self, *, batch_id: str, status: str = "CLOSED",
+            closed_ts: float | None = None, manual_reason: str = "",
+            exit_filled_size: float | None = None,
+            exit_notional_usd: float | None = None,
+            exit_fee_usd: float | None = None,
+    ) -> None:
+        """Mark a batch as CLOSED or MANUAL_HOLD."""
+        closed = closed_ts if closed_ts is not None else time.time()
+        sets = ["status=?", "closed_ts=?", "updated_ts=?"]
+        params: list = [status, closed, closed]
+        if manual_reason:
+            sets.append("manual_reason=?")
+            params.append(manual_reason)
+        if exit_filled_size is not None:
+            sets.append("exit_filled_size=?")
+            params.append(exit_filled_size)
+        if exit_notional_usd is not None:
+            sets.append("exit_notional_usd=?")
+            params.append(exit_notional_usd)
+        if exit_fee_usd is not None:
+            sets.append("exit_fee_usd=?")
+            params.append(exit_fee_usd)
+        params.append(batch_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE reward_exit_batches SET {', '.join(sets)} "
+                "WHERE batch_id=?",
+                params,
+            )
+            self._conn.commit()
+
+    def list_reward_exit_batches(
+            self, *, limit: int = 100, offset: int = 0,
+            cid: str | None = None, open_only: bool = False,
+    ) -> list[dict]:
+        """Read-only listing sorted by created_ts DESC."""
+        where: list[str] = []
+        params: list = []
+        if open_only:
+            where.append("status != 'CLOSED'")
+        if cid is not None:
+            where.append("cid = ?")
+            params.append(cid)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = self._conn.execute(
+            f"SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+            f"origin_token_id, complement_token_id, origin_size, "
+            f"origin_notional_usd, origin_fee_usd, take_target_size, "
+            f"take_filled_size, take_notional_usd, take_fee_usd, "
+            f"paired_size, paired_loss_usd, exit_initial_size, "
+            f"exit_filled_size, exit_notional_usd, exit_fee_usd, "
+            f"exit_target_price, status, manual_reason, "
+            f"created_ts, updated_ts, closed_ts "
+            f"FROM reward_exit_batches {clause} "
+            f"ORDER BY created_ts DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()
+        return [MetricsStore._reward_exit_batch_row_to_dict(r) for r in rows]
+
+    def reward_exit_batch_origin_fill_ids(self) -> set[str]:
+        """All origin_fill_ids ever recorded — used for idempotency."""
+        rows = self._conn.execute(
+            "SELECT origin_fill_id FROM reward_exit_batches"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    @staticmethod
+    def _reward_exit_batch_row_to_dict(row: tuple) -> dict:
+        """Convert a 25-column row tuple to a dictionary."""
+        keys = [
+            "batch_id", "cid", "origin_order_id", "origin_fill_id",
+            "origin_token_id", "complement_token_id", "origin_size",
+            "origin_notional_usd", "origin_fee_usd", "take_target_size",
+            "take_filled_size", "take_notional_usd", "take_fee_usd",
+            "paired_size", "paired_loss_usd", "exit_initial_size",
+            "exit_filled_size", "exit_notional_usd", "exit_fee_usd",
+            "exit_target_price", "status", "manual_reason",
+            "created_ts", "updated_ts", "closed_ts",
+        ]
+        return dict(zip(keys, row))
 
     def recovery_event_cost_basis(self, cid: str,
                                    since_ts: float) -> float | None:

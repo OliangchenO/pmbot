@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +124,15 @@ class PaperQuoteState:
     active_at: float = 0.0  # resting on the book only once now >= active_at
 
 
+@dataclass
+class PaperRewardExitState:
+    order_id: str
+    quote: Quote
+    audit: dict = field(default_factory=dict)
+    queue_ahead: float = 0.0
+    active_at: float = 0.0
+
+
 def _parse_fill_amount(resp: dict, requested: float) -> float:
     for key in ("takingAmount", "taking_amount", "size_matched", "sizeMatched"):
         val = resp.get(key)
@@ -160,6 +170,7 @@ class PaperBroker:
         self.unpaired_since: dict[str, float] = {}
         self._quotes: dict[str, list[PaperQuoteState]] = {}
         self._exits: dict[str, PaperQuoteState] = {}
+        self._reward_exits: dict[str, PaperRewardExitState] = {}
         # Quotes whose cancel is still in flight: list of (quote, fillable_until).
         self._dying: dict[str, list[tuple[Quote, float]]] = {}
         self._markets: dict[str, Market] = {}
@@ -274,6 +285,10 @@ class PaperBroker:
             return
         now = time.time()
         cid = market.condition_id
+        # A trade print is one shared volume budget.  Keep it across ordinary
+        # quotes, the legacy exit, and per-batch exits so simultaneous orders
+        # cannot all consume the same print.
+        trade_remaining = max(0.0, size) if size > 0 else float("inf")
 
         # Stale quotes whose cancel hasn't landed yet get picked off by
         # through-prints — the dominant live cost paper used to miss.
@@ -282,8 +297,10 @@ class PaperBroker:
             if now >= until:
                 continue
             if q.token_id == token_id and trade_price < q.price - 1e-9:
-                fill_sz = min(q.size, size) if size > 0 else q.size
-                self._fill(market, Quote(q.token_id, q.price, fill_sz), fill_sz)
+                fill_sz = min(q.size, trade_remaining)
+                if fill_sz > 0:
+                    self._fill(market, Quote(q.token_id, q.price, fill_sz), fill_sz)
+                    trade_remaining -= fill_sz
             else:
                 keep_dying.append((q, until))
         self._dying[cid] = keep_dying
@@ -304,19 +321,23 @@ class PaperBroker:
                     remaining.append(st)
                     continue
                 # Price priority guarantees the fill, but only for the taker's size.
-                fill_sz = min(q.size, size) if size > 0 else q.size
-                self._fill(market, Quote(q.token_id, q.price, fill_sz), fill_sz)
+                fill_sz = min(q.size, trade_remaining)
+                if fill_sz > 0:
+                    self._fill(market, Quote(q.token_id, q.price, fill_sz), fill_sz)
+                    trade_remaining -= fill_sz
                 if fill_sz < q.size - 1e-9:
                     st.quote = Quote(q.token_id, q.price, q.size - fill_sz)
                     st.queue_ahead = 0.0
                     remaining.append(st)
-            elif abs(trade_price - q.price) < 1e-9 and size > 0:
-                consume = min(size, st.queue_ahead)
+            elif abs(trade_price - q.price) < 1e-9 and trade_remaining > 0:
+                consume = min(trade_remaining, st.queue_ahead)
                 st.queue_ahead -= consume
-                leftover = size - consume
+                trade_remaining -= consume
+                leftover = trade_remaining
                 if active and leftover > 0 and st.queue_ahead <= 1e-9:
                     fill_sz = min(leftover, q.size)
                     self._fill(market, Quote(q.token_id, q.price, fill_sz), fill_sz)
+                    trade_remaining -= fill_sz
                     if fill_sz < q.size - 1e-9:
                         st.quote = Quote(q.token_id, q.price, q.size - fill_sz)
                         remaining.append(st)
@@ -331,20 +352,58 @@ class PaperBroker:
             active = now >= ex.active_at
             if trade_price > ex.quote.price + 1e-9:
                 if active:
-                    self._fill_exit(market, ex.quote, ex.quote.size)
-                    self._exits.pop(cid, None)
-            elif abs(trade_price - ex.quote.price) < 1e-9 and size > 0:
-                consume = min(size, ex.queue_ahead)
+                    fill_sz = min(trade_remaining, ex.quote.size)
+                    if fill_sz > 0:
+                        self._fill_exit(market, ex.quote, fill_sz)
+                        trade_remaining -= fill_sz
+                        if fill_sz >= ex.quote.size - 1e-9:
+                            self._exits.pop(cid, None)
+                        else:
+                            ex.quote = Quote(token_id, ex.quote.price,
+                                             ex.quote.size - fill_sz)
+            elif abs(trade_price - ex.quote.price) < 1e-9 and trade_remaining > 0:
+                consume = min(trade_remaining, ex.queue_ahead)
                 ex.queue_ahead -= consume
-                leftover = size - consume
+                trade_remaining -= consume
+                leftover = trade_remaining
                 if active and leftover > 0 and ex.queue_ahead <= 1e-9:
                     fill_sz = min(leftover, ex.quote.size)
                     self._fill_exit(market, ex.quote, fill_sz)
+                    trade_remaining -= fill_sz
                     if fill_sz >= ex.quote.size - 1e-9:
                         self._exits.pop(cid, None)
                     else:
                         ex.quote = Quote(token_id, ex.quote.price,
                                          ex.quote.size - fill_sz)
+
+        # Batch reward exits are independent per batch and must not reuse the
+        # singleton recovery exit above.
+        for batch_id, ex in list(self._reward_exits.items()):
+            if trade_remaining <= 1e-9:
+                break
+            if ex.quote.token_id != token_id:
+                continue
+            active = now >= ex.active_at
+            fill_sz = 0.0
+            if trade_price > ex.quote.price + 1e-9 and active:
+                fill_sz = min(trade_remaining, ex.quote.size)
+            elif abs(trade_price - ex.quote.price) < 1e-9 and trade_remaining > 0:
+                consume = min(trade_remaining, ex.queue_ahead)
+                ex.queue_ahead -= consume
+                trade_remaining -= consume
+                leftover = trade_remaining
+                if active and leftover > 0 and ex.queue_ahead <= 1e-9:
+                    fill_sz = min(leftover, ex.quote.size)
+            if fill_sz <= 0:
+                continue
+            self._fill_exit(market, ex.quote, fill_sz,
+                            order_id=ex.order_id, audit=ex.audit)
+            if fill_sz >= ex.quote.size - 1e-9:
+                self._reward_exits.pop(batch_id, None)
+            else:
+                ex.quote = Quote(token_id, ex.quote.price,
+                                 ex.quote.size - fill_sz)
+            trade_remaining = max(0.0, trade_remaining - fill_sz)
 
     def check_crossed_books(self) -> None:
         now = time.time()
@@ -383,6 +442,23 @@ class PaperBroker:
                 self._fill_exit(self._markets[cid], ex.quote, ex.quote.size)
                 self._exits.pop(cid, None)
 
+    def _record_reward_exit_fact(self, entry: dict) -> None:
+        if not self.metrics or not hasattr(self.metrics, "record_reward_exit_fill"):
+            return
+        intent = str(entry.get("intent") or "")
+        if intent not in {"normal_reward", "batch_take", "batch_exit"}:
+            return
+        self.metrics.record_reward_exit_fill(
+            fill_id=str(entry["fill_id"]),
+            batch_id=str(entry.get("batch_id") or ""),
+            order_id=str(entry.get("order_id") or ""),
+            intent=intent,
+            cid=str(entry["cid"]), token_id=str(entry["token"]),
+            side=str(entry["side"]), price=float(entry["price"]),
+            size=float(entry["size"]), fee_usd=float(entry.get("fee") or 0.0),
+            ts=float(entry["ts"]),
+        )
+
     def _fill(self, market: Market, q: Quote, size: float) -> None:
         pos = self.state.positions.setdefault(market.condition_id, Position())
         # Maker fill: no fee on Polymarket.
@@ -404,17 +480,22 @@ class PaperBroker:
             "ts": time.time(), "cid": market.condition_id,
             "market": market.question[:50], "side": side,
             "token": q.token_id, "price": q.price, "size": size, "merged": merged,
+            "path": "normal", "intent": "normal_reward",
+            "fill_id": f"paper-{uuid.uuid4().hex}",
         }
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
+            self._record_reward_exit_fact(entry)
             if merged:
                 self.metrics.record_merge(market.condition_id, merged)
         log.info("成交：%s %s %.0f 股 @ %.3f（已合并 %.0f 对）",
                  market.question[:40], side, size, q.price, merged)
         self._persist()
 
-    def _fill_exit(self, market: Market, q: Quote, fill_sz: float) -> None:
+    def _fill_exit(self, market: Market, q: Quote, fill_sz: float,
+                   *, order_id: str | None = None,
+                   audit: dict | None = None) -> None:
         pos = self.state.positions.setdefault(market.condition_id, Position())
         if q.token_id == market.yes_token:
             size = min(fill_sz, pos.yes_shares)
@@ -433,19 +514,28 @@ class PaperBroker:
         # Resting limit-sell exit is a maker order: no fee on Polymarket.
         self.state.cash += q.price * size
         pos.fills += 1
+        context = audit or {}
         entry = {
             "ts": time.time(), "cid": market.condition_id,
             "market": market.question[:50], "side": side,
             "token": q.token_id, "price": q.price, "size": size, "exit": True,
+            "fill_id": f"paper-{uuid.uuid4().hex}",
         }
+        if order_id:
+            entry["order_id"] = order_id
+        if context.get("batch_id"):
+            entry["batch_id"] = context["batch_id"]
+        entry["intent"] = context.get("intent", "batch_exit") if context else "normal_exit"
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
+            self._record_reward_exit_fact(entry)
         log.info("退出成交：%s 卖出 %.0f 股 %s @ %.3f",
                  market.question[:40], size, side, q.price)
         self._persist()
 
-    def taker_buy(self, market: Market, token_id: str, size: float, max_price: float) -> float:
+    def taker_buy(self, market: Market, token_id: str, size: float,
+                  max_price: float, audit_context: dict | None = None) -> float:
         book = self.tracker.books.get(token_id)
         if book is None or not book.asks:
             return 0.0
@@ -478,17 +568,25 @@ class PaperBroker:
         merged = pos.merge()
         if merged:
             self.state.cash += merged
+        context = audit_context or {}
+        intent = context.get("intent", "forced_hedge")
+        path = context.get(
+            "path", "reward_exit_take" if intent == "batch_take" else "forced_hedge")
         entry = {
             "ts": time.time(), "cid": market.condition_id,
             "market": market.question[:50], "side": side,
             "token": token_id, "price": avg, "size": filled, "merged": merged,
-            "taker": True,
+            "taker": True, "path": path, "intent": intent,
+            "fill_id": f"paper-{uuid.uuid4().hex}",
         }
+        if context.get("batch_id"):
+            entry["batch_id"] = context["batch_id"]
         if fee > 0:
             entry["fee"] = fee
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
+            self._record_reward_exit_fact(entry)
             self.metrics.record_hedge(market.condition_id, avg, filled)
             if merged:
                 self.metrics.record_merge(market.condition_id, merged)
@@ -497,6 +595,25 @@ class PaperBroker:
                  f", fee ${fee:.2f}" if fee > 0 else "")
         self._persist()
         return filled
+
+    def place_reward_exit(self, market: Market, batch_id: str,
+                          quote: Quote, audit_context: dict) -> PaperRewardExitState | None:
+        self._markets[market.condition_id] = market
+        self._token_to_market[market.yes_token] = market
+        self._token_to_market[market.no_token] = market
+        book = self.tracker.books.get(quote.token_id)
+        ahead = book.bids.get(quote.price, 0.0) if book else 0.0
+        state = PaperRewardExitState(
+            order_id=f"paper-exit-{uuid.uuid4().hex}", quote=quote,
+            audit={**audit_context, "batch_id": batch_id, "intent": "batch_exit"},
+            queue_ahead=ahead, active_at=time.time() + self.latency,
+        )
+        self._reward_exits[batch_id] = state
+        return state
+
+    def cancel_reward_exit(self, batch_id: str) -> bool:
+        self._reward_exits.pop(batch_id, None)
+        return True
 
     def position_tokens(self) -> list[str]:
         tokens = []
@@ -673,6 +790,8 @@ class LiveBroker:
         self.ws_fills_active = False
         self._open_orders: dict[str, list[RestingOrder]] = {}
         self._exit_orders: dict[str, RestingOrder] = {}
+        self._reward_exit_orders: dict[str, RestingOrder] = {}
+        self._taker_order_contexts: dict[str, dict] = {}
         self._markets: dict[str, Market] = {}
         self._unmanaged_position_cids: set[str] = set()
         self._positions: dict[str, dict] = {}
@@ -825,7 +944,10 @@ class LiveBroker:
         for ro in getattr(self, "_exit_orders", {}).values():
             if ro.order_id == order_id:
                 return ro.audit
-        return {}
+        for ro in getattr(self, "_reward_exit_orders", {}).values():
+            if ro.order_id == order_id:
+                return ro.audit
+        return getattr(self, "_taker_order_contexts", {}).get(order_id, {})
 
     def _resting_order_context(self, order_id: str) -> tuple[Market | None, Quote | None, str | None]:
         for cid, orders in getattr(self, "_open_orders", {}).items():
@@ -867,7 +989,8 @@ class LiveBroker:
             self._record_order_event("ORDER_POST_FAILED", quote=q, side="BUY", reason=str(e))
         return None
 
-    def _place_sell(self, q: Quote) -> RestingOrder | None:
+    def _place_sell(self, q: Quote,
+                    audit_context: dict | None = None) -> RestingOrder | None:
         from py_clob_client_v2 import AssetType, OrderArgs, OrderType, Side
         from py_clob_client_v2 import BalanceAllowanceParams
 
@@ -910,10 +1033,12 @@ class LiveBroker:
                 resp = self.client.post_order(signed, OrderType.GTD)
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
-                ro = RestingOrder(oid, q, time.time(), expiration)
+                ro = RestingOrder(oid, q, time.time(), expiration,
+                                  audit_context or {})
                 market = next((m for m in getattr(self, "_markets", {}).values()
                                if q.token_id in (m.yes_token, m.no_token)), None)
-                self._record_order_event("ORDER_PLACED", market, q, "SELL", oid)
+                self._record_order_event("ORDER_PLACED", market, q, "SELL", oid,
+                                         audit=audit_context)
                 return ro
         except Exception as e:  # noqa: BLE001
             log.error("退出订单提交失败（%s @ %.3f）：%s", q.token_id[:12], q.price, e)
@@ -1165,6 +1290,24 @@ class LiveBroker:
             return True
         return False  # _place_sell logged the specific reason
 
+    def place_reward_exit(self, market: Market, batch_id: str,
+                          quote: Quote, audit_context: dict) -> RestingOrder | None:
+        self._markets[market.condition_id] = market
+        context = {**audit_context, "batch_id": batch_id, "intent": "batch_exit"}
+        ro = self._place_sell(quote, context)
+        if ro:
+            self._reward_exit_orders[batch_id] = ro
+        return ro
+
+    def cancel_reward_exit(self, batch_id: str) -> bool:
+        ro = self._reward_exit_orders.get(batch_id)
+        if ro is None:
+            return True
+        ok = self._batch_cancel([ro.order_id], reason="reward_exit_replace")
+        if ok:
+            self._reward_exit_orders.pop(batch_id, None)
+        return ok
+
     def exit_quote(self, market: Market) -> Quote | None:
         cur = self._exit_orders.get(market.condition_id)
         return cur.quote if cur else None
@@ -1208,7 +1351,7 @@ class LiveBroker:
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float,
                   audit_context: dict | None = None) -> float:
         from py_clob_client_v2 import (
-            AssetType, MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side,
+            AssetType, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
         )
 
         size = round(size, 2)
@@ -1220,21 +1363,25 @@ class LiveBroker:
         # rejected ("invalid amounts ... maker amount supports a max accuracy of 2
         # decimals"). The market-order builder takes the spend amount directly and
         # rounds it correctly, so quote in collateral terms instead.
-        amount = round(size * max_price, 2)
-        if amount <= 0:
+        if size <= 0 or max_price <= 0:
             return 0.0
         try:
             with self._state_lock:
                 with self._client_lock:
-                    signed = self.client.create_market_order(MarketOrderArgs(
-                        token_id=token_id, amount=amount, side=Side.BUY,
-                        price=max_price, order_type=OrderType.FAK,
+                    signed = self.client.create_order(OrderArgs(
+                        token_id=token_id, price=max_price, size=size,
+                        side=Side.BUY, expiration=0,
                     ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
                     resp = self.client.post_order(signed, OrderType.FAK)
                 filled = _parse_fill_amount(resp, size)
                 order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")
                             or "") if isinstance(resp, dict) else ""
                 context = {"path": "forced_hedge", **(audit_context or {})}
+                if order_id:
+                    contexts = getattr(self, "_taker_order_contexts", None)
+                    if contexts is None:
+                        contexts = self._taker_order_contexts = {}
+                    contexts[order_id] = context
                 getattr(self, "audit", AuditLogger(None)).record({
                     "event": "order_placed", "cid": market.condition_id,
                     "market": market.question, "order_id": order_id or None,
@@ -1246,7 +1393,8 @@ class LiveBroker:
                     "expected_pair_pnl": context.get("expected_pair_pnl"),
                 })
                 if filled > 0:
-                    LiveBroker._register_pending_hedge(self, market, token_id, filled)
+                    if context.get("intent") != "batch_take":
+                        LiveBroker._register_pending_hedge(self, market, token_id, filled)
                     _notify_live_fill(
                         getattr(self, "notifier", None),
                         {
@@ -1269,7 +1417,8 @@ class LiveBroker:
             self.metrics.record_hedge(market.condition_id, max_price, filled)
         return filled
 
-    def _apply_fill_to_orders(self, token_id: str, size: float, side: str) -> None:
+    def _apply_fill_to_orders(self, token_id: str, size: float, side: str,
+                              order_id: str | None = None) -> None:
         """Decrement resting orders on fill."""
         if side == "BUY":
             for cid, orders in list(self._open_orders.items()):
@@ -1287,16 +1436,26 @@ class LiveBroker:
                 self._open_orders[cid] = new_orders
         elif side == "SELL":
             for cid, ro in list(self._exit_orders.items()):
-                if ro.quote.token_id == token_id:
+                if (ro.quote.token_id == token_id
+                        and (not order_id or ro.order_id == order_id)):
                     remaining = ro.quote.size - size
                     if remaining <= 0.01:
                         self._exit_orders.pop(cid, None)
                     else:
                         ro.quote = Quote(token_id, ro.quote.price, remaining)
+            for batch_id, ro in list(self._reward_exit_orders.items()):
+                if (ro.quote.token_id == token_id
+                        and order_id and ro.order_id == order_id):
+                    remaining = ro.quote.size - size
+                    if remaining <= 0.01:
+                        self._reward_exit_orders.pop(batch_id, None)
+                    else:
+                        ro.quote = Quote(token_id, ro.quote.price, remaining)
 
     def record_user_fill(self, token_id: str, side: str, price: float,
                          size: float, taker: bool = False, order_id: str | None = None,
-                         fill_id: str | None = None, trade_hash: str | None = None) -> None:
+                         fill_id: str | None = None, trade_hash: str | None = None,
+                         fee_usd: float | None = None) -> None:
         if size <= 0:
             return
         ts = time.time()
@@ -1307,14 +1466,21 @@ class LiveBroker:
         if market is None:
             return
         key = "yes" if token_id == market.yes_token else "no"
+        # Resolve order intent before applying the fill: a fully-filled maker
+        # order is removed from _open_orders by _apply_fill_to_orders().
+        context = LiveBroker._order_audit_context(self, order_id) if order_id else {}
+        if taker and not context:
+            context = {"path": "forced_hedge"}
+        is_batch_take = context.get("intent") == "batch_take"
         with self._state_lock:
             pending = self._pending_hedges.get(market.condition_id)
             pending_part = 0.0
-            if pending is not None and side == "BUY" and pending.token_id == token_id:
+            if (pending is not None and not is_batch_take and side == "BUY"
+                    and pending.token_id == token_id):
                 pending_part = min(size, max(0.0, pending.size - pending.ws_observed))
                 pending.ws_observed += pending_part
             # taker_buy 已发送即时通知则跳过，避免同一笔 FAK 对冲重复推送
-            skip_notify = pending is not None and pending.notified
+            skip_notify = pending is not None and not is_batch_take and pending.notified
             local_delta = delta - pending_part
             if abs(local_delta) > 1e-9:
                 self._token_shares[token_id] = max(
@@ -1326,7 +1492,7 @@ class LiveBroker:
                     market.condition_id, {"yes": 0.0, "no": 0.0, "value": 0.0})
                 d[key] = max(0.0, d[key] + local_delta)
         if not taker:
-            self._apply_fill_to_orders(token_id, size, side)
+            self._apply_fill_to_orders(token_id, size, side, order_id)
         entry = {
             "ts": ts, "cid": market.condition_id,
             "market": market.question[:50],
@@ -1337,15 +1503,46 @@ class LiveBroker:
             entry["taker"] = True
         if side == "SELL":
             entry["exit"] = True
+        # Carry the path and fill_id so the reward-exit batch controller can
+        # identify normal reward fills vs recovery/hedge fills.
+        path = context.get("path", "")
+        intent = context.get("intent") or {
+            "normal": "normal_reward",
+            "forced_hedge": "forced_hedge",
+            "reward_exit_take": "batch_take",
+            "reward_exit_exit": "batch_exit",
+        }.get(path, "")
+        if fee_usd is None and taker and market is not None:
+            rate = market.fee_bps / 10000.0
+            fee_usd = rate * (price * (1.0 - price)) ** market.fee_exponent * size
+        if context.get("path"):
+            entry["path"] = context["path"]
+        if intent:
+            entry["intent"] = intent
+        if context.get("batch_id"):
+            entry["batch_id"] = context["batch_id"]
+        if fee_usd is not None and fee_usd > 0:
+            entry["fee"] = fee_usd
+        if order_id:
+            entry["order_id"] = order_id
+        if fill_id:
+            entry["fill_id"] = fill_id
         self.fills_log.append(entry)
         self.fills_log = self.fills_log[-500:]
         if self.metrics:
             self.metrics.record_fill(entry)
+            if intent in {"normal_reward", "batch_take", "batch_exit"} and \
+                    hasattr(self.metrics, "record_reward_exit_fill"):
+                self.metrics.record_reward_exit_fill(
+                    fill_id=str(entry.get("fill_id") or
+                               f"live-{uuid.uuid4().hex}"),
+                    batch_id=str(entry.get("batch_id") or ""),
+                    order_id=str(entry.get("order_id") or ""),
+                    intent=intent, cid=market.condition_id,
+                    token_id=token_id, side=side, price=price, size=size,
+                    fee_usd=float(entry.get("fee") or 0.0), ts=ts)
         log.info("LIVE FILL（WebSocket）：%s %s %s %.1f 股 @ %.3f",
                  market.question[:40], side, entry["side"], size, price)
-        context = LiveBroker._order_audit_context(self, order_id) if order_id else {}
-        if taker and not context:
-            context = {"path": "forced_hedge"}
         getattr(self, "audit", AuditLogger(None)).record({
             "event": "ws_fill", "cid": market.condition_id, "market": market.question,
             "order_id": order_id, "fill_id": fill_id, "trade_hash": trade_hash,

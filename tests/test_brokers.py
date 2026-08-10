@@ -347,6 +347,68 @@ def test_paper_taker_buy_respects_displayed_depth():
     assert filled == 5.0  # only the 0.50 level is inside the price cap
 
 
+def test_paper_fill_records_normal_reward_with_persistent_fill_id(tmp_path):
+    """A normal maker fill needs a durable ID so one reward batch is created."""
+    tracker = BookTracker(["yes1", "no1"])
+    broker = PaperBroker(500.0, tracker, data_dir=str(tmp_path))
+    market = _market()
+
+    broker._fill(market, Quote("yes1", 0.47, 10.0), 10.0)
+
+    first = broker.fills_log[-1]
+    assert first["intent"] == "normal_reward"
+    assert first["fill_id"]
+
+    restarted = PaperBroker(500.0, tracker, data_dir=str(tmp_path))
+    assert restarted.fills_log[-1]["fill_id"] == first["fill_id"]
+
+
+def test_paper_batch_take_does_not_relabel_forced_hedge(tmp_path):
+    """The batch controller needs an explicit take intent, not a hedge guess."""
+    tracker = BookTracker(["yes1", "no1"])
+    tracker.books["no1"].asks = {0.50: 10.0}
+    broker = PaperBroker(500.0, tracker, data_dir=str(tmp_path))
+
+    assert broker.taker_buy(
+        _market(), "no1", 10.0, 0.51,
+        audit_context={"batch_id": "batch-take-1", "intent": "batch_take"},
+    ) == 10.0
+
+    entry = broker.fills_log[-1]
+    assert entry["batch_id"] == "batch-take-1"
+    assert entry["intent"] == "batch_take"
+    assert entry["path"] != "forced_hedge"
+    assert entry["fill_id"]
+
+
+def test_paper_reward_exits_are_independent_per_batch(tmp_path):
+    """Two batches on one CID must keep separate maker SELL ownership."""
+    import asyncio
+
+    tracker = BookTracker(["yes1", "no1"])
+    tracker.books["no1"].asks = {0.60: 0.0}
+    broker = PaperBroker(500.0, tracker, data_dir=str(tmp_path))
+    market = _market()
+    broker.state.positions[market.condition_id] = Position(no_shares=20.0)
+
+    first = broker.place_reward_exit(
+        market, "batch-exit-a", Quote("no1", 0.60, 10.0),
+        {"batch_id": "batch-exit-a", "intent": "batch_exit"},
+    )
+    second = broker.place_reward_exit(
+        market, "batch-exit-b", Quote("no1", 0.60, 10.0),
+        {"batch_id": "batch-exit-b", "intent": "batch_exit"},
+    )
+    assert first is not None and second is not None
+
+    asyncio.run(broker._on_trade("no1", 0.61, "BUY", 20.0))
+
+    exits = [entry for entry in broker.fills_log if entry.get("intent") == "batch_exit"]
+    assert {entry["batch_id"] for entry in exits} == {"batch-exit-a", "batch-exit-b"}
+    assert {entry["size"] for entry in exits} == {10.0}
+    assert broker.cancel_reward_exit("batch-exit-a") is True
+
+
 def test_paper_unpaired_cost_basis_survives_pair_merge_and_exit():
     """Paper recovery must use the average cost of the still-unpaired leg."""
     tracker = BookTracker(["yes1", "no1"])
@@ -779,6 +841,69 @@ def test_taker_buy_syncs_collateral_first():
     assert (AssetType.COLLATERAL, None) in stub.sync_calls
     assert LiveBroker.has_pending_hedge(stub, market.condition_id)
     assert stub._pending_hedges[market.condition_id].token_id == "tok9"
+
+
+def test_live_batch_take_uses_share_limited_fak_without_hedge_overlay():
+    """A cheap ask must not turn a batch's remaining shares into extra size."""
+    from py_clob_client_v2 import OrderType
+
+    stub = _live_stub()
+    stub.client.post_order.return_value = {"takingAmount": "10.0", "orderID": "take-1"}
+    market = _market()
+
+    filled = LiveBroker.taker_buy(
+        stub, market, market.no_token, 10.0, 0.99,
+        audit_context={"batch_id": "batch-take-1", "intent": "batch_take"},
+    )
+
+    assert filled == 10.0
+    args = stub.client.create_order.call_args.args[0]
+    assert args.size == 10.0
+    assert stub.client.post_order.call_args.args[1] == OrderType.FAK
+    assert not LiveBroker.has_pending_hedge(stub, market.condition_id)
+
+
+def test_live_batch_exit_fill_keeps_batch_identity_and_persists_fact():
+    """A user-feed SELL receipt must update only its own batch's audit trail."""
+    from pmbot.brokers import RestingOrder
+
+    class Metrics:
+        def __init__(self):
+            self.fills = []
+            self.batch_fills = []
+
+        def record_fill(self, entry):
+            self.fills.append(entry)
+
+        def record_reward_exit_fill(self, **entry):
+            self.batch_fills.append(entry)
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub.metrics = Metrics()
+    stub._reward_exit_orders = {
+        "batch-exit-1": RestingOrder(
+            "sell-1", Quote(market.no_token, 0.60, 10.0), time.time(), 0,
+            {"batch_id": "batch-exit-1", "intent": "batch_exit"},
+        ),
+    }
+
+    LiveBroker.record_user_fill(
+        stub, market.no_token, "SELL", 0.60, 4.0,
+        order_id="sell-1", fill_id="fill-sell-1",
+    )
+
+    entry = stub.fills_log[-1]
+    assert entry["batch_id"] == "batch-exit-1"
+    assert entry["intent"] == "batch_exit"
+    assert entry["order_id"] == "sell-1"
+    assert entry["fill_id"] == "fill-sell-1"
+    assert stub.metrics.batch_fills == [{
+        "fill_id": "fill-sell-1", "batch_id": "batch-exit-1",
+        "order_id": "sell-1", "intent": "batch_exit", "cid": "cid1",
+        "token_id": market.no_token, "side": "SELL", "price": 0.60,
+        "size": 4.0, "fee_usd": 0.0, "ts": entry["ts"],
+    }]
 
 
 def test_pending_hedge_survives_stale_snapshot_without_double_counting():

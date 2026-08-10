@@ -8,7 +8,7 @@ notifications:
     enabled: true
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 560
+capital_usd: 100
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
@@ -366,6 +366,9 @@ risk:
   # banned from re-entering the quote set (persisted to banned_markets.json,
   # survives restarts).  Set to a very large value to disable.
   recovery_loss_ban_threshold_usd: 15.0
+  # ── P1.x reward exit batch ──
+  # off / shadow / active.  shadow = record only, no broker calls.
+  reward_exit_batch_mode: active
   # Markets listed here are held entirely by the operator.  The bot neither
   # selects, quotes, recovers, hedges, nor cancels orders for them.
   manual_hold_cids:
