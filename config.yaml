@@ -219,6 +219,14 @@ scanner:
     - announce
     - blockade
     - starmer
+    # AI/tech competition & benchmark books: a single outcome announcement
+    # (leaderboard update, eval result) reprices the market faster than quotes
+    # can be pulled — same adverse-selection profile as box-office and IPO books.
+    # e.g. "Alibaba Code Arena | WebDev AI lab" triggered a 6.2c mid crash in 57s.
+    - code arena
+    - ai lab
+    - benchmark
+    - leaderboard
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of
@@ -286,7 +294,7 @@ guards:
   # 波动率熔断：窗口内中间价变动超过此阈值即撤下全市场报价。
   # 单边连续移动通常意味着知情流（例如每日天气市场实时结算）。
   vol_window_secs: 60
-  vol_max_move_cents: 3.0
+  vol_max_move_cents: 2.0
   # 同侧吃单熔断：窗口内同一侧被吃超过此次数，暂停整个市场报价。
   # 有人在持续单向砸盘，倾斜的报价被反复吃掉。
   max_same_side_fills: 3
@@ -300,7 +308,7 @@ guards:
   directional_consecutive: 5
   side_cooldown_minutes: 10
   # 报价衰减：窗口内每笔自己的吃单将下次报价推离中间价（递增，有上限）。
-  fade_cents_per_fill: 0.5
+  fade_cents_per_fill: 1.0
   fade_window_minutes: 5
   fade_max_cents: 2.0
   # 延迟保护：订单簿超过此时长的市场不报价。
@@ -460,7 +468,7 @@ controller:
   min_markout_samples: 2
   # Calm flow: quote tight, hedge fast, capture reward share.
   calm:
-    offset_frac_of_max_spread: 0.30
+    offset_frac_of_max_spread: 0.35
     flatten_after_secs: 120
     flatten_max_spread_cents: 4.0
     markout_trip_cents: -1.5

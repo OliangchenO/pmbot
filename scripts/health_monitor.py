@@ -208,6 +208,69 @@ def check_p0_guard() -> list[Finding]:
     return findings
 
 
+def check_guard_events() -> list[Finding]:
+    """传统 guard 触发事件（guard_events 表）：市场暂停、单边保护等。
+
+    覆盖 P0 quote_risk_decisions 覆盖不到的传统 guard 路径
+    （check_flow, record_trade, record_mid 触发的一级保护）。
+    """
+    findings: list[Finding] = []
+    cutoff = time.time() - SCAN_WINDOW_MINUTES * 60
+
+    rows = db_query(
+        """SELECT scope, reason, cid, market, COUNT(*) as cnt
+           FROM guard_events WHERE ts >= ?
+           GROUP BY scope, reason, cid ORDER BY cnt DESC""",
+        (cutoff,))
+
+    if not rows:
+        return findings
+
+    for r in rows:
+        scope = r["scope"] or ""
+        reason = r["reason"] or ""
+        cid = (r["cid"] or "")[:20]
+        market = (r.get("market") or "")[:60]
+        cnt = r["cnt"]
+
+        # market_guard_pull / side_guard_pull are the actionable signals
+        if reason == "market_guard_pull":
+            findings.append(Finding(
+                group=f"guard-market-pull-{cid}",
+                category="Guard · 市场暂停",
+                severity=SEV_HIGH,
+                detail=f"市场 {market} 触发全市场暂停（{cnt} 次）",
+                count=cnt,
+            ))
+        elif reason == "side_guard_pull":
+            findings.append(Finding(
+                group=f"guard-side-pull-{cid}",
+                category="Guard · 单边保护",
+                severity=SEV_MEDIUM,
+                detail=f"市场 {market} 触发单边保护（{cnt} 次）",
+                count=cnt,
+            ))
+        elif reason == "queue_depth_pull":
+            findings.append(Finding(
+                group=f"guard-queue-depth-{cid}",
+                category="Guard · 队列深度",
+                severity=SEV_LOW,
+                detail=f"市场 {market} 触发队列深度保护（{cnt} 次）",
+                count=cnt,
+            ))
+        else:
+            # Catch other/new guard event types
+            findings.append(Finding(
+                group=f"guard-other-{hashlib.md5(f'{scope}{reason}{cid}'.encode()).hexdigest()[:8]}",
+                category="Guard · 其他",
+                severity=SEV_LOW,
+                detail=f"scope={scope} reason={reason} market={market}（{cnt} 次）",
+                count=cnt,
+            ))
+
+    return findings
+
+
 def check_errors() -> list[Finding]:
     """Log ERROR lines."""
     lines = grep_log("ERROR")
@@ -423,6 +486,8 @@ def check_warnings() -> list[Finding]:
         "WebSocket", "websocket", "disconnect", "feed stale",
         "controller adjusted", "P0 逆向选择防护",
         "P0 guard 历史清理", "quote_risk_decision",
+        "市场风控触发", "单边流量失衡", "方向性成交流",
+        "guard_events",
     ]
     lines = grep_log("WARNING")
     filtered = []
@@ -608,6 +673,7 @@ def main() -> None:
 
     checks = [
         ("P0 Guard 信号", check_p0_guard),
+        ("传统 Guard 事件", check_guard_events),
         ("ERROR", check_errors),
         ("补单阶段", check_recovery_phase),
         ("强制对冲推迟", check_hedge_deferrals),
