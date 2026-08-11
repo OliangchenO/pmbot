@@ -2269,6 +2269,15 @@ class Bot:
             by_cid.setdefault(b["cid"], []).append(b)
 
         manual_hold = self._manual_hold_cids()
+
+        # ── Per-tick committed balance: prevent multiple batches in the
+        #     same tick from collectively overspending.  We snapshot the
+        #     broker balance once and deduct every FAK fill before the next
+        #     batch's budget check, so the second batch sees a realistic
+        #     post-execution balance even though the actual CLOB collateral
+        #     hasn't settled yet.
+        committed_balance: float | None = None
+
         for cid, batches in by_cid.items():
             # Skip CIDs in manual hold — this covers both config-driven holds
             # and permanently banned CIDs (markout/recovery-loss ban).
@@ -2278,7 +2287,19 @@ class Bot:
             take_batches = [b for b in batches if b["status"] == "TAKE_PENDING"]
             if take_batches:
                 take_batches.sort(key=lambda b: b["created_ts"])
-                await self._advance_take_pending(cid, take_batches[0], now)
+                await self._advance_take_pending(
+                    cid, take_batches[0], now,
+                    committed_balance=committed_balance,
+                )
+                # If the broker has a _collateral attribute, re-read after
+                # the FAK to keep committed_balance in sync with reality.
+                if hasattr(self.broker, '_collateral'):
+                    try:
+                        bal = getattr(self.broker, '_collateral', None)
+                        if bal is not None and isinstance(bal, (int, float)) and bal == bal:
+                            committed_balance = bal
+                    except Exception:
+                        pass
 
             # SELL_PENDING batches
             sell_batches = [b for b in batches if b["status"] == "SELL_PENDING"]
@@ -2287,8 +2308,15 @@ class Bot:
 
     # ── Take stage: submit FAK BUY ──
 
-    async def _advance_take_pending(self, cid: str, batch: dict, now: float) -> None:
-        """Submit FAK BUY for remaining complement shares of a TAKE_PENDING batch."""
+    async def _advance_take_pending(self, cid: str, batch: dict, now: float,
+                                     committed_balance: float | None = None) -> None:
+        """Submit FAK BUY for remaining complement shares of a TAKE_PENDING batch.
+
+        committed_balance, when passed, is the broker balance *after* earlier
+        batches in this tick have already spent.  It overrides the live
+        _collateral read for the budget check so multiple batches within one
+        tick don't collectively overspend.
+        """
         if self.broker is None or self.tracker is None:
             return
 
@@ -2350,21 +2378,25 @@ class Bot:
         safe_price = best_ask if best_ask and best_ask <= max_buy_price else max_buy_price
         budget_needed = round(safe_price * remaining, 2)
         balance_ok = True
-        if hasattr(self.broker, '_collateral'):
-            bal = None
+        # ── Per-tick committed balance: use the value passed down from
+        #     _advance_reward_exit_batches when available (already reflects
+        #     prior batches' FAK fills in this tick).  Otherwise fall back
+        #     to the live broker collateral.
+        bal: float | None = committed_balance
+        if bal is None and hasattr(self.broker, '_collateral'):
             try:
                 bal = getattr(self.broker, '_collateral', None)
             except Exception:
                 pass
-            if bal is not None and isinstance(bal, (int, float)) and bal == bal:
-                if bal < budget_needed * 0.99:
-                    balance_ok = False
-                    log.warning(
-                        "BATCH_TAKE_BALANCE_INSUFFICIENT batch_id=%s cid=%s "
-                        "needed=%.2f balance=%.2f "
-                        "说明=余额不足，跳过本次take（等待入金或市场变化）",
-                        batch_id, cid, budget_needed, bal,
-                    )
+        if bal is not None and isinstance(bal, (int, float)) and bal == bal:
+            if bal < budget_needed * 0.99:
+                balance_ok = False
+                log.warning(
+                    "BATCH_TAKE_BALANCE_INSUFFICIENT batch_id=%s cid=%s "
+                    "needed=%.2f balance=%.2f "
+                    "说明=余额不足，跳过本次take（等待入金或市场变化）",
+                    batch_id, cid, budget_needed, bal,
+                )
 
         # Use broker.taker_buy() for true FAK execution
         filled_now = 0.0
