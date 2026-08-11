@@ -37,6 +37,14 @@ class MetricsStore:
         # Tolerate brief contention from a concurrent reader/backfill instead of
         # raising "database is locked" immediately.
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # WAL (Write-Ahead Logging) allows concurrent reads and writes without
+        # blocking each other.  Without this the DELETE journal mode serialises
+        # every reader behind every writer, which causes the background cache
+        # refresh to hit its 5s timeout repeatedly (~50/day).
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        # In WAL mode NORMAL synchronous is safe — the WAL file provides
+        # crash-recovery guarantees without the extra fsync on every commit.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         # Order ops run concurrently in worker threads and all record metrics
         # through this single connection — serialize writes.
         self._lock = threading.Lock()
@@ -46,6 +54,7 @@ class MetricsStore:
         self._uptime_samples: dict[str, list[bool]] = {}
         self._last_uptime_minute: int = 0
         self._session_start = time.time()
+        self._last_qrd_prune: float = 0.0  # Last quote_risk_decisions cleanup time
 
     def _inception_ts(self) -> float | None:
         if not self.inception_date:
@@ -212,10 +221,13 @@ class MetricsStore:
                 origin_size    REAL NOT NULL DEFAULT 0.0,
                 origin_notional_usd REAL NOT NULL DEFAULT 0.0,
                 origin_fee_usd REAL NOT NULL DEFAULT 0.0,
+                origin_fill_ts REAL NOT NULL DEFAULT 0.0,
                 take_target_size REAL NOT NULL DEFAULT 0.0,
                 take_filled_size REAL NOT NULL DEFAULT 0.0,
                 take_notional_usd REAL NOT NULL DEFAULT 0.0,
                 take_fee_usd  REAL NOT NULL DEFAULT 0.0,
+                first_take_submit_ts REAL,
+                first_take_executed_ts REAL,
                 paired_size   REAL NOT NULL DEFAULT 0.0,
                 paired_loss_usd REAL NOT NULL DEFAULT 0.0,
                 exit_initial_size REAL NOT NULL DEFAULT 0.0,
@@ -248,6 +260,11 @@ class MetricsStore:
             );
             CREATE INDEX IF NOT EXISTS idx_reward_exit_fills_batch_intent_ts
                 ON reward_exit_fills (batch_id, intent, ts, fill_id);
+            CREATE TABLE IF NOT EXISTS unidentified_order_match_watermarks (
+                order_id      TEXT NOT NULL PRIMARY KEY,
+                matched_size  REAL NOT NULL DEFAULT 0.0,
+                updated_ts    REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS reward_exit_orders (
                 order_id     TEXT NOT NULL PRIMARY KEY,
                 batch_id     TEXT NOT NULL,
@@ -262,6 +279,8 @@ class MetricsStore:
             );
             CREATE INDEX IF NOT EXISTS idx_reward_exit_orders_batch
                 ON reward_exit_orders (batch_id);
+            CREATE INDEX IF NOT EXISTS idx_quote_risk_decisions_ts
+                ON quote_risk_decisions (ts);
         """)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
         if "fee" not in cols:
@@ -302,6 +321,16 @@ class MetricsStore:
         if "market" not in ge_cols:
             self._conn.execute(
                 "ALTER TABLE guard_events ADD COLUMN market TEXT DEFAULT ''")
+
+        # ── reward_exit_batches timing columns (2026-08-11) ──
+        reb_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(reward_exit_batches)")}
+        for col, defn in [
+            ("origin_fill_ts", "REAL NOT NULL DEFAULT 0.0"),
+            ("first_take_submit_ts", "REAL"),
+            ("first_take_executed_ts", "REAL"),
+        ]:
+            if col not in reb_cols:
+                self._conn.execute(f"ALTER TABLE reward_exit_batches ADD COLUMN {col} {defn}")
         self._conn.commit()
 
     def net_shadow_inputs(self, lookback_hours: float,
@@ -778,6 +807,39 @@ class MetricsStore:
 
     # ── P1.x reward exit batch lifecycle ──
 
+    def initialize_order_match_watermark(self, order_id: str) -> None:
+        """Register a newly placed maker order at zero matched shares."""
+        if not order_id:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO unidentified_order_match_watermarks "
+                "(order_id,matched_size,updated_ts) VALUES (?,?,?)",
+                (order_id, 0.0, time.time()),
+            )
+            self._conn.commit()
+
+    def claim_unidentified_order_match(self, order_id: str,
+                                       matched_size: float) -> float | None:
+        """Atomically return the new cumulative maker shares, or None if unsafe."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT matched_size FROM unidentified_order_match_watermarks "
+                "WHERE order_id=?", (order_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            previous = float(row[0])
+            delta = max(0.0, float(matched_size) - previous)
+            if delta > 1e-9:
+                self._conn.execute(
+                    "UPDATE unidentified_order_match_watermarks "
+                    "SET matched_size=?,updated_ts=? WHERE order_id=?",
+                    (float(matched_size), time.time(), order_id),
+                )
+                self._conn.commit()
+            return delta
+
     def record_reward_exit_fill(
             self, *, fill_id: str, batch_id: str, order_id: str, intent: str,
             cid: str, token_id: str, side: str, price: float, size: float,
@@ -809,6 +871,19 @@ class MetricsStore:
             params.append(intent)
         rows = self._conn.execute(
             query + " ORDER BY ts, fill_id", params,
+        ).fetchall()
+        keys = (
+            "fill_id", "batch_id", "order_id", "intent", "cid", "token_id",
+            "side", "price", "size", "fee_usd", "ts",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def list_unbatched_normal_reward_fills(self) -> list[dict]:
+        """Return durable normal maker fills that have not opened a batch yet."""
+        rows = self._conn.execute(
+            "SELECT fill_id,batch_id,order_id,intent,cid,token_id,side,price,"
+            "size,fee_usd,ts FROM reward_exit_fills "
+            "WHERE batch_id='' AND intent='normal_reward' ORDER BY ts, fill_id"
         ).fetchall()
         keys = (
             "fill_id", "batch_id", "order_id", "intent", "cid", "token_id",
@@ -872,6 +947,7 @@ class MetricsStore:
             complement_token_id: str, origin_size: float,
             origin_notional_usd: float, origin_fee_usd: float,
             take_target_size: float, created_ts: float,
+            origin_fill_ts: float = 0.0,
     ) -> bool:
         """Create a new reward exit batch.  Returns False on duplicate origin_fill_id."""
         with self._lock:
@@ -880,12 +956,14 @@ class MetricsStore:
                     "INSERT INTO reward_exit_batches "
                     "(batch_id, cid, origin_order_id, origin_fill_id, "
                     "origin_token_id, complement_token_id, origin_size, "
-                    "origin_notional_usd, origin_fee_usd, take_target_size, "
+                    "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
+                    "take_target_size, "
                     "status, created_ts, updated_ts) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (batch_id, cid, origin_order_id, origin_fill_id,
                      origin_token_id, complement_token_id, origin_size,
-                     origin_notional_usd, origin_fee_usd, take_target_size,
+                     origin_notional_usd, origin_fee_usd, origin_fill_ts,
+                     take_target_size,
                      "TAKE_PENDING", created_ts, created_ts),
                 )
                 self._conn.commit()
@@ -898,8 +976,10 @@ class MetricsStore:
         row = self._conn.execute(
             "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
             "origin_token_id, complement_token_id, origin_size, "
-            "origin_notional_usd, origin_fee_usd, take_target_size, "
+            "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
+            "take_target_size, "
             "take_filled_size, take_notional_usd, take_fee_usd, "
+            "first_take_submit_ts, first_take_executed_ts, "
             "paired_size, paired_loss_usd, exit_initial_size, "
             "exit_filled_size, exit_notional_usd, exit_fee_usd, "
             "exit_target_price, status, manual_reason, "
@@ -917,8 +997,10 @@ class MetricsStore:
             rows = self._conn.execute(
                 "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
                 "origin_token_id, complement_token_id, origin_size, "
-                "origin_notional_usd, origin_fee_usd, take_target_size, "
+                "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
+                "take_target_size, "
                 "take_filled_size, take_notional_usd, take_fee_usd, "
+                "first_take_submit_ts, first_take_executed_ts, "
                 "paired_size, paired_loss_usd, exit_initial_size, "
                 "exit_filled_size, exit_notional_usd, exit_fee_usd, "
                 "exit_target_price, status, manual_reason, "
@@ -931,8 +1013,10 @@ class MetricsStore:
             rows = self._conn.execute(
                 "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
                 "origin_token_id, complement_token_id, origin_size, "
-                "origin_notional_usd, origin_fee_usd, take_target_size, "
+                "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
+                "take_target_size, "
                 "take_filled_size, take_notional_usd, take_fee_usd, "
+                "first_take_submit_ts, first_take_executed_ts, "
                 "paired_size, paired_loss_usd, exit_initial_size, "
                 "exit_filled_size, exit_notional_usd, exit_fee_usd, "
                 "exit_target_price, status, manual_reason, "
@@ -960,6 +1044,7 @@ class MetricsStore:
             return
         valid = frozenset({
             "take_filled_size", "take_notional_usd", "take_fee_usd",
+            "first_take_submit_ts", "first_take_executed_ts",
             "paired_size", "paired_loss_usd", "exit_initial_size",
             "exit_target_price",
             "exit_filled_size", "exit_notional_usd", "exit_fee_usd",
@@ -1026,8 +1111,10 @@ class MetricsStore:
         rows = self._conn.execute(
             f"SELECT batch_id, cid, origin_order_id, origin_fill_id, "
             f"origin_token_id, complement_token_id, origin_size, "
-            f"origin_notional_usd, origin_fee_usd, take_target_size, "
+            f"origin_notional_usd, origin_fee_usd, origin_fill_ts, "
+            f"take_target_size, "
             f"take_filled_size, take_notional_usd, take_fee_usd, "
+            f"first_take_submit_ts, first_take_executed_ts, "
             f"paired_size, paired_loss_usd, exit_initial_size, "
             f"exit_filled_size, exit_notional_usd, exit_fee_usd, "
             f"exit_target_price, status, manual_reason, "
@@ -1047,12 +1134,14 @@ class MetricsStore:
 
     @staticmethod
     def _reward_exit_batch_row_to_dict(row: tuple) -> dict:
-        """Convert a 25-column row tuple to a dictionary."""
+        """Convert a row tuple to a dictionary."""
         keys = [
             "batch_id", "cid", "origin_order_id", "origin_fill_id",
             "origin_token_id", "complement_token_id", "origin_size",
-            "origin_notional_usd", "origin_fee_usd", "take_target_size",
+            "origin_notional_usd", "origin_fee_usd", "origin_fill_ts",
+            "take_target_size",
             "take_filled_size", "take_notional_usd", "take_fee_usd",
+            "first_take_submit_ts", "first_take_executed_ts",
             "paired_size", "paired_loss_usd", "exit_initial_size",
             "exit_filled_size", "exit_notional_usd", "exit_fee_usd",
             "exit_target_price", "status", "manual_reason",
@@ -1374,19 +1463,19 @@ class MetricsStore:
                      decision.score, decision.reason),
                 )
                 self._conn.commit()
-                # Probabilistic cleanup: ~5% chance each write, delete rows
-                # older than 10 hours to keep the table lean.
+                # Timer-based cleanup: every 5 minutes, delete rows older
+                # than 2 hours to keep the table lean.
                 self._prune_old_decisions(self._conn)
         except Exception:
             log.warning("quote_risk_decision 持久化失败（cid=%s）", cid, exc_info=True)
 
-    @staticmethod
-    def _prune_old_decisions(conn: sqlite3.Connection, keep_hours: int = 10) -> None:
-        """Delete quote_risk_decisions rows older than *keep_hours*, ~5% of calls."""
-        import random
-        if random.random() > 0.05:
+    def _prune_old_decisions(self, conn: sqlite3.Connection, keep_hours: int = 2) -> None:
+        """Delete quote_risk_decisions rows older than *keep_hours*, throttled to every 5 min."""
+        now = time.time()
+        if now - self._last_qrd_prune < 300:
             return
-        cutoff = time.time() - keep_hours * 3600
+        self._last_qrd_prune = now
+        cutoff = now - keep_hours * 3600
         try:
             cur = conn.execute(
                 "DELETE FROM quote_risk_decisions WHERE ts < ?", (cutoff,))

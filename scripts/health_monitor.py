@@ -45,6 +45,7 @@ SEV_MEDIUM = "🟡 Medium"
 SEV_LOW = "🔵 Low"
 
 SCAN_WINDOW_MINUTES = 20  # lookback for DB queries and log grep
+AUTO_RESOLVE_HOURS = 24     # auto-close issues silent for this long
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -546,7 +547,8 @@ def read_progress_issues() -> dict[str, dict]:
 def write_progress_report(findings: list[Finding]) -> None:
     """Merge findings into PROGRESS.md."""
     existing = read_progress_issues()
-    now_str = fmt_time(now_bj())
+    now_dt = now_bj()
+    now_str = fmt_time(now_dt)
 
     # Update existing entries / create new ones
     updated: dict[str, dict] = {}  # group → meta
@@ -567,17 +569,28 @@ def write_progress_report(findings: list[Finding]) -> None:
         if "count_window" not in meta:
             meta["count_window"] = {}
         meta["count_window"][now_str] = f.count
-        # Keep status unless it was manually resolved
-        if meta.get("status") == "resolved":
+        # Keep status unless it was manually resolved or auto-expired
+        if meta.get("status") in ("resolved", "resolved_inactive"):
             # It reappeared → re-open
             meta["status"] = "open"
             meta["reopened_at"] = now_str
         updated[f.group] = meta
         kept_findings[f.group] = f
 
-    # Also carry over resolved/wontfix issues that didn't reappear
+    # Also carry over resolved/wontfix issues that didn't reappear.
+    # Auto-resolve open issues that have been silent for > AUTO_RESOLVE_HOURS.
     for group, meta in existing.items():
         if group not in updated:
+            if meta.get("status") == "open":
+                try:
+                    last_seen_dt = datetime.datetime.strptime(
+                        meta.get("last_seen", ""), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=BEIJING_TZ)
+                    if (now_dt - last_seen_dt).total_seconds() > AUTO_RESOLVE_HOURS * 3600:
+                        meta["status"] = "resolved_inactive"
+                        meta["resolved_at"] = now_str
+                except ValueError:
+                    pass
             updated[group] = meta  # keep as-is
 
     # Build the markdown
@@ -609,7 +622,7 @@ def write_progress_report(findings: list[Finding]) -> None:
             lines.append("")
 
     # ── Closed issues ──
-    lines.append(f"## ✅ 已关闭 ({len(closed_issues)})")
+    lines.append(f"## ✅ 已关闭 / 自动过期 ({len(closed_issues)})")
     lines.append("")
     if not closed_issues:
         lines.append("暂无已关闭问题。")
@@ -631,7 +644,7 @@ def build_issue_block(meta: dict, finding: Optional[Finding]) -> str:
     sev = meta.get("severity", SEV_LOW)
     cat = meta.get("category", "Unknown")
     status = meta.get("status", "open")
-    status_icon = {"open": "🔴", "resolved": "✅", "wontfix": "⚫"}.get(status, "❓")
+    status_icon = {"open": "🔴", "resolved": "✅", "resolved_inactive": "💤", "wontfix": "⚫"}.get(status, "❓")
 
     blocks.append(f"### [{meta['id']}] {sev} · {cat} {status_icon}")
     blocks.append("")

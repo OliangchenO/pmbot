@@ -589,8 +589,8 @@ def _live_fill_stub():
     stub._ws_deltas_lock = threading.Lock()
     stub.metrics = None
     stub.fills_log = []
-    stub._apply_fill_to_orders = lambda token_id, size, side: LiveBroker._apply_fill_to_orders(
-        stub, token_id, size, side)
+    stub._apply_fill_to_orders = lambda token_id, size, side, order_id=None: LiveBroker._apply_fill_to_orders(
+        stub, token_id, size, side, order_id)
     return stub
 
 
@@ -612,6 +612,101 @@ def test_ws_fill_audit_retains_exchange_identifiers_and_hedge_path(tmp_path):
     assert row["fill_id"] == "fill-8"
     assert row["trade_hash"] == "0xabc"
     assert row["path"] == "forced_hedge"
+
+
+def test_ws_maker_fill_without_exchange_fill_id_uses_cumulative_delta(tmp_path):
+    """A replayed no-id maker update must not create another reward fill."""
+    from pmbot.brokers import RestingOrder
+    from pmbot.metrics import MetricsStore
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub.metrics = MetricsStore(str(tmp_path / "test.db"))
+    stub.metrics.initialize_order_match_watermark("normal-order")
+    stub._open_orders = {
+        market.condition_id: [RestingOrder(
+            "normal-order", Quote(market.no_token, 0.44, 40), time.time(), 0,
+            {"path": "normal", "intent": "normal_reward"},
+        )],
+    }
+
+    LiveBroker.record_user_fill(
+        stub, market.no_token, "BUY", 0.44, 40.0,
+        order_id="normal-order", fill_id=None, trade_hash=None,
+        matched_total=40.0, match_observed_ts=20.0, event_ts=20.0,
+    )
+    LiveBroker.record_user_fill(
+        stub, market.no_token, "BUY", 0.44, 40.0,
+        order_id="normal-order", fill_id=None, trade_hash=None,
+        matched_total=40.0, match_observed_ts=21.0, event_ts=21.0,
+    )
+
+    entry = stub.fills_log[-1]
+    assert entry["intent"] == "normal_reward"
+    assert entry["fill_id"] == "order-match:normal-order:40.00000000"
+    assert len(stub.fills_log) == 1
+    stub.metrics.close()
+
+
+def test_ws_no_id_fill_waits_for_later_cumulative_order_update(tmp_path):
+    """Trade-before-order delivery still opens exactly one reward batch fact."""
+    from pmbot.brokers import RestingOrder
+    from pmbot.metrics import MetricsStore
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub.metrics = MetricsStore(str(tmp_path / "test.db"))
+    stub.metrics.initialize_order_match_watermark("normal-order")
+    stub._open_orders = {market.condition_id: [RestingOrder(
+        "normal-order", Quote(market.no_token, 0.44, 40), time.time(), 0,
+        {"path": "normal", "intent": "normal_reward"},
+    )]}
+
+    LiveBroker.record_user_fill(
+        stub, market.no_token, "BUY", 0.44, 40.0, order_id="normal-order",
+        event_ts=20.0,
+    )
+    assert stub.fills_log == []
+    LiveBroker.observe_order_match(
+        stub, "normal-order", market.no_token, "BUY", 0.44, 40.0, 21.0)
+
+    assert stub.fills_log[-1]["size"] == 40.0
+    assert stub.fills_log[-1]["intent"] == "normal_reward"
+    stub.metrics.close()
+
+
+def test_inferred_maker_fill_persists_normal_reward_fact():
+    """A position-poll fill during a user-feed outage must remain batchable."""
+    from pmbot.brokers import RestingOrder
+
+    class Metrics:
+        def __init__(self):
+            self.fills = []
+            self.reward_fills = []
+
+        def record_fill(self, entry):
+            self.fills.append(entry)
+
+        def record_reward_exit_fill(self, **entry):
+            self.reward_fills.append(entry)
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub.metrics = Metrics()
+    stub._open_orders = {
+        market.condition_id: [RestingOrder(
+            "normal-order", Quote(market.no_token, 0.44, 40), time.time(), 0,
+            {"path": "normal", "intent": "normal_reward"},
+        )],
+    }
+
+    entry = LiveBroker._record_inferred_maker_fill(
+        stub, market, market.no_token, 40.0, 10.0)
+
+    assert entry is not None
+    assert entry["intent"] == "normal_reward"
+    assert entry["fill_id"]
+    assert stub.metrics.reward_fills[0]["fill_id"] == entry["fill_id"]
 
 
 def test_due_for_refresh_flags_near_expiry_orders():

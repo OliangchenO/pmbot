@@ -8,7 +8,7 @@ notifications:
     enabled: true
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 220
+capital_usd: 200
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
@@ -21,9 +21,6 @@ paper:
   reward_haircut: 0.7
 
 scanner:
-  # TOML file where newly discovered market slugs are persisted for supervised
-  # trading sessions. Set to null or omit to skip TOML sync.
-  markets_toml: "E:\\testWorkspace\\poly-maker\\config\\markets.toml"
   # P2.1 is observational only: it records an economic shadow ranking but does
   # not participate in ranking, sticky selection, quote prices, or order size.
   net_shadow:
@@ -227,6 +224,7 @@ scanner:
     - ai lab
     - benchmark
     - leaderboard
+    - Anthropic
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of
@@ -369,6 +367,10 @@ risk:
   # ── P1.x reward exit batch ──
   # off / shadow / active.  shadow = record only, no broker calls.
   reward_exit_batch_mode: active
+  # Max seconds a TAKE_PENDING batch can stay in that state before it is
+  # automatically closed.  This prevents permanently locked markets when
+  # the batch can never complete (balance insufficient, book missing, etc).
+  reward_exit_terminal_after_secs: 900
   # Markets listed here are held entirely by the operator.  The bot neither
   # selects, quotes, recovers, hedges, nor cancels orders for them.
   manual_hold_cids:
@@ -379,7 +381,7 @@ risk:
   # and the bot sizes up automatically; draw down and it sizes down. Clamped
   # so a bad mark or a single losing day can't whipsaw sizing. The dollar
   # values below are calibrated at capital_usd. Loss limits stay absolute.
-  scale_with_equity: true
+  scale_with_equity: false
   scale_min: 0.5
   scale_max: 10.0
   # Stop adding inventory in a market beyond this (USD at current prices).
@@ -515,8 +517,8 @@ controller:
       hard_kill_loss_usd: 20
     - min_equity_usd: 250
       top_n_markets: 2
-      size_mult_of_min: 2.0
-      max_capital_per_market: 100
+      size_mult_of_min: 1.0
+      max_capital_per_market: 50
       max_inventory_usd_per_market: 60
       daily_loss_limit_usd: 20
       hard_kill_loss_usd: 50

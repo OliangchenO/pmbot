@@ -54,3 +54,13 @@ def test_skips_non_matched_status():
     ev = {"event_type": "trade", "status": "MINED"}
     feed._handle_trade(ev)
     feed.broker.record_user_fill.assert_not_called()
+
+
+def test_order_update_is_forwarded_as_cumulative_matched_shares():
+    feed = UserFeed(_broker())
+    feed._handle('{"event_type":"order","id":"order-1","asset_id":"yes_tok",'
+                 '"price":"0.47","side":"BUY","size_matched":"33",'
+                 '"timestamp":"1782753357257"}')
+
+    feed.broker.observe_order_match.assert_called_once_with(
+        "order-1", "yes_tok", "BUY", 0.47, 33.0, 1782753357.257)

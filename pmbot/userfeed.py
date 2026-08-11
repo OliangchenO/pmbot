@@ -82,7 +82,12 @@ class UserFeed:
             return
         events = msg if isinstance(msg, list) else [msg]
         for ev in events:
-            if not isinstance(ev, dict) or ev.get("event_type") != "trade":
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("event_type") == "order":
+                self._handle_order(ev)
+                continue
+            if ev.get("event_type") != "trade":
                 continue
             # MATCHED fires once at match time; the later MINED/CONFIRMED
             # updates for the same trade are skipped to avoid double counts.
@@ -92,6 +97,22 @@ class UserFeed:
                 self._handle_trade(ev)
             except Exception as e:  # noqa: BLE001 — never let one bad event kill the feed
                 log.warning("用户成交推送事件格式异常：%s", e)
+
+    def _handle_order(self, ev: dict) -> None:
+        """Forward exchange cumulative matching state for no-id maker deduplication."""
+        try:
+            order_id = str(ev.get("id") or ev.get("order_id") or "")
+            token = str(ev.get("asset_id") or ev.get("token_id") or "")
+            matched = float(ev.get("size_matched") or ev.get("sizeMatched") or 0)
+            price = float(ev.get("price") or 0)
+            raw_ts = float(ev.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return
+        if raw_ts > 10_000_000_000:
+            raw_ts /= 1000.0
+        if order_id and token:
+            self.broker.observe_order_match(
+                order_id, token, str(ev.get("side") or "").upper(), price, matched, raw_ts)
 
     def _handle_trade(self, ev: dict) -> None:
         taker_side = str(ev.get("side") or "").upper()
@@ -113,12 +134,20 @@ class UserFeed:
                 # same direction, each on their own token.
                 side = taker_side
             if token and size > 0:
+                order_id = str(mo.get("order_id") or mo.get("id") or "") or None
+                snapshot = getattr(self.broker, "_order_match_snapshots", {}).get(order_id)
+                raw_ts = float(ev.get("timestamp") or 0)
+                if raw_ts > 10_000_000_000:
+                    raw_ts /= 1000.0
                 self.broker.record_user_fill(
                     token, side, price, size, taker=False,
-                    order_id=str(mo.get("order_id") or mo.get("id") or "") or None,
+                    order_id=order_id,
                     fill_id=str(ev.get("id") or ev.get("trade_id") or "") or None,
                     trade_hash=str(ev.get("transaction_hash") or ev.get("transactionHash") or "") or None,
-                    fee_usd=float(ev.get("fee_usd") or ev.get("fee") or 0) or None)
+                    fee_usd=float(ev.get("fee_usd") or ev.get("fee") or 0) or None,
+                    matched_total=snapshot[0] if snapshot else None,
+                    match_observed_ts=snapshot[1] if snapshot else None,
+                    event_ts=raw_ts or None)
         if not we_are_maker:
             # None of the maker orders are ours, so this event is about our
             # own taker order (e.g. a forced hedge crossing the spread).

@@ -236,16 +236,22 @@ class PaperBroker:
             self._start_dying(market.condition_id, prev, now)
         self._quotes[market.condition_id] = new_states
 
-    def cancel_all(self) -> None:
-        self.cancel_quotes()
-        self._exits.clear()
+    def cancel_all(self, exclude_cids: set[str] | None = None) -> None:
+        self.cancel_quotes(exclude_cids=exclude_cids)
+        exclude = exclude_cids or set()
+        for cid in list(self._exits):
+            if cid not in exclude:
+                self._exits.pop(cid, None)
 
-    def cancel_quotes(self) -> None:
+    def cancel_quotes(self, exclude_cids: set[str] | None = None) -> None:
         now = time.time()
+        exclude = exclude_cids or set()
         for cid, states in self._quotes.items():
+            if cid in exclude:
+                continue
             for st in states:
                 self._start_dying(cid, st, now)
-        self._quotes.clear()
+            self._quotes.pop(cid, None)
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [s.quote for s in self._quotes.get(market.condition_id, [])]
@@ -792,6 +798,10 @@ class LiveBroker:
         self._exit_orders: dict[str, RestingOrder] = {}
         self._reward_exit_orders: dict[str, RestingOrder] = {}
         self._taker_order_contexts: dict[str, dict] = {}
+        # Audit contexts saved for ~120s after cancellation so late-arriving
+        # WebSocket fills from orders that were matched before the cancel landed
+        # still carry the correct path/intent (e.g. for reward-exit batching).
+        self._recently_cancelled: dict[str, tuple[dict, float]] = {}
         self._markets: dict[str, Market] = {}
         self._unmanaged_position_cids: set[str] = set()
         self._positions: dict[str, dict] = {}
@@ -937,6 +947,12 @@ class LiveBroker:
                 pass
 
     def _order_audit_context(self, order_id: str) -> dict:
+        """Resolve the audit context (path, intent, etc.) for a fill.
+
+        Searches live order books first; falls back to taker-order contexts and
+        then to recently-cancelled orders so fills that outrace their cancel
+        confirmations still carry the correct tags (e.g. normal_reward).
+        """
         for orders in getattr(self, "_open_orders", {}).values():
             for ro in orders:
                 if ro.order_id == order_id:
@@ -947,7 +963,18 @@ class LiveBroker:
         for ro in getattr(self, "_reward_exit_orders", {}).values():
             if ro.order_id == order_id:
                 return ro.audit
-        return getattr(self, "_taker_order_contexts", {}).get(order_id, {})
+        ctx = getattr(self, "_taker_order_contexts", {}).get(order_id, None)
+        if ctx is not None:
+            return ctx
+        completed = getattr(self, "_completed_order_contexts", {}).get(order_id, None)
+        if completed is not None:
+            return completed
+        # Last resort: a late-side WebSocket fill that arrived after we already
+        # cancelled the order (race between cancel and taker match at the CLOB).
+        recent = getattr(self, "_recently_cancelled", {}).get(order_id, None)
+        if recent is not None:
+            return recent[0]
+        return {}
 
     def _resting_order_context(self, order_id: str) -> tuple[Market | None, Quote | None, str | None]:
         for cid, orders in getattr(self, "_open_orders", {}).items():
@@ -982,6 +1009,8 @@ class LiveBroker:
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
                 ro = RestingOrder(oid, q, time.time(), expiration)
+                if self.metrics:
+                    self.metrics.initialize_order_match_watermark(oid)
                 self._record_order_event("ORDER_PLACED", quote=q, side="BUY", order_id=oid)
                 return ro
         except Exception as e:  # noqa: BLE001
@@ -1050,30 +1079,48 @@ class LiveBroker:
         if not order_ids:
             return True
 
+        # Initialised here (not in __init__) so test stubs that don't call
+        # __init__ still get a safe default.
+        if not hasattr(self, "_recently_cancelled"):
+            self._recently_cancelled: dict[str, tuple[dict, float]] = {}
+
         def _do_cancel():
             with self._client_lock:
                 self.client.cancel_orders(order_ids)
 
         try:
             _with_retry("batch cancel", _do_cancel)
+            now = time.time()
             for oid in order_ids:
                 market, quote, side = self._resting_order_context(oid)
+                audit_ctx = (audit_contexts or {}).get(oid)
                 self._record_order_event(
                     "ORDER_CANCELLED", market, quote, side, oid, reason=reason,
-                    audit=(audit_contexts or {}).get(oid))
+                    audit=audit_ctx)
+                if audit_ctx:
+                    self._recently_cancelled[oid] = (audit_ctx, now)
+            # Prune entries older than 120 s
+            stale = [k for k, (_, ts) in self._recently_cancelled.items()
+                     if now - ts > 120]
+            for k in stale:
+                del self._recently_cancelled[k]
             return True
         except Exception as e:  # noqa: BLE001
             from py_clob_client_v2 import OrderPayload
 
             ok = True
+            now = time.time()
             for oid in order_ids:
                 try:
                     with self._client_lock:
                         self.client.cancel_order(OrderPayload(orderID=oid))
                     market, quote, side = self._resting_order_context(oid)
+                    audit_ctx = (audit_contexts or {}).get(oid)
                     self._record_order_event(
                         "ORDER_CANCELLED", market, quote, side, oid, reason=reason,
-                        audit=(audit_contexts or {}).get(oid))
+                        audit=audit_ctx)
+                    if audit_ctx:
+                        self._recently_cancelled[oid] = (audit_ctx, now)
                 except Exception as fallback_error:  # noqa: BLE001
                     ok = False
                     log.warning("撤单失败（%s）：%s", oid[:16], fallback_error)
@@ -1166,6 +1213,8 @@ class LiveBroker:
                             context = (audit_context or {}).get(q.token_id, {})
                             placed.append(RestingOrder(
                                 oid, q, now, expiration, context))
+                            if self.metrics:
+                                self.metrics.initialize_order_match_watermark(oid)
                             self._record_order_event("ORDER_PLACED", market, q, "BUY", oid,
                                                      audit=context)
                         else:
@@ -1216,36 +1265,59 @@ class LiveBroker:
         if self.metrics:
             self.metrics.record_quotes(market.condition_id, quotes)
 
-    def cancel_all(self) -> None:
+    def cancel_all(self, exclude_cids: set[str] | None = None) -> None:
+        exclude = exclude_cids or set()
+        # Gather order ids for all markets except excluded ones.
+        ids = [ro.order_id
+               for cid, orders in self._open_orders.items()
+               if cid not in exclude
+               for ro in orders]
+        exit_ids = [ro.order_id
+                    for cid, ro in self._exit_orders.items()
+                    if cid not in exclude]
+        all_ids = ids + exit_ids
         ok = True
         try:
             with self._client_lock:
-                self.client.cancel_all()
+                if all_ids:
+                    self.client.cancel_orders(all_ids)
         except Exception as e:  # noqa: BLE001
             ok = False
             log.error("撤销全部订单失败：%s", e)
             self._record_order_event("ORDER_CANCEL_ALL", reason=str(e))
         if ok:
             self._record_order_event("ORDER_CANCEL_ALL")
-            self._open_orders.clear()
-            self._exit_orders.clear()
+            # Only clear the excluded cids' orders.
+            for cid in list(self._open_orders):
+                if cid not in exclude:
+                    self._open_orders.pop(cid, None)
+            for cid in list(self._exit_orders):
+                if cid not in exclude:
+                    self._exit_orders.pop(cid, None)
         else:
             self.reconcile_orders()
 
-    def cancel_quotes(self) -> None:
-        ids = [ro.order_id for orders in self._open_orders.values() for ro in orders]
+    def cancel_quotes(self, exclude_cids: set[str] | None = None) -> None:
+        ids = [ro.order_id
+               for cid, orders in self._open_orders.items()
+               if cid not in (exclude_cids or set())
+               for ro in orders]
         if self._batch_cancel(ids):
-            self._open_orders.clear()
+            for cid in list(self._open_orders):
+                if cid not in (exclude_cids or set()):
+                    self._open_orders.pop(cid, None)
         else:
             self.reconcile_orders()
 
-    def cancel_quotes_for_market(self, market: Market) -> None:
+    def cancel_quotes_for_market(self, market: Market) -> bool:
         cid = market.condition_id
         ids = [ro.order_id for ro in self._open_orders.get(cid, [])]
         if self._batch_cancel(ids):
             self._open_orders.pop(cid, None)
+            return True
         else:
             self.reconcile_orders()
+            return False
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [ro.quote for ro in self._open_orders.get(market.condition_id, [])]
@@ -1463,11 +1535,13 @@ class LiveBroker:
     def record_user_fill(self, token_id: str, side: str, price: float,
                          size: float, taker: bool = False, order_id: str | None = None,
                          fill_id: str | None = None, trade_hash: str | None = None,
-                         fee_usd: float | None = None) -> None:
+                         fee_usd: float | None = None,
+                         matched_total: float | None = None,
+                         match_observed_ts: float | None = None,
+                         event_ts: float | None = None) -> None:
         if size <= 0:
             return
         ts = time.time()
-        delta = size if side == "BUY" else -size
         market = next(
             (m for m in self._markets.values()
              if token_id in (m.yes_token, m.no_token)), None)
@@ -1477,8 +1551,74 @@ class LiveBroker:
         # Resolve order intent before applying the fill: a fully-filled maker
         # order is removed from _open_orders by _apply_fill_to_orders().
         context = LiveBroker._order_audit_context(self, order_id) if order_id else {}
+        if not context and not taker:
+            # Fallback: order_id may be missing from the WebSocket event
+            # (Polymarket maker_orders sometimes omit it).  Scan open BUY
+            # orders by token_id to recover the audit context so that
+            # reward-exit batch detection (which depends on path/intent)
+            # still works.
+            for orders in getattr(self, "_open_orders", {}).values():
+                for ro in orders:
+                    if ro.quote.token_id == token_id:
+                        context = ro.audit
+                        break
+                if context:
+                    break
         if taker and not context:
             context = {"path": "forced_hedge"}
+        if order_id and context:
+            if not hasattr(self, "_completed_order_contexts"):
+                self._completed_order_contexts = {}
+            self._completed_order_contexts[order_id] = context
+        if not fill_id:
+            if trade_hash:
+                fill_id = f"trade-{trade_hash}:{order_id or token_id}:{side}"
+            elif context.get("intent") == "normal_reward":
+                if not order_id or matched_total is None:
+                    if order_id:
+                        if not hasattr(self, "_pending_unidentified_reward_fills"):
+                            self._pending_unidentified_reward_fills = {}
+                        self._pending_unidentified_reward_fills[order_id] = {
+                            "token_id": token_id, "side": side, "price": price,
+                            "size": size, "fee_usd": fee_usd,
+                            "event_ts": event_ts or ts,
+                        }
+                    log.warning(
+                        "REWARD_EXIT_UNIDENTIFIED_FILL_HELD order_id=%s: "
+                        "缺少累计成交份额，未触发 take",
+                        order_id or "unknown",
+                    )
+                    return
+                if match_observed_ts is not None and event_ts is not None and \
+                        match_observed_ts + 1e-6 < event_ts:
+                    if not hasattr(self, "_pending_unidentified_reward_fills"):
+                        self._pending_unidentified_reward_fills = {}
+                    self._pending_unidentified_reward_fills[order_id] = {
+                        "token_id": token_id, "side": side, "price": price,
+                        "size": size, "fee_usd": fee_usd, "event_ts": event_ts,
+                    }
+                    log.warning(
+                        "REWARD_EXIT_UNIDENTIFIED_FILL_HELD order_id=%s: "
+                        "累计成交份额早于本次成交，未触发 take", order_id,
+                    )
+                    return
+                claim = getattr(self.metrics, "claim_unidentified_order_match", None)
+                added = claim(order_id, matched_total) if claim else None
+                if added is None:
+                    log.warning(
+                        "REWARD_EXIT_UNIDENTIFIED_FILL_HELD order_id=%s: "
+                        "订单没有安全水位，未触发 take", order_id,
+                    )
+                    return
+                if added <= 1e-9:
+                    log.info("REWARD_EXIT_UNIDENTIFIED_FILL_DUPLICATE order_id=%s "
+                             "matched_total=%.8f", order_id, matched_total)
+                    return
+                size = added
+                fill_id = f"order-match:{order_id}:{matched_total:.8f}"
+            else:
+                fill_id = f"live-{uuid.uuid4().hex}"
+        delta = size if side == "BUY" else -size
         is_batch_take = context.get("intent") == "batch_take"
         with self._state_lock:
             pending = self._pending_hedges.get(market.condition_id)
@@ -1533,8 +1673,7 @@ class LiveBroker:
             entry["fee"] = fee_usd
         if order_id:
             entry["order_id"] = order_id
-        if fill_id:
-            entry["fill_id"] = fill_id
+        entry["fill_id"] = fill_id
         self.fills_log.append(entry)
         self.fills_log = self.fills_log[-500:]
         if self.metrics:
@@ -1547,7 +1686,7 @@ class LiveBroker:
                     batch_id=str(entry.get("batch_id") or ""),
                     order_id=str(entry.get("order_id") or ""),
                     intent=intent, cid=market.condition_id,
-                    token_id=token_id, side=side, price=price, size=size,
+                    token_id=token_id, side=entry["side"], price=price, size=size,
                     fee_usd=float(entry.get("fee") or 0.0), ts=ts)
         log.info("LIVE FILL（WebSocket）：%s %s %s %.1f 股 @ %.3f",
                  market.question[:40], side, entry["side"], size, price)
@@ -1563,6 +1702,58 @@ class LiveBroker:
         if not skip_notify:
             _notify_live_fill(getattr(self, "notifier", None), entry, side)
 
+    def observe_order_match(self, order_id: str, token_id: str, side: str,
+                            price: float, matched_total: float,
+                            observed_ts: float) -> None:
+        """Cache exchange cumulative maker shares for a following no-id trade."""
+        if not order_id or matched_total < 0:
+            return
+        if not hasattr(self, "_order_match_snapshots"):
+            self._order_match_snapshots = {}
+        self._order_match_snapshots[order_id] = (matched_total, observed_ts)
+        pending = getattr(self, "_pending_unidentified_reward_fills", {}).get(order_id)
+        if pending and observed_ts + 1e-6 >= pending["event_ts"]:
+            self._pending_unidentified_reward_fills.pop(order_id, None)
+            LiveBroker.record_user_fill(
+                self,
+                pending["token_id"], pending["side"], pending["price"], pending["size"],
+                order_id=order_id, fee_usd=pending["fee_usd"],
+                matched_total=matched_total, match_observed_ts=observed_ts,
+                event_ts=pending["event_ts"],
+            )
+
+    def _record_inferred_maker_fill(
+            self, market: Market, token_id: str, size: float, ts: float,
+    ) -> dict | None:
+        """Persist a poll-inferred normal maker fill so batch detection can replay it."""
+        order = next(
+            (ro for ro in self._open_orders.get(market.condition_id, [])
+             if ro.quote.token_id == token_id and ro.audit.get("intent") == "normal_reward"),
+            None,
+        )
+        if order is None:
+            return None
+        entry = {
+            "ts": ts, "cid": market.condition_id, "market": market.question[:50],
+            "side": "YES" if token_id == market.yes_token else "NO",
+            "token": token_id, "price": order.quote.price, "size": size,
+            "path": "normal", "intent": "normal_reward",
+            "order_id": order.order_id,
+            "fill_id": f"inferred-{uuid.uuid4().hex}",
+            "inferred": True,
+        }
+        self.fills_log.append(entry)
+        if self.metrics:
+            self.metrics.record_fill(entry)
+            if hasattr(self.metrics, "record_reward_exit_fill"):
+                self.metrics.record_reward_exit_fill(
+                    fill_id=entry["fill_id"], batch_id="", order_id=order.order_id,
+                    intent="normal_reward", cid=market.condition_id,
+                    token_id=token_id, side=entry["side"], price=order.quote.price,
+                    size=size, fee_usd=0.0, ts=ts,
+                )
+        return entry
+
     def reconcile_orders(self) -> None:
         """Rebuild local order state from exchange truth."""
         def _do_fetch():
@@ -1574,6 +1765,10 @@ class LiveBroker:
         except Exception as e:  # noqa: BLE001
             log.warning("订单对账失败：%s", e)
             return
+        old_audits = {
+            ro.order_id: ro.audit
+            for orders in self._open_orders.values() for ro in orders
+        }
         by_cid: dict[str, list[RestingOrder]] = {}
         exit_by_cid: dict[str, RestingOrder] = {}
         for o in remote:
@@ -1597,7 +1792,8 @@ class LiveBroker:
                 continue
             side = str(o.get("side") or "").upper()
             exp = int(o.get("expiration") or 0)
-            ro = RestingOrder(oid, Quote(token, price, remaining), time.time(), exp)
+            ro = RestingOrder(oid, Quote(token, price, remaining), time.time(), exp,
+                              old_audits.get(oid, {}))
             cid = market.condition_id
             if side == "SELL":
                 exit_by_cid[cid] = ro
@@ -1665,19 +1861,26 @@ class LiveBroker:
                      if token in (m.yes_token, m.no_token)), None)
                 if market is None:
                     continue
-                entry = {
-                    "ts": now, "cid": market.condition_id,
-                    "market": market.question[:50],
-                    "side": "YES" if token == market.yes_token else "NO",
-                    "token": token, "size": gained, "inferred": True,
-                }
-                for ro in self._open_orders.get(market.condition_id, []):
-                    if ro.quote.token_id == token:
-                        entry["price"] = ro.quote.price
-                        break
-                self.fills_log.append(entry)
-                if self.metrics:
-                    self.metrics.record_fill(entry)
+                entry = self._record_inferred_maker_fill(market, token, gained, now)
+                if entry is None:
+                    entry = {
+                        "ts": now, "cid": market.condition_id,
+                        "market": market.question[:50],
+                        "side": "YES" if token == market.yes_token else "NO",
+                        "token": token, "size": gained, "inferred": True,
+                    }
+                    for ro in self._open_orders.get(market.condition_id, []):
+                        if ro.quote.token_id == token:
+                            entry["price"] = ro.quote.price
+                            break
+                    self.fills_log.append(entry)
+                    if self.metrics:
+                        self.metrics.record_fill(entry)
+                    log.warning(
+                        "REWARD_EXIT_INFERRED_FILL_UNATTRIBUTED cid=%s token=%s size=%.1f "
+                        "说明=断线轮询发现增仓但无法证明来自普通奖励挂单，未创建奖励退出批次",
+                        market.condition_id, token[:12], gained,
+                    )
                 log.info("LIVE FILL detected %s %s +%.1f shares",
                          market.question[:40],
                          "YES" if token == market.yes_token else "NO", gained)

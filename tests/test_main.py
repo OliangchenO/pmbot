@@ -260,6 +260,36 @@ def _setup(bot: Bot, tmp_path, market: Market) -> PaperBroker:
     return broker
 
 
+def test_startup_keeps_stale_sell_pending_reward_exit_batch_locked(tmp_path):
+    """重启不能关闭已进入被动卖出阶段的奖励退出批次。"""
+    async def scenario():
+        bot = _bot(tmp_path)
+        cid = "reward-exit-cid"
+        batch = {
+            "batch_id": "reward-exit-batch",
+            "cid": cid,
+            "status": "SELL_PENDING",
+            "created_ts": 0.0,
+        }
+        metrics = MagicMock()
+        metrics.get_open_reward_exit_batches.return_value = [batch]
+        bot.metrics = metrics
+        bot.broker = MagicMock()
+        bot.tracker = MagicMock()
+        bot._reward_exit_mode = "active"
+        bot._stale_batches_cleaned = False
+        bot._credit_take_fills = AsyncMock()
+        bot._process_reward_fills = AsyncMock()
+        bot._advance_reward_exit_batches = AsyncMock()
+
+        await bot._run_reward_exit_batch_tick(901.0)
+
+        metrics.close_reward_exit_batch.assert_not_called()
+        assert cid in bot._reward_exit_locked
+
+    asyncio.run(scenario())
+
+
 def _quote_loop_bot_with_empty_strategy(tmp_path, unpaired: float = 0.0):
     """Build a real paper quote loop whose strategy boundary returns no quote."""
     cfg = copy.deepcopy(main.load_config("config.debug.yaml"))

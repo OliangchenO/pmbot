@@ -43,6 +43,11 @@ def _open_take_batch(bot: Bot, market: Market, batch_id: str = "batch-1") -> Non
 class _FillBroker:
     def __init__(self, fills):
         self.fills_log = fills
+        self.cancelled = []
+
+    def cancel_quotes_for_market(self, market):
+        self.cancelled.append(market.condition_id)
+        return True
 
 
 def test_take_credit_persists_only_own_batch_fill_once_and_ignores_forced_hedge(tmp_path):
@@ -116,6 +121,107 @@ def test_take_submission_uses_remaining_size_and_batch_audit_context(tmp_path):
         assert broker.calls[0][4]["intent"] == "batch_take"
         assert broker.calls[0][4]["batch_id"] == "batch-1"
         assert broker.calls[0][4]["best_ask"] == 0.51
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_normal_reward_fill_replays_from_metrics_after_broker_restart(tmp_path):
+    """A restart must not lose a normal maker fill before its batch is opened."""
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        bot.metrics.record_reward_exit_fill(
+            fill_id="durable-origin", batch_id="", order_id="normal-order",
+            intent="normal_reward", cid=market.condition_id,
+            token_id=market.no_token, side="NO", price=0.44, size=40.0,
+            fee_usd=0.0, ts=10.0,
+        )
+        bot.broker = _FillBroker([])
+
+        await bot._process_reward_fills(11.0)
+
+        batch = bot.metrics.get_reward_exit_batch("reward-exit-durable-origin")
+        assert batch is not None
+        assert batch["origin_size"] == 40.0
+        assert batch["take_target_size"] == 80.0
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_first_reward_fill_cancels_once_and_every_fill_opens_its_own_take(tmp_path):
+    """One market cancel guards every same-market reward fill, not only the first."""
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        broker = _FillBroker([
+            {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
+             "cid": market.condition_id, "token": market.yes_token, "side": "YES",
+             "price": 0.44, "size": 33.0, "ts": 10.0},
+            {"fill_id": "fill-2", "order_id": "order-2", "intent": "normal_reward",
+             "cid": market.condition_id, "token": market.no_token, "side": "NO",
+             "price": 0.45, "size": 40.0, "ts": 11.0},
+        ])
+        bot.broker = broker
+
+        await bot._process_reward_fills(12.0)
+
+        assert broker.cancelled == [market.condition_id]
+        assert bot.metrics.get_reward_exit_batch("reward-exit-fill-1")["take_target_size"] == 66.0
+        assert bot.metrics.get_reward_exit_batch("reward-exit-fill-2")["take_target_size"] == 80.0
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_failure_does_not_block_confirmed_reward_take(tmp_path):
+    """A cancel error is logged, but the confirmed reward fill still gets 2q take."""
+    class _CancelFailBroker(_FillBroker):
+        def cancel_quotes_for_market(self, market):
+            raise RuntimeError("exchange timeout")
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        bot.broker = _CancelFailBroker([
+            {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
+             "cid": market.condition_id, "token": market.yes_token, "side": "YES",
+             "price": 0.44, "size": 33.0, "ts": 10.0},
+        ])
+
+        await bot._process_reward_fills(12.0)
+
+        assert bot.metrics.get_reward_exit_batch("reward-exit-fill-1")["take_target_size"] == 66.0
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_quote_cancel_retries_while_reward_batch_is_open(tmp_path):
+    """Cancellation retries independently; the existing batch remains eligible for take."""
+    class _RetryBroker(_FillBroker):
+        def __init__(self, fills):
+            super().__init__(fills)
+            self.attempts = 0
+
+        def cancel_quotes_for_market(self, market):
+            self.attempts += 1
+            return self.attempts >= 2
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        broker = _RetryBroker([
+            {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
+             "cid": market.condition_id, "token": market.yes_token, "side": "YES",
+             "price": 0.44, "size": 33.0, "ts": 10.0},
+        ])
+        bot.broker = broker
+
+        await bot._process_reward_fills(12.0)
+        assert bot.metrics.get_reward_exit_batch("reward-exit-fill-1") is not None
+        assert broker.attempts == 1
+
+        await bot._retry_reward_exit_quote_cancels(13.0)
+        assert broker.attempts == 2
+        assert bot._reward_exit_cancel_retries == {}
         bot.metrics.close()
 
     asyncio.run(scenario())

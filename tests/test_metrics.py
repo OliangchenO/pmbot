@@ -9,6 +9,17 @@ from pmbot.gamma import Market
 from pmbot.metrics import MetricsStore
 
 
+def test_unidentified_order_match_uses_only_new_cumulative_shares(tmp_path):
+    """A replayed no-id maker update cannot create a second fill."""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.initialize_order_match_watermark("order-1")
+
+    assert store.claim_unidentified_order_match("order-1", 33.0) == 33.0
+    assert store.claim_unidentified_order_match("order-1", 33.0) == 0.0
+    assert store.claim_unidentified_order_match("order-1", 40.0) == 7.0
+    store.close()
+
+
 def test_reward_exit_fill_duplicate_preserves_original_fact(tmp_path):
     """A duplicate fill id must not overwrite the first recorded fill fact."""
     store = MetricsStore(str(tmp_path / "test.db"))

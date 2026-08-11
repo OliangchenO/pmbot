@@ -885,7 +885,9 @@ class Bot:
         self._awaiting_top_n_rescan: set[str] = set()
         self._batch_task_tracker: dict[str, asyncio.Task] = {}  # batch_id → async task
         self._batch_last_take_attempt: dict[str, float] = {}  # batch_id → last attempt ts
+        self._batch_take_errors: dict[str, tuple[str, int]] = {}  # batch_id → (last_error, count)
         self._batch_exit_orders: dict[str, object] = {}  # batch_id → RestingOrder
+        self._reward_exit_cancel_retries: dict[str, tuple[gamma.Market, float, int]] = {}
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
         self._recovery_pricing: dict[str, dict[str, float | str]] = {}
@@ -1085,7 +1087,9 @@ class Bot:
 
                 if action in (RiskAction.PAUSE_DAY, RiskAction.PAUSE_QUOTES):
                     if not self._was_paused:
-                        await self._broker_call(self.broker.cancel_quotes)
+                        await self._broker_call(
+                            self.broker.cancel_quotes,
+                            exclude_cids=self._manual_hold_cids())
                         self._was_paused = True
                     for m in self.markets:
                         self.metrics.sample_uptime(m.condition_id, False)
@@ -1119,7 +1123,8 @@ class Bot:
             if self._merge_task and not self._merge_task.done():
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._merge_task
-            await self._broker_call(self.broker.cancel_all)
+            await self._broker_call(
+                self.broker.cancel_all, exclude_cids=self._manual_hold_cids())
             if self.tracker:
                 await self.tracker.stop()
             self._print_status()
@@ -1160,11 +1165,11 @@ class Bot:
                     len(missing))
         await self.tracker.resubscribe([*self.tracker.books, *missing])
 
-    async def _broker_call(self, fn, *args):
+    async def _broker_call(self, fn, *args, **kwargs):
         """Dispatch broker order ops off the event loop in live mode."""
         if self.paper:
-            return fn(*args)
-        return await asyncio.to_thread(fn, *args)
+            return fn(*args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _market_lock(self, cid: str) -> asyncio.Lock:
         lock = self._market_locks.get(cid)
@@ -1954,6 +1959,40 @@ class Bot:
         if self._reward_exit_mode == "off" or self.broker is None or self.tracker is None:
             return
 
+        await self._retry_reward_exit_quote_cancels(now)
+
+        # ── Step -1: one-time stale batch cleanup on first tick ──
+        if not self._stale_batches_cleaned and self.metrics is not None:
+            self._stale_batches_cleaned = True
+            risk_cfg = self.cfg.get("risk") or {}
+            stale_secs: int = int(risk_cfg.get(
+                "reward_exit_stale_after_secs",
+                risk_cfg.get("reward_exit_terminal_after_secs", 900),
+            ))
+            # Only an incomplete take can be stale here. SELL_PENDING is a
+            # valid long-lived passive exit state and must keep its CID locked
+            # across a restart so generic inventory recovery cannot take over.
+            open_batches = self.metrics.get_open_reward_exit_batches()
+            for b in open_batches:
+                if b["status"] != "TAKE_PENDING":
+                    continue
+                age = now - float(b.get("created_ts") or 0)
+                if age < stale_secs:
+                    continue
+                bid = b["batch_id"]
+                log.warning(
+                    "REWARD_EXIT_BATCH_STALE_CLEANUP batch_id=%s cid=%s "
+                    "status=%s age=%.0fs "
+                    "说明=启动时发现前一次会话残留批次，自动关闭并解锁市场",
+                    bid, b["cid"], b["status"], age,
+                )
+                self.metrics.close_reward_exit_batch(
+                    batch_id=bid,
+                    status="CLOSED",
+                    closed_ts=now,
+                    manual_reason=f"stale_startup_cleanup_age_{age:.0f}s",
+                )
+
         # ── Step 0: Detect and credit take fills ──
         # Must run before _process_reward_fills so we don't mistake take fills
         # for new origin fills.
@@ -1985,6 +2024,7 @@ class Bot:
             # Unlock CIDs where all batches are CLOSED
             for cid in self._reward_exit_locked - active_cids:
                 self._reward_exit_locked.discard(cid)
+                self._reward_exit_cancel_retries.pop(cid, None)
                 self._awaiting_top_n_rescan.add(cid)
                 m_name = next((m.question for m in self.markets if m.condition_id == cid), cid)
                 log.warning("MARKET_REWARD_EXIT_UNLOCKED cid=%s market='%s' "
@@ -2156,6 +2196,28 @@ class Bot:
             target_result.required_net_usd,
         )
 
+        # ── Timing stats: compute end-to-end take latency ──
+        if self.metrics is not None:
+            fresh = self.metrics.get_reward_exit_batch(batch_id)
+            if fresh:
+                ots = float(fresh.get("origin_fill_ts") or 0)
+                bts = float(fresh.get("created_ts") or 0)
+                sts = float(fresh.get("first_take_submit_ts") or 0)
+                ets = float(fresh.get("first_take_executed_ts") or 0)
+                log.warning(
+                    "BATCH_TIMING batch_id=%s cid=%s "
+                    "fill_to_batch=%.3fs batch_to_submit=%.3fs "
+                    "submit_to_exec=%.3fs exec_to_seal=%.3fs "
+                    "total_fill_to_seal=%.3fs "
+                    "说明=take阶段端到端耗时统计",
+                    batch_id, cid,
+                    bts - ots if ots > 0 and bts > 0 else -1.0,
+                    sts - bts if sts > 0 and bts > 0 else -1.0,
+                    ets - sts if ets > 0 and sts > 0 else -1.0,
+                    now - ets if ets > 0 else -1.0,
+                    now - ots if ots > 0 else -1.0,
+                )
+
         self._batch_last_take_attempt.pop(batch_id, None)
 
     # ── Fill detection and batch creation ──
@@ -2174,7 +2236,23 @@ class Bot:
         if self.broker is None or self.metrics is None or self.tracker is None:
             return
 
-        fills = self.broker.fills_log
+        fills = list(self.broker.fills_log)
+        # A process restart or a user-feed outage can leave the in-memory log
+        # empty even though LiveBroker already persisted the normal maker fill.
+        # Replay those durable origin facts before deciding that no batch exists.
+        for persisted in self.metrics.list_unbatched_normal_reward_fills():
+            fills.append({
+                "fill_id": persisted["fill_id"],
+                "order_id": persisted["order_id"],
+                "intent": persisted["intent"],
+                "cid": persisted["cid"],
+                "token": persisted["token_id"],
+                "side": persisted["side"],
+                "price": persisted["price"],
+                "size": persisted["size"],
+                "fee_usd": persisted["fee_usd"],
+                "ts": persisted["ts"],
+            })
         known_fill_ids = self.metrics.reward_exit_batch_origin_fill_ids()
 
         for entry in fills:
@@ -2201,6 +2279,7 @@ class Bot:
             size = float(entry.get("size") or 0)
             price = float(entry.get("price") or 0)
             order_id = str(entry.get("order_id") or "")
+            origin_fill_ts = float(entry.get("ts") or now)
 
             if not token or not cid or size <= 0:
                 continue
@@ -2215,6 +2294,32 @@ class Bot:
 
             batch_id = f"reward-exit-{fill_id}"
 
+            # ── Cancel all normal quotes on this market FIRST ──
+            # A fill on one side means we now hold inventory on that token.
+            # The other side's quote must be cancelled immediately to avoid
+            # double-selling into the same market during the exit.
+            # We cancel before the DB write so a crash during write won't
+            # leave stale quotes on Polymarket.
+            if cid not in self._reward_exit_locked:
+                self._reward_exit_locked.add(cid)
+                log.warning(
+                    "MARKET_REWARD_EXIT_LOCKED cid=%s market='%s' "
+                    "说明=检测到首笔普通奖励成交，立即锁定市场并撤销普通报价",
+                    cid, str(m.question)[:50],
+                )
+                try:
+                    cancelled = await self._broker_call(
+                        self.broker.cancel_quotes_for_market, m)
+                    if cancelled is False:
+                        self._schedule_reward_exit_cancel_retry(cid, m, now, 1)
+                except Exception as exc:  # noqa: BLE001 - confirmed fills must still take
+                    log.warning(
+                        "REWARD_EXIT_CANCEL_QUOTES_FAILED cid=%s market='%s': %s; "
+                        "仍为已确认奖励成交创建 double-take 批次",
+                        cid, str(m.question)[:50], exc,
+                    )
+                    self._schedule_reward_exit_cancel_retry(cid, m, now, 1)
+
             # Persist the batch
             self.metrics.open_reward_exit_batch(
                 batch_id=batch_id, cid=cid,
@@ -2225,6 +2330,7 @@ class Bot:
                 origin_fee_usd=float(entry.get("fee") or entry.get("fee_usd") or 0.0),
                 take_target_size=2.0 * size,
                 created_ts=now,
+                origin_fill_ts=origin_fill_ts,
             )
 
             log.warning(
@@ -2239,17 +2345,34 @@ class Bot:
             )
             known_fill_ids.add(fill_id)
 
-            # ── Immediately lock the CID to stop ordinary quoting ──
-            # Do not wait for the end-of-tick CID sync in Step 3 — the
-            # batch has an open take to execute and ordinary quoting
-            # should stop right now to avoid interfering with the exit.
-            if cid not in self._reward_exit_locked:
-                self._reward_exit_locked.add(cid)
-                log.warning(
-                    "MARKET_REWARD_EXIT_LOCKED cid=%s market='%s' "
-                    "说明=该市场有活跃奖励退出批次，停止普通报价和旧 recovery",
-                    cid, str(m.question)[:50],
-                )
+    def _schedule_reward_exit_cancel_retry(
+            self, cid: str, market: gamma.Market, now: float, attempts: int,
+    ) -> None:
+        delay = min(2 ** (attempts - 1), 30.0)
+        self._reward_exit_cancel_retries[cid] = (market, now + delay, attempts)
+        log.warning(
+            "REWARD_EXIT_CANCEL_QUOTES_RETRY_SCHEDULED cid=%s attempt=%d delay=%.0fs",
+            cid, attempts, delay,
+        )
+
+    async def _retry_reward_exit_quote_cancels(self, now: float) -> None:
+        """Retry failed normal-quote cancellations without delaying confirmed takes."""
+        if self.broker is None:
+            return
+        for cid, (market, due_ts, attempts) in list(self._reward_exit_cancel_retries.items()):
+            if now < due_ts:
+                continue
+            try:
+                cancelled = await self._broker_call(self.broker.cancel_quotes_for_market, market)
+            except Exception as exc:  # noqa: BLE001 - retry on the next backoff slot
+                log.warning("REWARD_EXIT_CANCEL_QUOTES_RETRY_FAILED cid=%s: %s", cid, exc)
+                cancelled = False
+            if cancelled is False:
+                self._schedule_reward_exit_cancel_retry(cid, market, now, attempts + 1)
+            else:
+                self._reward_exit_cancel_retries.pop(cid, None)
+                log.info("REWARD_EXIT_CANCEL_QUOTES_RETRY_SUCCEEDED cid=%s attempts=%d",
+                         cid, attempts)
 
     # ── Batch advancement ──
 
@@ -2269,6 +2392,8 @@ class Bot:
             by_cid.setdefault(b["cid"], []).append(b)
 
         manual_hold = self._manual_hold_cids()
+        risk_cfg = self.cfg.get("risk") or {}
+        terminal_secs: int = int(risk_cfg.get("reward_exit_terminal_after_secs", 900))
 
         # ── Per-tick committed balance: prevent multiple batches in the
         #     same tick from collectively overspending.  We snapshot the
@@ -2286,6 +2411,34 @@ class Bot:
                     committed_balance = bal
             except Exception:
                 pass
+
+        # ── Terminal timeout: close stale TAKE_PENDING batches that have
+        #     been stuck forever (e.g. balance insufficient, book missing,
+        #     market delisted).  Without this the CID is permanently locked
+        #     and will never quote again.
+        if self.metrics:
+            for b in open_batches:
+                if b["status"] not in ("TAKE_PENDING",):
+                    continue
+                age = now - float(b["created_ts"])
+                if age < terminal_secs:
+                    continue
+                bid = b["batch_id"]
+                cid = b["cid"]
+                log.warning(
+                    "REWARD_EXIT_BATCH_TERMINAL_TIMEOUT batch_id=%s cid=%s "
+                    "age=%.0fs status=%s take_filled=%.0f take_target=%.0f "
+                    "说明=批次在TAKE_PENDING状态超时，自动关闭并解锁市场",
+                    bid, cid, age, b["status"],
+                    float(b.get("take_filled_size") or 0),
+                    float(b.get("take_target_size") or 0),
+                )
+                self.metrics.close_reward_exit_batch(
+                    batch_id=bid,
+                    status="CLOSED",
+                    closed_ts=now,
+                    manual_reason=f"terminal_timeout_age_{age:.0f}s",
+                )
 
         for cid, batches in by_cid.items():
             # Skip CIDs in manual hold — this covers both config-driven holds
@@ -2357,10 +2510,22 @@ class Bot:
             )
             return 0.0
 
-        # Retry with backoff
+        # ── Exponential backoff for FAK retries ──
+        # First attempt after batch creation: no delay (attempts=0 → 0s).
+        # After 1st failure: 1s, 2nd: 2s, 3rd: 4s, then clamp at 5s.
+        # This puts fast pressure on fresh inventory while avoiding
+        # wasteful spam when the book is persistently empty.
         last = self._batch_last_take_attempt.get(batch_id, 0.0)
-        if now - last < 5.0:  # 5-second retry interval
-            return 0.0
+        if last > 0:
+            # How many previous failures for this batch?
+            attempts: int = 0
+            err_info = self._batch_take_errors.get(batch_id)
+            if err_info:
+                attempts = err_info[1]
+            # Exponential: 1s, 2s, 4s capped at 5s
+            delay: float = min(1.0 * (2 ** (attempts - 1)), 5.0) if attempts > 0 else 1.0
+            if now - last < delay:
+                return 0.0
         self._batch_last_take_attempt[batch_id] = now
 
         # Determine tick for max legal price
@@ -2376,6 +2541,12 @@ class Bot:
             "说明=提交FAK BUY互补token",
             batch_id, cid, complement_token[:12], target, remaining, max_buy_price,
         )
+
+        # ── Record first take submit timestamp for timing stats ──
+        first_submit = batch.get("first_take_submit_ts")
+        if first_submit is None and self.metrics is not None:
+            self.metrics.update_reward_exit_batch(
+                batch_id=batch_id, first_take_submit_ts=now)
 
         # ── Balance check: skip if remaining * best_ask > available ──
         # Compute amount tightly to avoid FAK overfill.  The CLOB FAK
@@ -2422,6 +2593,8 @@ class Bot:
         # fills_log — the WebSocket fill may not carry the correct
         # batch_id/orient_id, causing the batch to never advance.
         remaining_before = remaining
+        new_total: float = filled  # init before conditional — used in log & seal below
+        remaining_after: float = remaining
         if filled_now > 0 and self.metrics is not None:
             # Persist the fill fact for idempotent replay
             fill_proof = {
@@ -2435,11 +2608,14 @@ class Bot:
             }
             self.metrics.record_reward_exit_fill(**fill_proof)
             new_total = filled + filled_now
+            # ── Record first take execution timestamp for timing stats ──
+            first_exec = batch.get("first_take_executed_ts")
             self.metrics.update_reward_exit_batch(
                 batch_id=batch_id,
                 take_filled_size=new_total,
                 take_notional_usd=float(batch.get("take_notional_usd") or 0)
                                    + safe_price * filled_now,
+                **({"first_take_executed_ts": now} if first_exec is None else {}),
             )
             # Re-read remaining after credit for the EXECUTED log line
             remaining_after = reward_exit.remaining_take(target, new_total)
@@ -2457,6 +2633,29 @@ class Bot:
                 persisted = self.metrics.list_reward_exit_fills(
                     batch_id, intent="batch_take")
                 await self._seal_and_set_sell_target(batch, persisted, now)
+        else:
+            # ── FAK returned 0: classify the error for adaptive backoff ──
+            # Permanent errors (balance, invalid args) get longer cooldown
+            # after repeated failures to avoid wasted API calls.
+            err_key = "unknown"
+            if not balance_ok:
+                err_key = "balance_insufficient"
+            elif book is None or best_ask is None:
+                err_key = "no_book"
+            elif m is None:
+                err_key = "no_market"
+            prev = self._batch_take_errors.get(batch_id)
+            if prev and prev[0] == err_key:
+                new_count = prev[1] + 1
+            else:
+                new_count = 1
+            self._batch_take_errors[batch_id] = (err_key, new_count)
+            if new_count >= 3 and new_count % 10 == 0:
+                log.warning(
+                    "BATCH_TAKE_STUCK batch_id=%s cid=%s error=%s count=%d "
+                    "说明=take持续失败，已重试%d次，原因=%s",
+                    batch_id, cid, err_key, new_count, new_count, err_key,
+                )
 
         # Return actual spend for per-tick committed balance tracking
         return safe_price * filled_now
@@ -2465,6 +2664,8 @@ class Bot:
 
     # Track per-batch exit orders: batch_id → RestingOrder
     _batch_exit_orders: dict[str, object] = {}
+    # Guard: close stale batches from prior sessions exactly once per run
+    _stale_batches_cleaned: bool = False
 
     async def _advance_sell_pending(self, cid: str, batch: dict, now: float) -> None:
         """Manage maker SELL for a SELL_PENDING batch.
@@ -2521,6 +2722,20 @@ class Bot:
             # All exit shares sold — close batch
             if self.metrics:
                 self.metrics.close_reward_exit_batch(batch_id=batch_id, closed_ts=now)
+                # ── Timing: full lifecycle fill → close ──
+                fresh = self.metrics.get_reward_exit_batch(batch_id)
+                if fresh:
+                    ots = float(fresh.get("origin_fill_ts") or 0)
+                    ets = float(fresh.get("first_take_executed_ts") or 0)
+                    cts = float(fresh.get("closed_ts") or 0)
+                    log.warning(
+                        "BATCH_TIMING batch_id=%s cid=%s "
+                        "total_fill_to_close=%.3fs seal_to_close=%.3fs "
+                        "stage=COMPLETE 说明=退出全生命周期耗时统计",
+                        batch_id, cid,
+                        cts - ots if ots > 0 else -1.0,
+                        cts - ets if ets > 0 else -1.0,
+                    )
             log.warning(
                 "REWARD_EXIT_BATCH_CLOSED batch_id=%s cid=%s "
                 "exit_filled=%.0f exit_size=%.0f 说明=所有退出份额已售出",
@@ -2712,6 +2927,14 @@ class Bot:
             self.metrics.record_markout(mo)
         for cid, avg_cents, n in self.markouts.toxic_markets():
             m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+            # P1-4: never trip a manual_hold market — the operator is
+            # managing it by hand.
+            manual_hold = self._manual_hold_cids()
+            if cid in manual_hold:
+                log.info("markout toxic '%s' (%.1fc, n=%d) — 人工持有中，跳过 trip",
+                         (m.question if m else cid)[:50], avg_cents, n)
+                self.markouts.reset_market(cid)
+                continue
             self.guards.trip_market(
                 cid, now, f"avg markout {avg_cents:+.1f}c over {n} fills",
                 m.question if m else cid)
