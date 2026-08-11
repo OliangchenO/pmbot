@@ -963,12 +963,19 @@ class Bot:
             log.warning("无法写入 %s：%s", self._markets_toml, e)
 
     def _manual_hold_cids(self) -> set[str]:
-        """Return markets that the bot must leave entirely to manual handling."""
+        """Return markets that the bot must leave entirely to manual handling.
+
+        Includes both config-driven manual_hold_cids and permanently banned CIDs
+        (markout-ban + recovery-loss-ban), so every call site gets a single
+        authoritative set and banned checks don't scatter.
+        """
         risk_cfg = self.cfg.get("risk") or {}
-        return {
+        manual = {
             hex(cid) if isinstance(cid, int) else str(cid)
             for cid in risk_cfg.get("manual_hold_cids") or []
         }
+        manual.update(self._banned_cids)
+        return manual
 
     async def run(self) -> None:
         if not self.paper:
@@ -1349,8 +1356,6 @@ class Bot:
             self._last_rotate = time.time()
         exclude = set() if initial else self._rotatable_tripped_cids()
         exclude |= exclude_cids or set()
-        # P1.3: 把 markout-ban 的 cid 也排除，确保 banned 市场不会被重新扫入。
-        exclude |= self._banned_cids
         # Manual-hold markets are excluded from selection; their inventory and
         # orders remain untouched by the bot.
         manual_hold = self._manual_hold_cids()
@@ -2263,7 +2268,12 @@ class Bot:
         for b in open_batches:
             by_cid.setdefault(b["cid"], []).append(b)
 
+        manual_hold = self._manual_hold_cids()
         for cid, batches in by_cid.items():
+            # Skip CIDs in manual hold — this covers both config-driven holds
+            # and permanently banned CIDs (markout/recovery-loss ban).
+            if cid in manual_hold:
+                continue
             # Find the oldest TAKE_PENDING batch — only one take at a time
             take_batches = [b for b in batches if b["status"] == "TAKE_PENDING"]
             if take_batches:
@@ -2377,10 +2387,11 @@ class Bot:
             fill_proof = {
                 "fill_id": f"take-{batch_id}-{time.time():.3f}",
                 "cid": cid, "batch_id": batch_id,
-                "token": complement_token, "side": "BUY",
+                "token_id": complement_token, "side": "BUY",
                 "price": safe_price, "size": filled_now,
                 "fee_usd": 0.0, "ts": now,
                 "intent": "batch_take",
+                "order_id": "",
             }
             self.metrics.record_reward_exit_fill(**fill_proof)
             new_total = filled + filled_now
