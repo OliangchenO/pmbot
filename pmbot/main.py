@@ -2272,11 +2272,20 @@ class Bot:
 
         # ── Per-tick committed balance: prevent multiple batches in the
         #     same tick from collectively overspending.  We snapshot the
-        #     broker balance once and deduct every FAK fill before the next
-        #     batch's budget check, so the second batch sees a realistic
-        #     post-execution balance even though the actual CLOB collateral
-        #     hasn't settled yet.
+        #     live broker balance once, then deduct every actual FAK spend
+        #     (safe_price × filled_now) so batch 2 sees a realistic
+        #     post-batch-1 balance.  Do NOT re-read _collateral — the CLOB
+        #     balance isn't settled instantly and would show stale data.
         committed_balance: float | None = None
+        # Lazy-init on first use so PaperBroker (no _collateral) isn't
+        # silently broken.
+        if hasattr(self.broker, '_collateral'):
+            try:
+                bal = getattr(self.broker, '_collateral', None)
+                if bal is not None and isinstance(bal, (int, float)) and bal == bal:
+                    committed_balance = bal
+            except Exception:
+                pass
 
         for cid, batches in by_cid.items():
             # Skip CIDs in manual hold — this covers both config-driven holds
@@ -2287,19 +2296,15 @@ class Bot:
             take_batches = [b for b in batches if b["status"] == "TAKE_PENDING"]
             if take_batches:
                 take_batches.sort(key=lambda b: b["created_ts"])
-                await self._advance_take_pending(
+                spent = await self._advance_take_pending(
                     cid, take_batches[0], now,
                     committed_balance=committed_balance,
                 )
-                # If the broker has a _collateral attribute, re-read after
-                # the FAK to keep committed_balance in sync with reality.
-                if hasattr(self.broker, '_collateral'):
-                    try:
-                        bal = getattr(self.broker, '_collateral', None)
-                        if bal is not None and isinstance(bal, (int, float)) and bal == bal:
-                            committed_balance = bal
-                    except Exception:
-                        pass
+                # Deduct the actual FAK spend (not the budget) so the next
+                # batch's check is accurate.  The live _collateral won't
+                # reflect this spend for several seconds.
+                if spent > 0 and committed_balance is not None:
+                    committed_balance = max(0.0, committed_balance - spent)
 
             # SELL_PENDING batches
             sell_batches = [b for b in batches if b["status"] == "SELL_PENDING"]
@@ -2309,16 +2314,19 @@ class Bot:
     # ── Take stage: submit FAK BUY ──
 
     async def _advance_take_pending(self, cid: str, batch: dict, now: float,
-                                     committed_balance: float | None = None) -> None:
+                                     committed_balance: float | None = None) -> float:
         """Submit FAK BUY for remaining complement shares of a TAKE_PENDING batch.
 
         committed_balance, when passed, is the broker balance *after* earlier
         batches in this tick have already spent.  It overrides the live
         _collateral read for the budget check so multiple batches within one
         tick don't collectively overspend.
+
+        Returns the actual USD spent (safe_price × filled_now) so the caller
+        can deduct it from committed_balance for subsequent batches.
         """
         if self.broker is None or self.tracker is None:
-            return
+            return 0.0
 
         complement_token = batch["complement_token_id"]
         orig_size = float(batch["origin_size"])
@@ -2327,16 +2335,16 @@ class Bot:
         remaining = reward_exit.remaining_take(target, filled)
 
         if remaining <= 0:
-            return
+            return 0.0
 
         # Check if complement book is available
         book = self.tracker.books.get(complement_token)
         if book is None:
-            return
+            return 0.0
 
         best_ask = book.best_ask
         if best_ask is None:
-            return
+            return 0.0
 
         batch_id = batch["batch_id"]
 
@@ -2347,12 +2355,12 @@ class Bot:
                 "说明=shadow模式，不实际提交take订单",
                 batch_id, cid, complement_token[:12], target, remaining, best_ask,
             )
-            return
+            return 0.0
 
         # Retry with backoff
         last = self._batch_last_take_attempt.get(batch_id, 0.0)
         if now - last < 5.0:  # 5-second retry interval
-            return
+            return 0.0
         self._batch_last_take_attempt[batch_id] = now
 
         # Determine tick for max legal price
@@ -2449,6 +2457,9 @@ class Bot:
                 persisted = self.metrics.list_reward_exit_fills(
                     batch_id, intent="batch_take")
                 await self._seal_and_set_sell_target(batch, persisted, now)
+
+        # Return actual spend for per-tick committed balance tracking
+        return safe_price * filled_now
 
     # ── SELL stage: per-batch GTD maker SELL ──
 
