@@ -958,6 +958,64 @@ def test_live_batch_take_uses_share_limited_fak_without_hedge_overlay():
     assert not LiveBroker.has_pending_hedge(stub, market.condition_id)
 
 
+def test_ws_no_order_id_batch_take_fill_persists_real_batch_fact(tmp_path):
+    """删除待归因 take 上下文会使真实 FAK 成交无法推进其批次。"""
+    from pmbot.metrics import MetricsStore
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub.metrics = MetricsStore(str(tmp_path / "test.db"))
+    LiveBroker.restore_pending_batch_take(stub, {
+        "batch_id": "batch-take-1", "cid": market.condition_id,
+        "token_id": market.no_token,
+    })
+
+    LiveBroker.record_user_fill(
+        stub, market.no_token, "BUY", 0.728, 10.0, taker=True,
+        order_id=None, fill_id="exchange-take-fill-1", fee_usd=0.10,
+    )
+
+    assert stub.fills_log[-1]["intent"] == "batch_take"
+    assert stub.fills_log[-1]["batch_id"] == "batch-take-1"
+    assert stub.metrics.list_reward_exit_fills("batch-take-1", "batch_take") == [{
+        "fill_id": "exchange-take-fill-1", "batch_id": "batch-take-1",
+        "order_id": "", "intent": "batch_take", "cid": "cid1",
+        "token_id": market.no_token, "side": "NO", "price": 0.728,
+        "size": 10.0, "fee_usd": 0.10,
+        "ts": stub.metrics.list_reward_exit_fills("batch-take-1", "batch_take")[0]["ts"],
+    }]
+    stub.metrics.close()
+
+
+def test_reconcile_pending_batch_take_closes_only_exact_unfilled_order(tmp_path):
+    """精确订单查询确认 FAK 未成交后，才可解除持久化 take 锁。"""
+    from pmbot.metrics import MetricsStore
+
+    class _Client:
+        def get_order(self, order_id):
+            assert order_id == "exchange-take-1"
+            return {"status": "CANCELED", "size_matched": "0"}
+
+    stub = _live_fill_stub()
+    market = stub._markets["cid1"]
+    stub._client_lock = threading.RLock()
+    stub.client = _Client()
+    stub.metrics = MetricsStore(str(tmp_path / "test.db"))
+    stub.metrics.record_pending_batch_take(
+        batch_id="batch-take-1", cid=market.condition_id,
+        token_id=market.no_token, price=0.58, submitted_ts=10.0,
+    )
+    stub.metrics.set_pending_batch_take_exchange_order_id(
+        "batch-take-1", "exchange-take-1")
+    pending = stub.metrics.get_pending_batch_take("batch-take-1")
+    LiveBroker.restore_pending_batch_take(stub, pending)
+
+    assert LiveBroker.reconcile_pending_batch_take(stub, pending) is True
+    assert stub.metrics.get_pending_batch_take("batch-take-1") is None
+    assert not LiveBroker.has_pending_batch_take(stub, market.condition_id, "batch-take-1")
+    stub.metrics.close()
+
+
 def test_live_batch_exit_fill_keeps_batch_identity_and_persists_fact():
     """A user-feed SELL receipt must update only its own batch's audit trail."""
     from pmbot.brokers import RestingOrder

@@ -148,6 +148,258 @@ def test_take_submission_uses_remaining_size_and_batch_audit_context(tmp_path):
     asyncio.run(scenario())
 
 
+def test_take_cost_guard_blocks_expensive_complement_and_keeps_batch_open(tmp_path):
+    """删除 take 成本门控会在 0.86 ask 时再次提交确定性亏损的买单。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = []
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            self.calls.append((market, token_id, size, max_price, audit_context))
+            return 0.0
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        bot.cfg["risk"]["reward_exit_max_pair_loss_cents"] = 8.0
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.86", "size": "100"}])
+        broker = _TakeBroker()
+        bot.broker = broker
+
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 10.0)
+
+        assert broker.calls == []
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        assert batch["status"] == "TAKE_BLOCKED"
+        assert batch["manual_reason"] == "take_cost_guard"
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_take_cost_guard_retries_blocked_batch_after_ask_recovers(tmp_path):
+    """遗漏 TAKE_BLOCKED 调度会使价格恢复后的批次永久锁死。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = []
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            self.calls.append((market, token_id, size, max_price, audit_context))
+            return 0.0
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        bot.cfg["risk"]["reward_exit_max_pair_loss_cents"] = 8.0
+        _open_take_batch(bot, market)
+        bot.metrics.update_reward_exit_batch(
+            batch_id="batch-1", status="TAKE_BLOCKED", manual_reason="take_cost_guard")
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.50", "size": "100"}])
+        broker = _TakeBroker()
+        bot.broker = broker
+
+        await bot._advance_reward_exit_batches(10.0)
+
+        assert len(broker.calls) == 1
+        assert bot.metrics.get_reward_exit_batch("batch-1")["status"] == "TAKE_PENDING"
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_take_submission_does_not_persist_estimated_price_as_a_fill(tmp_path):
+    """将限价或盘口价伪造为成交事实会低估 live batch 的实际成本。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            return 6.0
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.51", "size": "100"}])
+        bot.broker = _TakeBroker()
+
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 10.0)
+
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        assert batch["take_filled_size"] == 0.0
+        assert batch["take_notional_usd"] == 0.0
+        assert bot.metrics.list_reward_exit_fills("batch-1", "batch_take") == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_take_waits_for_real_fill_before_retrying_after_timeout(tmp_path):
+    """删除 broker 的待归因检查会在真实成交流到达前重复提交 FAK。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = []
+            self.pending = False
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            self.calls.append((market, token_id, size, max_price, audit_context))
+            self.pending = True
+            return 10.0
+
+        def has_pending_batch_take(self, cid, batch_id):
+            return self.pending
+
+        def clear_pending_batch_take(self, cid, batch_id):
+            self.pending = False
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.51", "size": "100"}])
+        broker = _TakeBroker()
+        bot.broker = broker
+
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 10.0)
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 100.0)
+
+        assert len(broker.calls) == 1
+
+        bot.metrics.record_reward_exit_fill(
+            fill_id="actual-take-1", batch_id="batch-1", order_id="take-1",
+            intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+            side="NO", price=0.51, size=10.0, fee_usd=0.0, ts=101.0,
+        )
+        await bot._credit_take_fills(101.0)
+
+        assert bot.metrics.get_reward_exit_batch("batch-1")["take_filled_size"] == 10.0
+        assert not broker.pending
+
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 102.0)
+        assert len(broker.calls) == 2
+        assert broker.calls[-1][2] == 10.0
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_durable_pending_take_blocks_retry_after_bot_restart(tmp_path):
+    """删除持久化提交检查会让重启后的批次再次提交同一笔 take。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = []
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            self.calls.append((market, token_id, size, max_price, audit_context))
+            return 0.0
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.51", "size": "100"}])
+        bot.metrics.record_pending_batch_take(
+            batch_id="batch-1", cid=market.condition_id,
+            token_id=market.no_token, price=0.58, submitted_ts=99.0,
+        )
+        broker = _TakeBroker()
+        bot.broker = broker
+
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 100.0)
+
+        assert broker.calls == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_fragmented_take_fill_keeps_submission_locked_until_reported_size(tmp_path):
+    """若首段成交就解锁，余下同一 FAK 成交会与补单叠加而超买。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = []
+
+        def taker_buy(self, market, token_id, size, max_price, audit_context=None):
+            self.calls.append((market, token_id, size, max_price, audit_context))
+            return 0.0
+
+        def clear_pending_batch_take(self, cid, batch_id):
+            raise AssertionError("partial fill must not release pending take")
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot([], [{"price": "0.51", "size": "100"}])
+        pending_id = bot.metrics.record_pending_batch_take(
+            batch_id="batch-1", cid=market.condition_id,
+            token_id=market.no_token, price=0.58, submitted_ts=99.0,
+        )
+        bot.metrics.update_reward_exit_order(pending_id, expiration=10.0)
+        bot.metrics.record_reward_exit_fill(
+            fill_id="take-part-1", batch_id="batch-1", order_id="take-1",
+            intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+            side="NO", price=0.51, size=5.0, fee_usd=0.0, ts=100.0,
+        )
+        bot.broker = _TakeBroker()
+
+        await bot._credit_take_fills(100.0)
+        await bot._advance_take_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 101.0)
+
+        assert bot.metrics.get_pending_batch_take("batch-1")["status"] == "PENDING"
+        assert bot.broker.calls == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_completed_durable_take_releases_rehydrated_context_without_new_fill(tmp_path):
+    """重启后汇总已更新时，不能因没有新增成交流而永久锁住 take。"""
+    class _TakeBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.cleared = []
+
+        def clear_pending_batch_take(self, cid, batch_id):
+            self.cleared.append((cid, batch_id))
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        pending_id = bot.metrics.record_pending_batch_take(
+            batch_id="batch-1", cid=market.condition_id,
+            token_id=market.no_token, price=0.58, submitted_ts=99.0,
+        )
+        bot.metrics.update_reward_exit_order(pending_id, expiration=5.0)
+        bot.metrics.record_reward_exit_fill(
+            fill_id="take-complete-before-restart", batch_id="batch-1", order_id="take-1",
+            intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+            side="NO", price=0.51, size=5.0, fee_usd=0.0, ts=100.0,
+        )
+        bot.metrics.update_reward_exit_batch(batch_id="batch-1", take_filled_size=5.0)
+        bot.broker = _TakeBroker()
+
+        await bot._credit_take_fills(101.0)
+
+        assert bot.metrics.get_pending_batch_take("batch-1") is None
+        assert bot.broker.cleared == [(market.condition_id, "batch-1")]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_normal_reward_fill_replays_from_metrics_after_broker_restart(tmp_path):
     """A restart must not lose a normal maker fill before its batch is opened."""
     async def scenario():

@@ -280,6 +280,11 @@ class MetricsStore:
             );
             CREATE INDEX IF NOT EXISTS idx_reward_exit_orders_batch
                 ON reward_exit_orders (batch_id);
+            CREATE TABLE IF NOT EXISTS reward_exit_take_submissions (
+                batch_id          TEXT NOT NULL PRIMARY KEY,
+                exchange_order_id TEXT NOT NULL DEFAULT '',
+                submitted_ts      REAL NOT NULL DEFAULT 0.0
+            );
             CREATE INDEX IF NOT EXISTS idx_quote_risk_decisions_ts
                 ON quote_risk_decisions (ts);
         """)
@@ -924,6 +929,62 @@ class MetricsStore:
             "order_id", "batch_id", "intent", "cid", "token_id", "side",
             "price", "size", "expiration", "status",
         )
+        return dict(zip(keys, row))
+
+    def record_pending_batch_take(
+            self, *, batch_id: str, cid: str, token_id: str,
+            price: float, submitted_ts: float,
+    ) -> str:
+        """Durably reserve a FAK take before it is sent to the exchange."""
+        order_id = f"take-pending:{batch_id}"
+        baseline = sum(float(fill["size"]) for fill in self.list_reward_exit_fills(
+            batch_id, intent="batch_take"))
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reward_exit_orders "
+                "(order_id,batch_id,intent,cid,token_id,side,price,size,expiration,status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(order_id) DO UPDATE SET "
+                "cid=excluded.cid,token_id=excluded.token_id,price=excluded.price,"
+                "size=excluded.size,expiration=excluded.expiration,status=excluded.status",
+                (order_id, batch_id, "batch_take", cid, token_id, "BUY", price,
+                 baseline, -1.0, "PENDING"),
+            )
+            self._conn.execute(
+                "INSERT INTO reward_exit_take_submissions "
+                "(batch_id,exchange_order_id,submitted_ts) VALUES (?,?,?) "
+                "ON CONFLICT(batch_id) DO UPDATE SET "
+                "exchange_order_id='',submitted_ts=excluded.submitted_ts",
+                (batch_id, "", submitted_ts),
+            )
+            self._conn.commit()
+        return order_id
+
+    def set_pending_batch_take_exchange_order_id(self, batch_id: str,
+                                                  exchange_order_id: str) -> None:
+        """Attach the exchange id returned for a durable take submission."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE reward_exit_take_submissions SET exchange_order_id=? "
+                "WHERE batch_id=?", (exchange_order_id, batch_id),
+            )
+            self._conn.commit()
+
+    def get_pending_batch_take(self, batch_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT o.order_id,o.batch_id,o.intent,o.cid,o.token_id,o.side,o.price,o.size,"
+            "o.expiration,o.status,COALESCE(s.exchange_order_id,''),"
+            "COALESCE(s.submitted_ts,0) FROM reward_exit_orders o "
+            "LEFT JOIN reward_exit_take_submissions s ON s.batch_id=o.batch_id "
+            "WHERE o.batch_id=? AND o.intent='batch_take' AND o.status='PENDING' "
+            "ORDER BY o.rowid DESC LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = ("order_id", "batch_id", "intent", "cid", "token_id", "side",
+                "price", "size", "expiration", "status", "exchange_order_id",
+                "submitted_ts")
         return dict(zip(keys, row))
 
     def update_reward_exit_order(self, order_id: str, **fields) -> None:

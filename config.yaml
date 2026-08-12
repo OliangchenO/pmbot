@@ -343,6 +343,9 @@ guards:
   quote_risk_resume_score: 0.45
 
 risk:
+  # Each ordinary reward fill may take its complement only while the original
+  # fill, complement ask, and estimated taker fee stay within this loss cap.
+  reward_exit_max_pair_loss_cents: 8.0
   # ── P1 recovery episode (new controller) ──
   # Shadow = record decisions without executing broker calls.
   # Active = execute broker calls.  Must be explicitly authorized.
@@ -367,6 +370,7 @@ risk:
   manual_hold_cids:
     - "0xa1a4a8b493cd978b359c3deab56955d80a4b0b14c806beea6bd37b4b3a3e4415"
     - "0xb9846df61a1c23ddf4c30afcced568a96a88229adcf04ee005e05e1d22c6da0b"
+    - "0xd36add56915cf355310be65d77daef7d3bb71719957d670011d634cc0a6dce35"
   # Equity-proportional sizing: quote sizes, inventory caps, and the forced-
   # hedge threshold all scale by (current equity / capital_usd). Deposit more
   # and the bot sizes up automatically; draw down and it sizes down. Clamped

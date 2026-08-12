@@ -8,18 +8,22 @@ Design doc: 2026-08-10-reward-fill-double-take-exit-design.md
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from .gamma import Market
 
 # ── Status per design doc §4.1 ──
-BatchStatus = Literal["TAKE_PENDING", "SELL_PENDING", "CLOSED", "MANUAL_HOLD"]
+BatchStatus = Literal[
+    "TAKE_PENDING", "TAKE_BLOCKED", "SELL_PENDING", "CLOSED", "MANUAL_HOLD",
+]
 
 # ── Valid transitions ──
 _VALID_TRANSITIONS: dict[str, frozenset[str]] = {
-    "TAKE_PENDING": frozenset({"SELL_PENDING", "MANUAL_HOLD"}),
+    "TAKE_PENDING": frozenset({"TAKE_BLOCKED", "SELL_PENDING", "MANUAL_HOLD"}),
+    "TAKE_BLOCKED": frozenset({"TAKE_PENDING", "MANUAL_HOLD"}),
     "SELL_PENDING": frozenset({"CLOSED", "MANUAL_HOLD"}),
     "CLOSED": frozenset(),
     "MANUAL_HOLD": frozenset(),
@@ -237,6 +241,20 @@ def _sell_fee_per_share(market: "Market", price: float) -> float:
         return 0.0
     rate = market.fee_bps / 10_000.0
     return rate * (price * (1.0 - price)) ** market.fee_exponent
+
+
+def max_take_price_for_pair(
+    origin_price: float,
+    market: "Market",
+    max_pair_loss_cents: float,
+) -> float:
+    """Return the highest complementary BUY price within the per-pair loss cap."""
+    ceiling = 1.0 + max(0.0, max_pair_loss_cents) / 100.0
+    tick = float(getattr(market, "tick", 0.01))
+    price = math.floor(min(1.0 - tick, ceiling - origin_price) / tick + 1e-9) * tick
+    while price > 0 and origin_price + price + _sell_fee_per_share(market, price) > ceiling + 1e-12:
+        price = math.floor((price - tick) / tick + 1e-9) * tick
+    return max(0.0, price)
 
 
 def ceil_to_tick(price: float, tick: float) -> float:
@@ -458,6 +476,21 @@ def transition_to_manual_hold(
         status="MANUAL_HOLD",
         manual_reason=reason,
         created_ts=batch.created_ts,
+        updated_ts=updated_ts,
+    )
+
+
+def transition_to_take_blocked(
+    batch: RewardExitBatch,
+    *,
+    reason: str,
+    updated_ts: float = 0.0,
+) -> RewardExitBatch:
+    """Keep an incomplete take batch locked until its cost becomes acceptable."""
+    return replace(
+        batch,
+        status="TAKE_BLOCKED",
+        manual_reason=reason,
         updated_ts=updated_ts,
     )
 

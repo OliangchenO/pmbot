@@ -886,6 +886,7 @@ class Bot:
         self._batch_task_tracker: dict[str, asyncio.Task] = {}  # batch_id → async task
         self._batch_last_take_attempt: dict[str, float] = {}  # batch_id → last attempt ts
         self._batch_take_errors: dict[str, tuple[str, int]] = {}  # batch_id → (last_error, count)
+        self._batch_pending_take_until: dict[str, float] = {}
         self._batch_exit_orders: dict[str, object] = {}  # batch_id → RestingOrder
         self._batch_exit_cancel_pending: dict[str, str] = {}  # batch_id → cancelled order_id
         self._batch_sell_failures: dict[str, tuple[float, int]] = {}  # batch_id → (last failure ts, count)
@@ -1145,8 +1146,14 @@ class Bot:
         self.risk = RiskManager(self.cfg, self.broker.equity())
         from .userfeed import UserFeed
         self.userfeed = UserFeed(self.broker)
-        self.userfeed.start()
         self.broker.metrics = self.metrics
+        restore_pending = getattr(self.broker, "restore_pending_batch_take", None)
+        if callable(restore_pending) and self.metrics is not None:
+            for batch in self.metrics.get_open_reward_exit_batches():
+                pending = self.metrics.get_pending_batch_take(batch["batch_id"])
+                if pending is not None:
+                    restore_pending(pending)
+        self.userfeed.start()
         self.tracker.on_trade(self._on_market_trade)
         await self.tracker.start()
         await self._ensure_held_market_books()
@@ -2084,7 +2091,9 @@ class Bot:
             return
 
         open_batches = self.metrics.get_open_reward_exit_batches()
-        take_batches = [b for b in open_batches if b["status"] == "TAKE_PENDING"]
+        take_batches = [
+            b for b in open_batches if b["status"] in ("TAKE_PENDING", "TAKE_BLOCKED")
+        ]
         if not take_batches:
             return
 
@@ -2111,6 +2120,21 @@ class Bot:
                 take_notional_usd=total_notional,
                 take_fee_usd=total_fee,
             )
+            pending_take = self.metrics.get_pending_batch_take(bid)
+            clear_pending = getattr(self.broker, "clear_pending_batch_take", None)
+            reported = float(pending_take["expiration"]) if pending_take is not None else -1.0
+            complete_submission = (pending_take is not None and reported >= 0
+                                   and total_filled >= float(pending_take["size"]) + reported - 1e-9)
+            if complete_submission:
+                self.metrics.update_reward_exit_order(
+                    pending_take["order_id"], status="CLOSED")
+            # A restart can leave the batch aggregate already updated while the
+            # durable submission is still PENDING.  Release the in-memory
+            # attribution context whenever the durable record is resolved;
+            # requiring a *new* fill here would otherwise permanently block it.
+            if callable(clear_pending) and (complete_submission or pending_take is None):
+                clear_pending(b["cid"], bid)
+                self._batch_pending_take_until.pop(bid, None)
 
             log.warning(
                 "BATCH_TAKE_CREDITED batch_id=%s cid=%s "
@@ -2483,8 +2507,10 @@ class Bot:
             # and permanently banned CIDs (markout/recovery-loss ban).
             if cid in manual_hold:
                 continue
-            # Find the oldest TAKE_PENDING batch — only one take at a time
-            take_batches = [b for b in batches if b["status"] == "TAKE_PENDING"]
+            # Find the oldest pending or cost-blocked take — only one take at a time.
+            take_batches = [
+                b for b in batches if b["status"] in ("TAKE_PENDING", "TAKE_BLOCKED")
+            ]
             if take_batches:
                 take_batches.sort(key=lambda b: b["created_ts"])
                 spent = await self._advance_take_pending(
@@ -2538,6 +2564,57 @@ class Bot:
             return 0.0
 
         batch_id = batch["batch_id"]
+        has_durable_pending = getattr(self.metrics, "get_pending_batch_take", None)
+        pending_take = has_durable_pending(batch_id) if callable(has_durable_pending) else None
+        if pending_take:
+            reconcile_take = getattr(self.broker, "reconcile_pending_batch_take", None)
+            if callable(reconcile_take):
+                reconcile_take(pending_take)
+            return 0.0
+        has_pending = getattr(self.broker, "has_pending_batch_take", None)
+        if callable(has_pending) and has_pending(cid, batch_id):
+            return 0.0
+        if now < self._batch_pending_take_until.get(batch_id, 0.0):
+            return 0.0
+
+        # Determine market before computing the cost cap.
+        m = next((mm for mm in self.markets if mm.condition_id == cid), None)
+        if m is None:
+            m = self._token_market.get(complement_token)
+        if m is None:
+            return 0.0
+
+        risk_cfg = self.cfg.get("risk") or {}
+        max_pair_loss_cents = float(risk_cfg.get("reward_exit_max_pair_loss_cents", 8.0))
+        origin_notional = float(batch.get("origin_notional_usd") or 0.0)
+        origin_fee = float(batch.get("origin_fee_usd") or 0.0)
+        origin_price = (origin_notional + origin_fee) / orig_size if orig_size > 0 else 0.0
+        max_buy_price = reward_exit.max_take_price_for_pair(
+            origin_price, m, max_pair_loss_cents)
+        if best_ask > max_buy_price + 1e-9:
+            if self.metrics is not None:
+                self.metrics.update_reward_exit_batch(
+                    batch_id=batch_id,
+                    status="TAKE_BLOCKED",
+                    manual_reason="take_cost_guard",
+                    updated_ts=now,
+                )
+            log.warning(
+                "BATCH_TAKE_BLOCKED batch_id=%s cid=%s origin_price=%.4f "
+                "best_ask=%.4f max_ask=%.4f max_pair_loss_cents=%.2f "
+                "说明=互补买入将超过每对成本上限，保持批次锁定等待盘口恢复",
+                batch_id, cid, origin_price, best_ask, max_buy_price,
+                max_pair_loss_cents,
+            )
+            return 0.0
+
+        if batch.get("status") == "TAKE_BLOCKED" and self.metrics is not None:
+            self.metrics.update_reward_exit_batch(
+                batch_id=batch_id,
+                status="TAKE_PENDING",
+                manual_reason="",
+                updated_ts=now,
+            )
 
         if self._reward_exit_mode == "shadow":
             log.warning(
@@ -2567,11 +2644,8 @@ class Bot:
         self._batch_last_take_attempt[batch_id] = now
 
         # Determine tick for max legal price
-        m = next((mm for mm in self.markets if mm.condition_id == cid), None)
-        if m is None:
-            m = self._token_market.get(complement_token)
         tick = getattr(m, 'tick', 0.01) if m else 0.01
-        max_buy_price = 1.0 - tick
+        max_buy_price = min(max_buy_price, 1.0 - tick)
 
         log.warning(
             "BATCH_TAKE_SUBMITTED batch_id=%s cid=%s complement=%s "
@@ -2626,51 +2700,16 @@ class Bot:
                      "batch_id": batch_id, "best_ask": best_ask},
                 )
 
-        # ── Direct credit: update batch take_filled immediately ──
-        # Do not wait for _credit_take_fills to find the fill in
-        # fills_log — the WebSocket fill may not carry the correct
-        # batch_id/orient_id, causing the batch to never advance.
-        remaining_before = remaining
-        new_total: float = filled  # init before conditional — used in log & seal below
-        remaining_after: float = remaining
         if filled_now > 0 and self.metrics is not None:
-            # Persist the fill fact for idempotent replay
-            fill_proof = {
-                "fill_id": f"take-{batch_id}-{time.time():.3f}",
-                "cid": cid, "batch_id": batch_id,
-                "token_id": complement_token, "side": "BUY",
-                "price": safe_price, "size": filled_now,
-                "fee_usd": 0.0, "ts": now,
-                "intent": "batch_take",
-                "order_id": "",
-            }
-            self.metrics.record_reward_exit_fill(**fill_proof)
-            new_total = filled + filled_now
-            # ── Record first take execution timestamp for timing stats ──
-            first_exec = batch.get("first_take_executed_ts")
-            self.metrics.update_reward_exit_batch(
-                batch_id=batch_id,
-                take_filled_size=new_total,
-                take_notional_usd=float(batch.get("take_notional_usd") or 0)
-                                   + safe_price * filled_now,
-                **({"first_take_executed_ts": now} if first_exec is None else {}),
-            )
-            # Re-read remaining after credit for the EXECUTED log line
-            remaining_after = reward_exit.remaining_take(target, new_total)
-
-        if filled_now > 0:
+            # The order response confirms quantity but not the exchange fill
+            # price or fee.  Wait for the durable user-feed fact before
+            # advancing accounting or sealing the batch.
+            self._batch_pending_take_until[batch_id] = now + 30.0
             log.warning(
-                "BATCH_TAKE_EXECUTED batch_id=%s cid=%s "
-                "filled=%.2f remaining_before=%.0f remaining_after=%.0f "
-                "说明=FAK买入了互补token",
-                batch_id, cid, filled_now, remaining_before, remaining_after,
+                "BATCH_TAKE_AWAITING_FILL batch_id=%s cid=%s reported_size=%.2f "
+                "说明=FAK回执仅确认数量，等待成交流写入真实价格和手续费",
+                batch_id, cid, filled_now,
             )
-
-            # ── Transition: if take target is fully filled, seal and set SELL ──
-            if new_total >= target - 1e-9 and self.metrics is not None:
-                persisted = self.metrics.list_reward_exit_fills(
-                    batch_id, intent="batch_take")
-                await self._seal_and_set_sell_target(batch, persisted, now)
         else:
             # ── FAK returned 0: classify the error for adaptive backoff ──
             # Permanent errors (balance, invalid args) get longer cooldown

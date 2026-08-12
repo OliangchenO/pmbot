@@ -85,6 +85,23 @@ def test_reward_exit_order_is_unique_and_update_persists_selected_fields(tmp_pat
     assert updated == {**original, "status": "FILLED", "expiration": 1_700_001_000.0}
 
 
+def test_pending_batch_take_persists_exchange_order_id_for_reconciliation(tmp_path):
+    """FAK 回执的订单号必须跨重启保留，才能精确查询其终态。"""
+    store = MetricsStore(str(tmp_path / "test.db"))
+    store.record_pending_batch_take(
+        batch_id="batch-1", cid="cid-1", token_id="token-1",
+        price=0.58, submitted_ts=1_700_000_000.0,
+    )
+    store.set_pending_batch_take_exchange_order_id("batch-1", "exchange-order-1")
+    store.close()
+
+    reopened = MetricsStore(str(tmp_path / "test.db"))
+    pending = reopened.get_pending_batch_take("batch-1")
+    reopened.close()
+    assert pending["exchange_order_id"] == "exchange-order-1"
+    assert pending["submitted_ts"] == 1_700_000_000.0
+
+
 def test_report_totals_use_the_requested_utc_day(tmp_path):
     store = MetricsStore(str(tmp_path / "metrics.db"))
     old = datetime(2026, 7, 30, tzinfo=timezone.utc)

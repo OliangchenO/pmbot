@@ -1420,6 +1420,32 @@ class LiveBroker:
             self._positions = positions
             self._token_shares = dict(token_shares)
 
+    def has_pending_batch_take(self, cid: str, batch_id: str) -> bool:
+        """Whether a submitted batch take is still waiting for its user-feed fill."""
+        pending = getattr(self, "_pending_batch_take_contexts", {}).get(cid)
+        return bool(pending and pending.get("batch_id") == batch_id)
+
+    def clear_pending_batch_take(self, cid: str, batch_id: str) -> None:
+        """Release a take context only after a real batch fill is persisted."""
+        contexts = getattr(self, "_pending_batch_take_contexts", {})
+        pending = contexts.get(cid)
+        if pending and pending.get("batch_id") == batch_id:
+            contexts.pop(cid, None)
+
+    def restore_pending_batch_take(self, pending: dict) -> None:
+        """Rehydrate a durable take submission before user-feed processing starts."""
+        contexts = getattr(self, "_pending_batch_take_contexts", None)
+        if contexts is None:
+            contexts = self._pending_batch_take_contexts = {}
+        contexts[str(pending["cid"])] = {
+            "batch_id": str(pending["batch_id"]),
+            "cid": str(pending["cid"]),
+            "token_id": str(pending["token_id"]),
+            "side": "BUY",
+            "path": "reward_exit_take",
+            "intent": "batch_take",
+        }
+
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float,
                   audit_context: dict | None = None) -> float:
         from py_clob_client_v2 import (
@@ -1436,7 +1462,24 @@ class LiveBroker:
         # (e.g. price=0.99, size=88 → amount=$87.12, but fills at
         # ask=0.51 → 170+ shares instead of 88).  Cap the spend budget
         # at best_ask × remaining so we never buy more than requested.
-        context = audit_context or {}
+        context = {"path": "forced_hedge", **(audit_context or {})}
+        pending_batch_take = None
+        if context.get("intent") == "batch_take":
+            pending_batch_take = {
+                **context,
+                "cid": market.condition_id,
+                "token_id": token_id,
+                "side": "BUY",
+            }
+            contexts = getattr(self, "_pending_batch_take_contexts", None)
+            if contexts is None:
+                contexts = self._pending_batch_take_contexts = {}
+            contexts[market.condition_id] = pending_batch_take
+            if self.metrics:
+                self.metrics.record_pending_batch_take(
+                    batch_id=str(context["batch_id"]), cid=market.condition_id,
+                    token_id=token_id, price=max_price, submitted_ts=time.time(),
+                )
         best_ask = context.get("best_ask")
         effective_price = (best_ask if best_ask is not None and 0 < best_ask <= max_price
                            else max_price)
@@ -1456,12 +1499,14 @@ class LiveBroker:
                 filled = min(_parse_fill_amount(resp, size), size)
                 order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")
                             or "") if isinstance(resp, dict) else ""
-                context = {"path": "forced_hedge", **(audit_context or {})}
                 if order_id:
                     contexts = getattr(self, "_taker_order_contexts", None)
                     if contexts is None:
                         contexts = self._taker_order_contexts = {}
                     contexts[order_id] = context
+                    if pending_batch_take is not None and self.metrics:
+                        self.metrics.set_pending_batch_take_exchange_order_id(
+                            str(context["batch_id"]), order_id)
                 getattr(self, "audit", AuditLogger(None)).record({
                     "event": "order_placed", "cid": market.condition_id,
                     "market": market.question, "order_id": order_id or None,
@@ -1493,9 +1538,48 @@ class LiveBroker:
         except Exception as e:  # noqa: BLE001
             log.error("吃单订单失败（%s @ %.3f）：%s", token_id[:12], max_price, e)
             return 0.0
+        if filled <= 0 and pending_batch_take is not None:
+            contexts = getattr(self, "_pending_batch_take_contexts", {})
+            if contexts.get(market.condition_id) is pending_batch_take:
+                contexts.pop(market.condition_id, None)
+            if self.metrics:
+                self.metrics.update_reward_exit_order(
+                    f"take-pending:{context['batch_id']}", status="CLOSED")
+        elif pending_batch_take is not None and self.metrics:
+            self.metrics.update_reward_exit_order(
+                f"take-pending:{context['batch_id']}", expiration=filled)
         if filled > 0 and self.metrics:
             self.metrics.record_hedge(market.condition_id, max_price, filled)
         return filled
+
+    def reconcile_pending_batch_take(self, pending: dict) -> bool:
+        """Close a known-unfilled FAK only after an exact exchange lookup."""
+        order_id = str(pending.get("exchange_order_id") or "")
+        if not order_id:
+            return False
+        try:
+            with self._client_lock:
+                remote = self.client.get_order(order_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("BATCH_TAKE_RECONCILE_FAILED batch_id=%s order_id=%s: %s",
+                        pending.get("batch_id"), order_id, e)
+            return False
+        if not isinstance(remote, dict):
+            return False
+        try:
+            matched = float(remote.get("size_matched") or remote.get("sizeMatched") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        status = str(remote.get("status") or "").upper()
+        if matched > 1e-9 or status not in {"CANCELED", "CANCELLED", "EXPIRED", "FAILED"}:
+            return False
+        if self.metrics:
+            self.metrics.update_reward_exit_order(pending["order_id"], status="CLOSED")
+        LiveBroker.clear_pending_batch_take(
+            self, str(pending["cid"]), str(pending["batch_id"]))
+        log.warning("BATCH_TAKE_RECONCILED_UNFILLED batch_id=%s order_id=%s",
+                    pending["batch_id"], order_id)
+        return True
 
     def _apply_fill_to_orders(self, token_id: str, size: float, side: str,
                               order_id: str | None = None) -> None:
@@ -1564,6 +1648,14 @@ class LiveBroker:
                         break
                 if context:
                     break
+        if taker and not context and not order_id:
+            pending_take = getattr(self, "_pending_batch_take_contexts", {}).get(
+                market.condition_id)
+            if (pending_take is not None
+                    and pending_take.get("token_id") == token_id
+                    and pending_take.get("side") == side
+                    and pending_take.get("intent") == "batch_take"):
+                context = dict(pending_take)
         if taker and not context:
             context = {"path": "forced_hedge"}
         if order_id and context:
@@ -1678,7 +1770,7 @@ class LiveBroker:
         self.fills_log = self.fills_log[-500:]
         if self.metrics:
             self.metrics.record_fill(entry)
-            if intent in {"normal_reward"} and \
+            if intent in {"normal_reward", "batch_take"} and \
                     hasattr(self.metrics, "record_reward_exit_fill"):
                 self.metrics.record_reward_exit_fill(
                     fill_id=str(entry.get("fill_id") or

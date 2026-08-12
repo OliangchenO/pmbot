@@ -15,10 +15,12 @@ from pmbot.reward_exit import (
     compute_paired_loss,
     compute_sell_target,
     create_batch,
+    max_take_price_for_pair,
     remaining_exit,
     remaining_take,
     split_take_fills_fifo,
     transition_to_closed,
+    transition_to_take_blocked,
     transition_to_manual_hold,
     transition_to_seal_pending,
     valid_transition,
@@ -357,6 +359,31 @@ def test_transition_to_manual_hold():
     held = transition_to_manual_hold(b, reason="above_max_price", updated_ts=150.0)
     assert held.status == "MANUAL_HOLD"
     assert held.manual_reason == "above_max_price"
+
+
+def test_take_cost_guard_blocks_and_preserves_batch_progress():
+    """删除成本门控或丢失阻塞 batch 进度时必须失败。"""
+    batch = create_batch(
+        batch_id="b1", cid="c1", origin_order_id="o1", origin_fill_id="f0",
+        origin_token_id="yes", complement_token_id="no",
+        origin_size=20, origin_price=0.59, created_ts=100.0,
+    )
+
+    blocked = transition_to_take_blocked(
+        batch, reason="take_cost_guard", updated_ts=101.0,
+    )
+
+    assert blocked.status == "TAKE_BLOCKED"
+    assert blocked.manual_reason == "take_cost_guard"
+    assert blocked.take_filled_size == 0.0
+    assert valid_transition("TAKE_BLOCKED", "TAKE_PENDING")
+
+
+def test_take_cost_guard_caps_complement_price_at_eight_cents_per_pair():
+    """将 8¢ 配对损失上限放宽或忽略 taker 费时必须失败。"""
+    market = _dummy_market()
+
+    assert max_take_price_for_pair(0.59, market, 8.0) == pytest.approx(0.48)
 
 
 # ── 11.2: valid transitions ──
