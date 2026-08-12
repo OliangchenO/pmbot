@@ -887,6 +887,8 @@ class Bot:
         self._batch_last_take_attempt: dict[str, float] = {}  # batch_id → last attempt ts
         self._batch_take_errors: dict[str, tuple[str, int]] = {}  # batch_id → (last_error, count)
         self._batch_exit_orders: dict[str, object] = {}  # batch_id → RestingOrder
+        self._batch_exit_cancel_pending: dict[str, str] = {}  # batch_id → cancelled order_id
+        self._batch_sell_failures: dict[str, tuple[float, int]] = {}  # batch_id → (last failure ts, count)
         self._reward_exit_cancel_retries: dict[str, tuple[gamma.Market, float, int]] = {}
         self._recovery_skip_logged_at: dict[str, float] = {}
         self._recovery_phase_logged: dict[str, str] = {}
@@ -993,7 +995,9 @@ class Bot:
                 await asyncio.to_thread(self.broker.refresh_state)
                 self._last_pos_refresh = time.time()
                 await self._ensure_held_market_books()
-            await self._manage_inventory(time.time())
+            now = time.time()
+            await self._run_reward_exit_batch_tick(now)
+            await self._manage_inventory(now)
             log.warning("扫描器未找到符合条件的市场，%.0f 秒后重试"
                         "（可适当放宽配置筛选条件）",
                         SCAN_RETRY_SECONDS)
@@ -1359,12 +1363,20 @@ class Bot:
         self._rotate_pending = False
         if rotate:
             self._last_rotate = time.time()
-        exclude = set() if initial else self._rotatable_tripped_cids()
-        exclude |= exclude_cids or set()
+        guard_tripped_cids = set() if initial else self._rotatable_tripped_cids()
+        explicit_exclude_cids = exclude_cids or set()
+        reward_exit_cids: set[str] = set()
+        if self.metrics is not None:
+            # Reward-exit locks are rebuilt from durable batches after a restart.
+            # Include them before the initial scan so a pending exit cannot retake
+            # a normal reward-quote slot during that startup window.
+            reward_exit_cids = {
+                str(batch["cid"])
+                for batch in self.metrics.get_open_reward_exit_batches()
+            }
         # Manual-hold markets are excluded from selection; their inventory and
         # orders remain untouched by the bot.
         manual_hold = self._manual_hold_cids()
-        exclude |= manual_hold
         recovery_cids: set[str] = set()
         if self.broker is not None:
             recovery_cids = {
@@ -1373,9 +1385,24 @@ class Bot:
             }
             # Inventory remains managed through held_markets() in _quote_all(),
             # but an unpaired market must release its normal reward quote slot.
-            exclude |= recovery_cids
-        log.info("正在扫描奖励市场…%s",
-                 f" (rotating out {len(exclude)} tripped)" if exclude else "")
+        exclude = (
+            guard_tripped_cids
+            | explicit_exclude_cids
+            | reward_exit_cids
+            | manual_hold
+            | recovery_cids
+        )
+        log.info(
+            "正在扫描奖励市场… (exclude: unique=%d guard_tripped=%d "
+            "reward_exit_locked=%d inventory_recovery=%d manual_hold=%d "
+            "explicit_exclude=%d)",
+            len(exclude),
+            len(guard_tripped_cids),
+            len(reward_exit_cids),
+            len(recovery_cids),
+            len(manual_hold),
+            len(explicit_exclude_cids),
+        )
         # P2.2: read the most recent cached outcome snapshot (refreshed in
         # background AFTER the previous _rescan finished).  When the metrics db
         # is new or the cache is stale, scan() falls back to legacy silently.
@@ -1388,7 +1415,7 @@ class Bot:
         if recovery_cids:
             ranked = [market for market in ranked
                       if market.condition_id not in recovery_cids]
-        if not ranked:
+        if not ranked and not exclude_cids:
             if not initial:
                 log.warning("重新扫描未找到市场，保留当前市场集合")
             self._last_scan = time.time()
@@ -1520,12 +1547,19 @@ class Bot:
                         and old_m.condition_id not in manual_hold
                         and old_m.condition_id not in recovery_cids):
                     async with self._market_lock(old_m.condition_id):
-                        if hasattr(self.broker, "cancel_quotes_for_market"):
-                            await self._broker_call(
-                                self.broker.cancel_quotes_for_market, old_m)
-                        else:
-                            await self._broker_call(
-                                self.broker.set_quotes, old_m, [])
+                        try:
+                            if hasattr(self.broker, "cancel_quotes_for_market"):
+                                await self._broker_call(
+                                    self.broker.cancel_quotes_for_market, old_m)
+                            else:
+                                await self._broker_call(
+                                    self.broker.set_quotes, old_m, [])
+                        except Exception as exc:  # noqa: BLE001 - a failed cancel must not block rotation
+                            log.warning(
+                                "MARKET_SWITCH_CANCEL_QUOTES_FAILED cid=%s market='%s': %s; "
+                                "继续切换市场",
+                                old_m.condition_id, old_m.question[:50], exc,
+                            )
 
         token_ids = list(new_tokens)
         if self.tracker:
@@ -2300,7 +2334,8 @@ class Bot:
             # double-selling into the same market during the exit.
             # We cancel before the DB write so a crash during write won't
             # leave stale quotes on Polymarket.
-            if cid not in self._reward_exit_locked:
+            rotate_market = cid not in self._reward_exit_locked
+            if rotate_market:
                 self._reward_exit_locked.add(cid)
                 log.warning(
                     "MARKET_REWARD_EXIT_LOCKED cid=%s market='%s' "
@@ -2323,6 +2358,7 @@ class Bot:
             # Persist the batch
             self.metrics.open_reward_exit_batch(
                 batch_id=batch_id, cid=cid,
+                market_name=m.question,
                 origin_order_id=order_id, origin_fill_id=fill_id,
                 origin_token_id=token, complement_token_id=complement,
                 origin_size=size,
@@ -2343,6 +2379,8 @@ class Bot:
                 "YES" if complement == m.yes_token else "NO",
                 2.0 * size,
             )
+            if rotate_market:
+                await self._rescan(rotate=True, exclude_cids={cid})
             known_fill_ids.add(fill_id)
 
     def _schedule_reward_exit_cancel_retry(
@@ -2743,6 +2781,8 @@ class Bot:
             )
             self._batch_last_take_attempt.pop(batch_id, None)
             self._batch_exit_orders.pop(batch_id, None)
+            self._batch_exit_cancel_pending.pop(batch_id, None)
+            self._batch_sell_failures.pop(batch_id, None)
             return
 
         if target_price <= 0:
@@ -2778,6 +2818,8 @@ class Bot:
             )
             self._batch_last_take_attempt.pop(batch_id, None)
             self._batch_exit_orders.pop(batch_id, None)
+            self._batch_exit_cancel_pending.pop(batch_id, None)
+            self._batch_sell_failures.pop(batch_id, None)
             return
 
         best_bid = book.best_bid
@@ -2797,6 +2839,40 @@ class Bot:
 
         # Rehydrate order identity from the broker/exchange view before
         # creating anything.  A restart must not duplicate an existing GTD.
+        pending_cancel_id = self._batch_exit_cancel_pending.get(batch_id)
+        if pending_cancel_id:
+            if not hasattr(self.broker, "reconcile_orders"):
+                return
+            reconciled = await self._broker_call(self.broker.reconcile_orders)
+            if not reconciled:
+                log.warning(
+                    "BATCH_SELL_CANCEL_PENDING batch_id=%s order_id=%s "
+                    "说明=旧卖单撤销后对账失败，暂不重挂",
+                    batch_id, pending_cancel_id,
+                )
+                return
+            active_ids = {
+                ro.order_id
+                for orders in getattr(self.broker, "_open_orders", {}).values()
+                for ro in orders
+            }
+            active_ids.update(
+                ro.order_id for ro in getattr(self.broker, "_exit_orders", {}).values())
+            active_ids.update(
+                ro.order_id
+                for ro in getattr(self.broker, "_reward_exit_orders", {}).values())
+            if pending_cancel_id in active_ids:
+                log.warning(
+                    "BATCH_SELL_CANCEL_PENDING batch_id=%s order_id=%s "
+                    "说明=旧卖单仍在交易所活动订单中，暂不重挂",
+                    batch_id, pending_cancel_id,
+                )
+                return
+            self._batch_exit_cancel_pending.pop(batch_id, None)
+            if self.metrics:
+                self.metrics.update_reward_exit_order(
+                    pending_cancel_id, status="CANCELLED")
+
         cur = self._batch_exit_orders.get(batch_id)
         if cur is None:
             cur = getattr(self.broker, "_reward_exit_orders", {}).get(batch_id)
@@ -2814,18 +2890,39 @@ class Bot:
                             cur = order
                             break
                 if cur is None:
-                    # No exchange truth means we cannot safely repost.  Keep
-                    # the market locked until a subsequent reconciliation
-                    # makes the order visible.
+                    # Reconcile before deciding whether the persisted OPEN
+                    # order is still protecting these shares.  A successful
+                    # reconcile that still cannot find it is authoritative:
+                    # mark the old identity terminal and recreate the exit.
+                    reconciled = False
                     if hasattr(self.broker, "reconcile_orders"):
                         with contextlib.suppress(Exception):
-                            await self._broker_call(self.broker.reconcile_orders)
-                    log.warning(
-                        "BATCH_SELL_REHYDRATE_PENDING batch_id=%s order_id=%s "
-                        "说明=持久化卖单未在当前订单视图出现，暂不重复挂单",
-                        batch_id, order_id,
-                    )
-                    return
+                            reconciled = bool(await self._broker_call(
+                                self.broker.reconcile_orders))
+                    if not reconciled:
+                        log.warning(
+                            "BATCH_SELL_REHYDRATE_PENDING batch_id=%s order_id=%s "
+                            "说明=持久化卖单未在当前订单视图出现且对账未确认，暂不重复挂单",
+                            batch_id, order_id,
+                        )
+                        return
+                    for order in getattr(self.broker, "_reward_exit_orders", {}).values():
+                        if getattr(order, "order_id", "") == order_id:
+                            cur = order
+                            break
+                    if cur is None:
+                        for order in getattr(self.broker, "_exit_orders", {}).values():
+                            if getattr(order, "order_id", "") == order_id:
+                                cur = order
+                                break
+                    if cur is None:
+                        self.metrics.update_reward_exit_order(
+                            order_id, status="CANCELLED")
+                        log.warning(
+                            "BATCH_SELL_REHYDRATE_STALE batch_id=%s order_id=%s "
+                            "说明=对账确认持久化卖单已不在交易所，标记失效并恢复退出挂单",
+                            batch_id, order_id,
+                        )
 
         from .brokers import RestingOrder
         GTD_REFRESH_MARGIN_SECS = 30.0  # same as broker's constant
@@ -2849,6 +2946,19 @@ class Bot:
             )
             return
 
+        failure = self._batch_sell_failures.get(batch_id)
+        if failure is not None:
+            last_failure, failures = failure
+            delay = min(2.0 ** failures, 30.0)
+            if now - last_failure < delay:
+                log.warning(
+                    "BATCH_SELL_RETRY_BACKOFF batch_id=%s cid=%s "
+                    "failures=%d retry_in=%.1fs "
+                    "说明=上次退出卖单失败，退避后再尝试",
+                    batch_id, cid, failures, delay - (now - last_failure),
+                )
+                return
+
         # Cancel previous per-batch exit order if any
         if cur is not None:
             order_id = str(getattr(cur, "order_id", ""))
@@ -2867,9 +2977,8 @@ class Bot:
                     batch_id, order_id,
                 )
                 return
-            if self.metrics:
-                self.metrics.update_reward_exit_order(
-                    order_id, status="CANCELLED")
+            self._batch_exit_cancel_pending[batch_id] = order_id
+            return
 
         # Place new GTD SELL via the broker's batch-specific API.
         sell_quote = strategy.Quote(complement_token, target_price, rem)
@@ -2890,6 +2999,7 @@ class Bot:
 
         if placed:
             self._batch_exit_orders[batch_id] = placed
+            self._batch_sell_failures.pop(batch_id, None)
             if self.metrics:
                 self.metrics.record_reward_exit_order(
                     order_id=placed.order_id, batch_id=batch_id,
@@ -2906,6 +3016,11 @@ class Bot:
                 batch_id, cid, rem, target_price, placed.order_id,
             )
         else:
+            _, failures = self._batch_sell_failures.get(batch_id, (0.0, 0))
+            self._batch_sell_failures[batch_id] = (now, failures + 1)
+            if hasattr(self.broker, "reconcile_orders"):
+                with contextlib.suppress(Exception):
+                    await self._broker_call(self.broker.reconcile_orders)
             log.warning(
                 "BATCH_SELL_FAILED batch_id=%s cid=%s "
                 "size=%.0f price=%.4f 说明=退出卖单提交失败",

@@ -38,13 +38,13 @@ scanner:
   # market (a filled YES+NO pair is worth $1), so N markets need ~N×size of
   # free balance at once. At $100 capital, 1–2 markets is realistic; raise
   # this only as you add capital.
-  top_n_markets: 2
+  top_n_markets: 3
   # Ignore markets whose daily reward pool is below this (USD/day). Raised
   # from 75: a thin pool (e.g. an $82/day box-office bracket) earns only cents
   # of reward share at our size while still carrying full pick-off/forced-hedge
   # risk — a losing trade. Better to quote one strong market than backfill the
   # second slot with a toxic low-pool one. Lower only if the scanner starves.
-  min_pool_per_day: 120
+  min_pool_per_day: 80
   # Absolute book-liquidity floor (USD). The reward-density ranking below
   # (pool ÷ liquidity) structurally favors THIN books, which then trip the
   # volatility / book-not-quotable guards and tank in-band uptime (e.g. a $431
@@ -95,7 +95,7 @@ scanner:
   # risk.derisk_hours_before_end so freshly scanned markets aren't entered
   # already inside the de-risk/exit window (which would quote them at a shrunk
   # cap and widened spread for only a couple of hours before forced exit).
-  min_hours_to_end: 14
+  min_hours_to_end: 24
   # Re-run the scanner this often to rotate into fresh markets.
   refresh_minutes: 15
   # Check the selected markets' reward minimum size without re-ranking or
@@ -216,15 +216,6 @@ scanner:
     - announce
     - blockade
     - starmer
-    # AI/tech competition & benchmark books: a single outcome announcement
-    # (leaderboard update, eval result) reprices the market faster than quotes
-    # can be pulled — same adverse-selection profile as box-office and IPO books.
-    # e.g. "Alibaba Code Arena | WebDev AI lab" triggered a 6.2c mid crash in 57s.
-    - code arena
-    - ai lab
-    - benchmark
-    - leaderboard
-    - Anthropic
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of
@@ -516,7 +507,7 @@ controller:
       daily_loss_limit_usd: 8
       hard_kill_loss_usd: 20
     - min_equity_usd: 250
-      top_n_markets: 2
+      top_n_markets: 3
       size_mult_of_min: 1.0
       max_capital_per_market: 50
       max_inventory_usd_per_market: 60

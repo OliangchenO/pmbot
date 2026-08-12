@@ -1754,7 +1754,7 @@ class LiveBroker:
                 )
         return entry
 
-    def reconcile_orders(self) -> None:
+    def reconcile_orders(self) -> bool:
         """Rebuild local order state from exchange truth."""
         def _do_fetch():
             with self._client_lock:
@@ -1764,7 +1764,7 @@ class LiveBroker:
             remote = _with_retry("order reconcile", _do_fetch)
         except Exception as e:  # noqa: BLE001
             log.warning("订单对账失败：%s", e)
-            return
+            return False
         old_audits = {
             ro.order_id: ro.audit
             for orders in self._open_orders.values() for ro in orders
@@ -1801,6 +1801,7 @@ class LiveBroker:
                 by_cid.setdefault(cid, []).append(ro)
         self._open_orders = by_cid
         self._exit_orders = exit_by_cid
+        return True
 
     def refresh_state(self) -> bool:
         import httpx

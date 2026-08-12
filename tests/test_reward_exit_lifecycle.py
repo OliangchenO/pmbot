@@ -6,7 +6,9 @@ import copy
 from pmbot.books import BookTracker
 from pmbot.gamma import Market
 from pmbot import main
+from pmbot.brokers import RestingOrder
 from pmbot.main import Bot
+from pmbot.strategy import Quote
 
 
 def _market() -> Market:
@@ -30,14 +32,34 @@ def _bot(tmp_path) -> tuple[Bot, Market]:
     return bot, market
 
 
+def _record_rescan(bot: Bot) -> list[tuple[bool, bool, set[str]]]:
+    calls = []
+
+    async def record(*, initial=False, rotate=False, exclude_cids=None):
+        calls.append((initial, rotate, set(exclude_cids or ())))
+
+    bot._rescan = record
+    return calls
+
+
 def _open_take_batch(bot: Bot, market: Market, batch_id: str = "batch-1") -> None:
     bot.metrics.open_reward_exit_batch(
         batch_id=batch_id, cid=market.condition_id, origin_order_id="origin-order",
         origin_fill_id="origin-fill", origin_token_id=market.yes_token,
         complement_token_id=market.no_token, origin_size=10.0,
         origin_notional_usd=5.0, origin_fee_usd=0.0, take_target_size=20.0,
-        created_ts=1.0,
+        created_ts=1.0, market_name=market.question,
     )
+
+
+def test_reward_exit_batch_persists_market_name(tmp_path):
+    """批次列表必须保留创建时的市场名称，避免只能靠 CID 反查。"""
+    bot, market = _bot(tmp_path)
+
+    _open_take_batch(bot, market)
+
+    assert bot.metrics.get_reward_exit_batch("batch-1")["market_name"] == "Reward exit market"
+    bot.metrics.close()
 
 
 class _FillBroker:
@@ -130,6 +152,7 @@ def test_normal_reward_fill_replays_from_metrics_after_broker_restart(tmp_path):
     """A restart must not lose a normal maker fill before its batch is opened."""
     async def scenario():
         bot, market = _bot(tmp_path)
+        _record_rescan(bot)
         bot.metrics.record_reward_exit_fill(
             fill_id="durable-origin", batch_id="", order_id="normal-order",
             intent="normal_reward", cid=market.condition_id,
@@ -153,6 +176,7 @@ def test_first_reward_fill_cancels_once_and_every_fill_opens_its_own_take(tmp_pa
     """One market cancel guards every same-market reward fill, not only the first."""
     async def scenario():
         bot, market = _bot(tmp_path)
+        rescan_calls = _record_rescan(bot)
         broker = _FillBroker([
             {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
              "cid": market.condition_id, "token": market.yes_token, "side": "YES",
@@ -166,6 +190,7 @@ def test_first_reward_fill_cancels_once_and_every_fill_opens_its_own_take(tmp_pa
         await bot._process_reward_fills(12.0)
 
         assert broker.cancelled == [market.condition_id]
+        assert rescan_calls == [(False, True, {market.condition_id})]
         assert bot.metrics.get_reward_exit_batch("reward-exit-fill-1")["take_target_size"] == 66.0
         assert bot.metrics.get_reward_exit_batch("reward-exit-fill-2")["take_target_size"] == 80.0
         bot.metrics.close()
@@ -181,6 +206,12 @@ def test_cancel_failure_does_not_block_confirmed_reward_take(tmp_path):
 
     async def scenario():
         bot, market = _bot(tmp_path)
+        rescan_calls = []
+
+        async def record_rescan(*, initial=False, rotate=False, exclude_cids=None):
+            rescan_calls.append((initial, rotate, set(exclude_cids or ())))
+
+        bot._rescan = record_rescan
         bot.broker = _CancelFailBroker([
             {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
              "cid": market.condition_id, "token": market.yes_token, "side": "YES",
@@ -190,6 +221,7 @@ def test_cancel_failure_does_not_block_confirmed_reward_take(tmp_path):
         await bot._process_reward_fills(12.0)
 
         assert bot.metrics.get_reward_exit_batch("reward-exit-fill-1")["take_target_size"] == 66.0
+        assert rescan_calls == [(False, True, {market.condition_id})]
         bot.metrics.close()
 
     asyncio.run(scenario())
@@ -208,6 +240,7 @@ def test_failed_quote_cancel_retries_while_reward_batch_is_open(tmp_path):
 
     async def scenario():
         bot, market = _bot(tmp_path)
+        _record_rescan(bot)
         broker = _RetryBroker([
             {"fill_id": "fill-1", "order_id": "order-1", "intent": "normal_reward",
              "cid": market.condition_id, "token": market.yes_token, "side": "YES",
@@ -222,6 +255,167 @@ def test_failed_quote_cancel_retries_while_reward_batch_is_open(tmp_path):
         await bot._retry_reward_exit_quote_cancels(13.0)
         assert broker.attempts == 2
         assert bot._reward_exit_cancel_retries == {}
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_sell_refresh_waits_for_reconcile_to_remove_cancelled_order(tmp_path):
+    """A successful cancel request must not free shares until reconciliation does."""
+    class _ExitBroker:
+        fills_log = []
+
+        def __init__(self):
+            old = RestingOrder("old-exit", Quote("no-1", 0.62, 10.0), 1.0, 1)
+            self._reward_exit_orders = {"batch-1": old}
+            self._exit_orders = {}
+            self.cancelled = []
+            self.placed = []
+            self.reconciled = 0
+            self.old_still_open = True
+
+        def cancel_reward_exit(self, batch_id):
+            self.cancelled.append(batch_id)
+            self._reward_exit_orders.pop(batch_id, None)
+            return True
+
+        def reconcile_orders(self):
+            self.reconciled += 1
+            if self.old_still_open:
+                self._exit_orders = {
+                    "cid-1": RestingOrder(
+                        "old-exit", Quote("no-1", 0.62, 10.0), 1.0, 1)
+                }
+            else:
+                self._exit_orders = {}
+            return True
+
+        def place_reward_exit(self, market, batch_id, quote, audit_context):
+            self.placed.append((market, batch_id, quote, audit_context))
+            return RestingOrder("replacement", quote, 100.0, 1000)
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.metrics.update_reward_exit_batch(
+            batch_id="batch-1", status="SELL_PENDING", take_filled_size=20.0,
+            exit_initial_size=10.0, exit_target_price=0.62,
+        )
+        bot.tracker.books[market.no_token].snapshot(
+            [{"price": "0.61", "size": "100"}], [])
+        broker = _ExitBroker()
+        bot.broker = broker
+
+        await bot._advance_sell_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 100.0)
+
+        assert broker.cancelled == ["batch-1"]
+        assert broker.reconciled == 0
+        assert broker.placed == []
+
+        await bot._advance_sell_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 101.0)
+
+        assert broker.reconciled == 1
+        assert broker.placed == []
+
+        broker.old_still_open = False
+        await bot._advance_sell_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 102.0)
+
+        assert len(broker.placed) == 1
+        assert bot.metrics.get_reward_exit_order("batch-1")["status"] == "OPEN"
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_missing_persisted_batch_sell_reconciles_then_replaces(tmp_path):
+    """An exchange-confirmed missing persisted exit must not lock the batch forever."""
+    class _ExitBroker:
+        fills_log = []
+
+        def __init__(self):
+            self._reward_exit_orders = {}
+            self._exit_orders = {}
+            self._open_orders = {}
+            self.reconciled = 0
+            self.placed = []
+
+        def reconcile_orders(self):
+            self.reconciled += 1
+            return True
+
+        def place_reward_exit(self, market, batch_id, quote, audit_context):
+            self.placed.append((market, batch_id, quote, audit_context))
+            return RestingOrder("replacement", quote, 100.0, 1000)
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.metrics.update_reward_exit_batch(
+            batch_id="batch-1", status="SELL_PENDING", take_filled_size=20.0,
+            exit_initial_size=10.0, exit_target_price=0.62,
+        )
+        bot.metrics.record_reward_exit_order(
+            order_id="stale-exit", batch_id="batch-1", intent="batch_exit",
+            cid=market.condition_id, token_id=market.no_token, side="SELL",
+            price=0.62, size=10.0, expiration=200.0, status="OPEN",
+        )
+        bot.tracker.books[market.no_token].snapshot(
+            [{"price": "0.61", "size": "100"}], [])
+        broker = _ExitBroker()
+        bot.broker = broker
+
+        await bot._advance_sell_pending(
+            market.condition_id, bot.metrics.get_reward_exit_batch("batch-1"), 100.0)
+
+        assert broker.reconciled == 1
+        assert len(broker.placed) == 1
+        assert bot.metrics.get_reward_exit_order("batch-1")["order_id"] == "replacement"
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_batch_sell_reconciles_and_backs_off_before_retry(tmp_path):
+    """A rejected SELL cannot be reposted on every reward-exit tick."""
+    class _RejectingExitBroker:
+        fills_log = []
+        _reward_exit_orders = {}
+        _exit_orders = {}
+        _open_orders = {}
+
+        def __init__(self):
+            self.place_attempts = 0
+            self.reconcile_attempts = 0
+
+        def place_reward_exit(self, market, batch_id, quote, audit_context):
+            self.place_attempts += 1
+            return None
+
+        def reconcile_orders(self):
+            self.reconcile_attempts += 1
+            return True
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.metrics.update_reward_exit_batch(
+            batch_id="batch-1", status="SELL_PENDING", take_filled_size=20.0,
+            exit_initial_size=10.0, exit_target_price=0.62,
+        )
+        bot.tracker.books[market.no_token].snapshot(
+            [{"price": "0.61", "size": "100"}], [])
+        broker = _RejectingExitBroker()
+        bot.broker = broker
+
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        await bot._advance_sell_pending(market.condition_id, batch, 100.0)
+        await bot._advance_sell_pending(market.condition_id, batch, 101.0)
+
+        assert broker.place_attempts == 1
+        assert broker.reconcile_attempts == 1
         bot.metrics.close()
 
     asyncio.run(scenario())

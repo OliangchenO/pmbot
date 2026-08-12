@@ -907,6 +907,107 @@ def test_rescan_excludes_manual_hold_market_without_cancelling_orders(tmp_path, 
     asyncio.run(scenario())
 
 
+def test_rescan_releases_explicitly_excluded_market_when_no_replacement(
+        tmp_path, monkeypatch):
+    """奖励退出强制换市没有候选时，原市场不能继续占用普通报价席位。"""
+    from pmbot import gamma as gamma_mod
+
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path)
+        scan_excludes = []
+
+        def empty_scan(_cfg, exclude=None, full=False, shadow_inputs=None,
+                       outcome_report=None):
+            scan_excludes.append(set(exclude or ()))
+            return []
+
+        async def no_op_resubscribe(_token_ids, carry=None):
+            return None
+
+        monkeypatch.setattr(gamma_mod, "scan", empty_scan)
+        monkeypatch.setattr(bot.tracker, "resubscribe", no_op_resubscribe)
+        monkeypatch.setattr(bot, "_sync_markets_toml", lambda _markets: None)
+
+        await bot._rescan(rotate=True, exclude_cids={market.condition_id})
+
+        assert scan_excludes == [{market.condition_id}]
+        assert bot.markets == []
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_initial_rescan_excludes_market_with_persisted_reward_exit_batch(
+        tmp_path, monkeypatch):
+    """重启首轮扫描不能让未关闭退出批次的市场重新占用普通报价席位。"""
+    from pmbot import gamma as gamma_mod
+
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path)
+        replacement = _scored("replacement", 2.0)
+        scan_excludes = []
+
+        def fake_scan(_cfg, exclude=None, full=False, shadow_inputs=None,
+                      outcome_report=None):
+            scan_excludes.append(set(exclude or ()))
+            return [replacement]
+
+        async def no_op_resubscribe(_token_ids, carry=None):
+            return None
+
+        bot.metrics.open_reward_exit_batch(
+            batch_id="open-batch", cid=market.condition_id,
+            origin_order_id="order", origin_fill_id="fill",
+            origin_token_id=market.yes_token, complement_token_id=market.no_token,
+            origin_size=10.0, origin_notional_usd=5.0, origin_fee_usd=0.0,
+            take_target_size=20.0, created_ts=1.0,
+        )
+        monkeypatch.setattr(gamma_mod, "scan", fake_scan)
+        monkeypatch.setattr(bot.tracker, "resubscribe", no_op_resubscribe)
+        monkeypatch.setattr(bot, "_sync_markets_toml", lambda _markets: None)
+
+        await bot._rescan(initial=True)
+
+        assert scan_excludes == [{market.condition_id}]
+        assert [selected.condition_id for selected in bot.markets] == [replacement.condition_id]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_rescan_log_splits_exclusion_reasons(tmp_path, monkeypatch, caplog):
+    """The scan log must not call every exclusion a guard trip."""
+    from pmbot import gamma as gamma_mod
+
+    async def scenario():
+        bot, market = _quote_loop_bot_with_empty_strategy(tmp_path)
+        bot.cfg["risk"]["manual_hold_cids"] = ["manual-cid"]
+        bot.metrics.open_reward_exit_batch(
+            batch_id="open-batch", cid="reward-exit-cid",
+            origin_order_id="order", origin_fill_id="fill",
+            origin_token_id=market.yes_token, complement_token_id=market.no_token,
+            origin_size=10.0, origin_notional_usd=5.0, origin_fee_usd=0.0,
+            take_target_size=20.0, created_ts=1.0,
+        )
+        monkeypatch.setattr(bot, "_rotatable_tripped_cids", lambda: {"guard-cid"})
+        monkeypatch.setattr(bot.broker, "held_markets", lambda: [market])
+        monkeypatch.setattr(bot.broker, "unpaired_shares", lambda _market: 10.0)
+        monkeypatch.setattr(gamma_mod, "scan", lambda *_args, **_kwargs: [])
+
+        with caplog.at_level(logging.INFO, logger="pmbot"):
+            await bot._rescan()
+
+        message = next(msg for msg in caplog.messages if "正在扫描奖励市场" in msg)
+        assert "guard_tripped=1" in message
+        assert "reward_exit_locked=1" in message
+        assert "inventory_recovery=1" in message
+        assert "manual_hold=1" in message
+        assert "tripped)" not in message
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 def test_rescan_records_shadow_candidates_without_changing_legacy_selection(tmp_path, monkeypatch):
     """Passive P2.1 instrumentation must not make the shadow winner tradable."""
     from pmbot import gamma as gamma_mod
@@ -1268,6 +1369,42 @@ def test_live_startup_manages_inventory_when_scan_finds_no_market(tmp_path, monk
         bot._ensure_held_market_books.assert_awaited_once()
         bot._manage_inventory.assert_awaited_once()
         bot.metrics.close()
+    asyncio.run(scenario())
+
+
+def test_live_startup_ticks_reward_exit_before_inventory_recovery(tmp_path, monkeypatch):
+    """A scan drought must restore reward-exit locks before generic recovery."""
+    class StopRun(Exception):
+        pass
+
+    async def stop_after_first_retry(_seconds):
+        raise StopRun
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.paper = False
+        bot._bootstrap_live_broker = AsyncMock()
+        bot._rescan = AsyncMock()
+        bot._ensure_held_market_books = AsyncMock()
+        bot.broker = MagicMock()
+        calls = []
+
+        async def tick_reward_exit(_now):
+            calls.append("reward_exit")
+
+        async def manage_inventory(_now):
+            calls.append("inventory")
+
+        bot._run_reward_exit_batch_tick = tick_reward_exit
+        bot._manage_inventory = manage_inventory
+        monkeypatch.setattr(main.asyncio, "sleep", stop_after_first_retry)
+
+        with pytest.raises(StopRun):
+            await bot.run()
+
+        assert calls == ["reward_exit", "inventory"]
+        bot.metrics.close()
+
     asyncio.run(scenario())
 
 

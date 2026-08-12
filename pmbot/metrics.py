@@ -214,6 +214,7 @@ class MetricsStore:
             CREATE TABLE IF NOT EXISTS reward_exit_batches (
                 batch_id       TEXT NOT NULL PRIMARY KEY,
                 cid            TEXT NOT NULL,
+                market_name    TEXT NOT NULL DEFAULT '',
                 origin_order_id TEXT NOT NULL DEFAULT '',
                 origin_fill_id TEXT NOT NULL UNIQUE,  -- one batch per reward fill
                 origin_token_id TEXT NOT NULL DEFAULT '',
@@ -325,6 +326,7 @@ class MetricsStore:
         # ── reward_exit_batches timing columns (2026-08-11) ──
         reb_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(reward_exit_batches)")}
         for col, defn in [
+            ("market_name", "TEXT NOT NULL DEFAULT ''"),
             ("origin_fill_ts", "REAL NOT NULL DEFAULT 0.0"),
             ("first_take_submit_ts", "REAL"),
             ("first_take_executed_ts", "REAL"),
@@ -947,20 +949,20 @@ class MetricsStore:
             complement_token_id: str, origin_size: float,
             origin_notional_usd: float, origin_fee_usd: float,
             take_target_size: float, created_ts: float,
-            origin_fill_ts: float = 0.0,
+            origin_fill_ts: float = 0.0, market_name: str = "",
     ) -> bool:
         """Create a new reward exit batch.  Returns False on duplicate origin_fill_id."""
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO reward_exit_batches "
-                    "(batch_id, cid, origin_order_id, origin_fill_id, "
+                    "(batch_id, cid, market_name, origin_order_id, origin_fill_id, "
                     "origin_token_id, complement_token_id, origin_size, "
                     "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
                     "take_target_size, "
                     "status, created_ts, updated_ts) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (batch_id, cid, origin_order_id, origin_fill_id,
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (batch_id, cid, market_name, origin_order_id, origin_fill_id,
                      origin_token_id, complement_token_id, origin_size,
                      origin_notional_usd, origin_fee_usd, origin_fill_ts,
                      take_target_size,
@@ -974,7 +976,7 @@ class MetricsStore:
     def get_reward_exit_batch(self, batch_id: str) -> dict | None:
         """Return one batch by its id, or None."""
         row = self._conn.execute(
-            "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+            "SELECT batch_id, cid, market_name, origin_order_id, origin_fill_id, "
             "origin_token_id, complement_token_id, origin_size, "
             "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
             "take_target_size, "
@@ -995,7 +997,7 @@ class MetricsStore:
         """Return all open (non-CLOSED) batches, optionally filtered by cid."""
         if cid is not None:
             rows = self._conn.execute(
-                "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+                "SELECT batch_id, cid, market_name, origin_order_id, origin_fill_id, "
                 "origin_token_id, complement_token_id, origin_size, "
                 "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
                 "take_target_size, "
@@ -1011,7 +1013,7 @@ class MetricsStore:
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+                "SELECT batch_id, cid, market_name, origin_order_id, origin_fill_id, "
                 "origin_token_id, complement_token_id, origin_size, "
                 "origin_notional_usd, origin_fee_usd, origin_fill_ts, "
                 "take_target_size, "
@@ -1109,7 +1111,7 @@ class MetricsStore:
             params.append(cid)
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         rows = self._conn.execute(
-            f"SELECT batch_id, cid, origin_order_id, origin_fill_id, "
+            f"SELECT batch_id, cid, market_name, origin_order_id, origin_fill_id, "
             f"origin_token_id, complement_token_id, origin_size, "
             f"origin_notional_usd, origin_fee_usd, origin_fill_ts, "
             f"take_target_size, "
@@ -1136,7 +1138,7 @@ class MetricsStore:
     def _reward_exit_batch_row_to_dict(row: tuple) -> dict:
         """Convert a row tuple to a dictionary."""
         keys = [
-            "batch_id", "cid", "origin_order_id", "origin_fill_id",
+            "batch_id", "cid", "market_name", "origin_order_id", "origin_fill_id",
             "origin_token_id", "complement_token_id", "origin_size",
             "origin_notional_usd", "origin_fee_usd", "origin_fill_ts",
             "take_target_size",
