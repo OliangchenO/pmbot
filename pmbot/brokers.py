@@ -243,6 +243,19 @@ class PaperBroker:
             if cid not in exclude:
                 self._exits.pop(cid, None)
 
+    def cancel_all_for_market(self, market: Market) -> bool:
+        """Remove every paper order for a market before manual handoff."""
+        cid = market.condition_id
+        now = time.time()
+        for state in self._quotes.get(cid, []):
+            self._start_dying(cid, state, now)
+        self._quotes.pop(cid, None)
+        self._exits.pop(cid, None)
+        for batch_id, state in list(self._reward_exits.items()):
+            if state.quote.token_id in (market.yes_token, market.no_token):
+                self._reward_exits.pop(batch_id, None)
+        return True
+
     def cancel_quotes(self, exclude_cids: set[str] | None = None) -> None:
         now = time.time()
         exclude = exclude_cids or set()
@@ -1318,6 +1331,27 @@ class LiveBroker:
         else:
             self.reconcile_orders()
             return False
+
+    def cancel_all_for_market(self, market: Market) -> bool:
+        """Cancel every bot-owned order for one CID before manual handoff."""
+        cid = market.condition_id
+        ids = [ro.order_id for ro in self._open_orders.get(cid, [])]
+        exit_order = self._exit_orders.get(cid)
+        if exit_order is not None:
+            ids.append(exit_order.order_id)
+        reward_batches = [
+            batch_id for batch_id, ro in self._reward_exit_orders.items()
+            if ro.quote.token_id in (market.yes_token, market.no_token)
+        ]
+        ids.extend(self._reward_exit_orders[batch_id].order_id for batch_id in reward_batches)
+        if not self._batch_cancel(ids, reason="reward_exit_manual_hold"):
+            self.reconcile_orders()
+            return False
+        self._open_orders.pop(cid, None)
+        self._exit_orders.pop(cid, None)
+        for batch_id in reward_batches:
+            self._reward_exit_orders.pop(batch_id, None)
+        return True
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [ro.quote for ro in self._open_orders.get(market.condition_id, [])]

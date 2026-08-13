@@ -62,6 +62,193 @@ def test_reward_exit_batch_persists_market_name(tmp_path):
     bot.metrics.close()
 
 
+def test_completed_take_cancels_market_orders_then_enters_named_manual_hold(tmp_path):
+    """补齐 2x 后若仍进入 SELL_PENDING，机器人会继续操作已交给人工的市场。"""
+    class _ManualHoldBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.cancelled = []
+
+        def cancel_all_for_market(self, market):
+            self.cancelled.append(market.condition_id)
+            return True
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.broker = _ManualHoldBroker()
+        fills = [
+            {"fill_id": "take-a", "ts": 2.0, "price": 0.55, "size": 10.0, "fee_usd": 0.0},
+            {"fill_id": "take-b", "ts": 3.0, "price": 0.56, "size": 10.0, "fee_usd": 0.0},
+        ]
+
+        await bot._seal_and_set_sell_target(
+            bot.metrics.get_reward_exit_batch("batch-1"), fills, 4.0)
+
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        assert bot.broker.cancelled == [market.condition_id]
+        assert batch["status"] == "MANUAL_HOLD"
+        assert batch["manual_reason"] == "take_complete_manual_hold"
+        assert batch["market_name"] == market.question
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_manual_hold_notifies_dingtalk_with_persisted_sell_suggestion(tmp_path):
+    """人工接管通知必须带原 SELL 算法的建议价，而不是只给 CID。"""
+    class _Notifier:
+        def __init__(self):
+            self.messages = []
+
+        def send_markdown(self, title, text):
+            self.messages.append((title, text))
+
+    class _ManualHoldBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.notifier = _Notifier()
+
+        def cancel_all_for_market(self, market):
+            return True
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.broker = _ManualHoldBroker()
+        fills = [
+            {"fill_id": "take-a", "ts": 2.0, "price": 0.55, "size": 10.0, "fee_usd": 0.0},
+            {"fill_id": "take-b", "ts": 3.0, "price": 0.56, "size": 10.0, "fee_usd": 0.0},
+        ]
+
+        await bot._seal_and_set_sell_target(
+            bot.metrics.get_reward_exit_batch("batch-1"), fills, 4.0)
+
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        assert batch["exit_target_price"] == 0.61
+        assert bot.broker.notifier.messages == [(
+            "[PMBot] 市场转人工管理",
+            "## 市场转人工管理\n"
+            "- 市场：Reward exit market\n"
+            "- CID：cid-1\n"
+            "- 建议卖出：10 股 @ 0.6100\n"
+            "- 机器人已撤销该市场订单，后续不再操作。",
+        )]
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_manual_hold_releases_when_net_outcome_exposure_is_below_five_shares(tmp_path):
+    """人工交接按 YES/NO 净敞口，而不是任一边的总持仓解除。"""
+    class _ManualHoldBroker:
+        fills_log = []
+
+        def __init__(self, shares):
+            self.shares = shares
+
+        def position_shares(self, market):
+            return self.shares
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.metrics.update_reward_exit_batch(
+            batch_id="batch-1", status="MANUAL_HOLD",
+            manual_reason="take_complete_manual_hold")
+        bot.broker = _ManualHoldBroker((10.0, 4.3))
+
+        await bot._release_reward_exit_manual_holds(10.0)
+        assert bot.metrics.get_reward_exit_batch("batch-1")["status"] == "MANUAL_HOLD"
+
+        bot.broker.shares = (8.6, 4.3)
+        await bot._release_reward_exit_manual_holds(11.0)
+        closed = bot.metrics.get_reward_exit_batch("batch-1")
+        assert closed["status"] == "CLOSED"
+        assert closed["manual_reason"] == "manual_hold_net_inventory_below_5"
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_manual_hold_retries_handoff_when_initial_order_cancel_fails(tmp_path):
+    """撤单失败后不重试接管会让补齐的批次永久停在 TAKE_PENDING。"""
+    class _ManualHoldBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = 0
+
+        def cancel_all_for_market(self, market):
+            self.calls += 1
+            return self.calls > 1
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        for fill_id, price, ts in (("take-a", 0.55, 2.0), ("take-b", 0.56, 3.0)):
+            bot.metrics.record_reward_exit_fill(
+                fill_id=fill_id, batch_id="batch-1", order_id="take-order",
+                intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+                side="BUY", price=price, size=10.0, fee_usd=0.0, ts=ts,
+            )
+        bot.broker = _ManualHoldBroker()
+
+        await bot._credit_take_fills(4.0)
+        assert bot.metrics.get_reward_exit_batch("batch-1")["status"] == "TAKE_PENDING"
+        await bot._credit_take_fills(5.0)
+        assert bot.metrics.get_reward_exit_batch("batch-1")["status"] == "MANUAL_HOLD"
+        assert bot.broker.calls == 2
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_subminimum_take_residual_hands_off_with_actual_sellable_size(tmp_path):
+    """剩余不足最小下单量时不能超时关闭；可卖余仓必须按真实已买数量计算。"""
+    class _ManualHoldBroker:
+        fills_log = []
+
+        def __init__(self):
+            self.calls = 0
+
+        def cancel_all_for_market(self, market):
+            self.calls += 1
+            return self.calls > 1
+
+    async def scenario():
+        bot, market = _bot(tmp_path)
+        _open_take_batch(bot, market)
+        bot.tracker.books[market.no_token].snapshot(
+            [{"price": "0.60", "size": "100"}], [], min_order_size=5.0)
+        bot.metrics.record_reward_exit_fill(
+            fill_id="take-a", batch_id="batch-1", order_id="take-order",
+            intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+            side="BUY", price=0.55, size=10.0, fee_usd=0.0, ts=2.0,
+        )
+        bot.metrics.record_reward_exit_fill(
+            fill_id="take-b", batch_id="batch-1", order_id="take-order",
+            intent="batch_take", cid=market.condition_id, token_id=market.no_token,
+            side="BUY", price=0.56, size=9.99, fee_usd=0.0, ts=3.0,
+        )
+        bot.broker = _ManualHoldBroker()
+
+        await bot._credit_take_fills(4.0)
+        assert bot.metrics.get_reward_exit_batch("batch-1")["status"] == "TAKE_PENDING"
+        await bot._credit_take_fills(5.0)
+
+        batch = bot.metrics.get_reward_exit_batch("batch-1")
+        assert batch["status"] == "MANUAL_HOLD"
+        assert batch["exit_initial_size"] == 9.99
+        assert batch["manual_reason"] == "take_residual_below_min_order_size"
+        assert bot.broker.calls == 2
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
 class _FillBroker:
     def __init__(self, fills):
         self.fills_log = fills

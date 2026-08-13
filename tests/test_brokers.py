@@ -958,6 +958,31 @@ def test_live_batch_take_uses_share_limited_fak_without_hedge_overlay():
     assert not LiveBroker.has_pending_hedge(stub, market.condition_id)
 
 
+def test_manual_hold_cancels_normal_exit_and_reward_exit_orders_for_one_market():
+    """人工接管必须清掉该 CID 的全部机器人订单，而非只撤普通报价。"""
+    from pmbot.brokers import RestingOrder
+
+    stub = _order_book_stub()
+    market = _market()
+    stub._open_orders = {market.condition_id: [
+        RestingOrder("normal-1", Quote(market.yes_token, 0.4, 10), 1.0),
+    ]}
+    stub._exit_orders = {
+        market.condition_id: RestingOrder("exit-1", Quote(market.no_token, 0.6, 10), 1.0),
+    }
+    stub._reward_exit_orders = {
+        "batch-1": RestingOrder("reward-exit-1", Quote(market.no_token, 0.61, 10), 1.0),
+    }
+    cancelled = []
+    stub._batch_cancel = lambda ids, **_kwargs: cancelled.extend(ids) or True
+
+    assert LiveBroker.cancel_all_for_market(stub, market) is True
+    assert cancelled == ["normal-1", "exit-1", "reward-exit-1"]
+    assert stub._open_orders == {}
+    assert stub._exit_orders == {}
+    assert stub._reward_exit_orders == {}
+
+
 def test_ws_no_order_id_batch_take_fill_persists_real_batch_fact(tmp_path):
     """删除待归因 take 上下文会使真实 FAK 成交无法推进其批次。"""
     from pmbot.metrics import MetricsStore

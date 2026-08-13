@@ -979,6 +979,12 @@ class Bot:
             hex(cid) if isinstance(cid, int) else str(cid)
             for cid in risk_cfg.get("manual_hold_cids") or []
         }
+        if self.metrics is not None:
+            manual.update(
+                str(batch["cid"])
+                for batch in self.metrics.get_open_reward_exit_batches()
+                if batch.get("status") == "MANUAL_HOLD"
+            )
         manual.update(self._banned_cids)
         return manual
 
@@ -2049,6 +2055,7 @@ class Bot:
 
         # ── Step 2: advance existing batches ──
         await self._advance_reward_exit_batches(now)
+        await self._release_reward_exit_manual_holds(now)
 
         # ── Step 3: sync CIDs ──
         # Any CID with an open (non-CLOSED) batch is reward_exit_locked.
@@ -2072,7 +2079,48 @@ class Bot:
                             "说明=所有批次已关闭，市场可在下次扫描后恢复报价",
                             cid, str(m_name)[:50])
 
+    async def _release_reward_exit_manual_holds(self, now: float) -> None:
+        """Return a manually handed-off market once its net inventory is small."""
+        if self.metrics is None or self.broker is None:
+            return
+        for batch in self.metrics.get_open_reward_exit_batches():
+            if batch.get("status") != "MANUAL_HOLD":
+                continue
+            cid = str(batch["cid"])
+            market = next((m for m in self.markets if m.condition_id == cid), None)
+            if market is None:
+                market = self._token_market.get(batch["origin_token_id"])
+            if market is None or not hasattr(self.broker, "position_shares"):
+                continue
+            yes_shares, no_shares = self.broker.position_shares(market)
+            net_shares = abs(float(yes_shares) - float(no_shares))
+            if net_shares >= 5.0:
+                continue
+            self.metrics.close_reward_exit_batch(
+                batch_id=batch["batch_id"], status="CLOSED", closed_ts=now,
+                manual_reason="manual_hold_net_inventory_below_5")
+            log.warning(
+                "MARKET_MANUAL_HOLD_RELEASED batch_id=%s cid=%s market='%s' "
+                "yes=%.2f no=%.2f net=%.2f 说明=净敞口低于5股，恢复自动管理",
+                batch["batch_id"], cid, batch.get("market_name") or market.question,
+                yes_shares, no_shares, net_shares,
+            )
+
     # ── Take fill credit: detect FAK fills and update batch ──
+
+    def _take_handoff_reason(self, batch: dict, total_filled: float) -> str | None:
+        """Return the manual-hold reason once no further valid take is possible."""
+        target = float(batch["take_target_size"])
+        remaining = reward_exit.remaining_take(target, total_filled)
+        if remaining <= 1e-9:
+            return "take_complete_manual_hold"
+        min_order_size = self._clob_min_order_size(batch["complement_token_id"])
+        if min_order_size is None:
+            market = next((m for m in self.markets if m.condition_id == batch["cid"]), None)
+            min_order_size = float(market.min_size) if market is not None else None
+        if min_order_size is not None and remaining < min_order_size:
+            return "take_residual_below_min_order_size"
+        return None
 
     async def _credit_take_fills(self, now: float) -> None:
         """Check fills_log for taker fills and credit them to TAKE_PENDING batches.
@@ -2080,7 +2128,7 @@ class Bot:
         For each active take batch, find fills on the complement token that are
         taker fills (path == 'reward_exit_take' or 'forced_hedge') and accumulate
         take_filled_size, take_notional_usd, take_fee_usd.  When filled >= 2q,
-        transition to SELL_PENDING via compute_sell_target.
+        cancel bot orders and transfer the CID to MANUAL_HOLD.
 
         NOTE: batch_take fills are credited directly by _advance_take_pending()
         immediately after FAK execution.  This method reads the already-persisted
@@ -2111,6 +2159,12 @@ class Bot:
             prev_filled = float(b.get("take_filled_size") or 0)
             if abs(total_filled - prev_filled) < 1e-9 and \
                     abs(total_notional - float(b.get("take_notional_usd") or 0)) < 1e-9:
+                handoff_reason = self._take_handoff_reason(b, total_filled)
+                if handoff_reason is not None:
+                    # A prior manual-handoff cancellation may have failed.
+                    # Retry without inventing a fill or submitting another take.
+                    await self._seal_and_set_sell_target(
+                        b, persisted, now, manual_reason=handoff_reason)
                 continue
 
             # Update persisted batch with accumulated totals
@@ -2144,13 +2198,17 @@ class Bot:
                 total_filled, float(b["take_target_size"]),
             )
 
-            # If take is fully filled, seal and compute SELL target
-            target = float(b["take_target_size"])
-            if total_filled >= target - 1e-9:
-                await self._seal_and_set_sell_target(b, persisted, now)
+            # A remainder below the CLOB's hard order-size floor cannot be
+            # bought, so hand the confirmed inventory to manual management
+            # instead of letting a timeout close and unlock the CID.
+            handoff_reason = self._take_handoff_reason(b, total_filled)
+            if handoff_reason is not None:
+                await self._seal_and_set_sell_target(
+                    b, persisted, now, manual_reason=handoff_reason)
 
     async def _seal_and_set_sell_target(
         self, batch: dict, take_fill_dicts: list[dict], now: float,
+        manual_reason: str = "take_complete_manual_hold",
     ) -> None:
         """Seal a fully-filled take batch: compute paired loss, set SELL target."""
         if self.metrics is None or self.tracker is None or self.broker is None:
@@ -2197,62 +2255,64 @@ class Bot:
             )
             return
 
+        exit_size = round(min(orig_size, max(0.0, sum(f.size for f in take_fills) - orig_size)), 6)
         complement_token = batch["complement_token_id"]
         book = self.tracker.books.get(complement_token)
-        best_bid = book.best_bid if book else None
-
-        # Compute SELL target price
-        target_result = reward_exit.compute_sell_target(
+        target_result = compute_sell_target(
             market=m,
-            exit_size=orig_size,
+            exit_size=exit_size,
             exit_cost_notional=split.exit_notional,
             exit_cost_fee=split.exit_fee,
             paired_loss_usd=paired_loss,
-            best_bid=best_bid,
+            best_bid=book.best_bid if book else None,
         )
+        suggested_price = target_result.price
 
-        if target_result.price is None:
-            # Cannot compute a valid target — move to MANUAL_HOLD
-            self.metrics.update_reward_exit_batch(
-                batch_id=batch_id,
-                paired_size=orig_size,
-                paired_loss_usd=paired_loss,
-                exit_initial_size=orig_size,
-                status="MANUAL_HOLD",
-                manual_reason=target_result.reason,
-                updated_ts=now,
-            )
+        cancel_all = getattr(self.broker, "cancel_all_for_market", None)
+        cancelled = bool(await self._broker_call(cancel_all, m)) if callable(cancel_all) else False
+        if not cancelled:
             log.warning(
-                "BATCH_MANUAL_HOLD batch_id=%s cid=%s reason=%s "
-                "origin_notional=%.4f paired_notional=%.4f exit_notional=%.4f "
-                "paired_loss=%.4f 说明=无法计算有效卖出目标价",
-                batch_id, cid, target_result.reason,
-                orig_notional, split.paired_notional, split.exit_notional,
-                paired_loss,
+                "MARKET_MANUAL_HOLD_CANCEL_FAILED batch_id=%s cid=%s market='%s' "
+                "说明=未确认撤销该市场全部机器人订单，暂不交给人工",
+                batch_id, cid, batch.get("market_name") or m.question,
             )
             return
 
-        # Seal → SELL_PENDING
+        # Once 2x is confirmed, hand the entire CID to the operator.  Do not
+        # create the former batch SELL or let generic recovery touch it.
         self.metrics.update_reward_exit_batch(
             batch_id=batch_id,
             paired_size=orig_size,
             paired_loss_usd=paired_loss,
-            exit_initial_size=orig_size,
-            exit_target_price=target_result.price,
-            status="SELL_PENDING",
+            exit_initial_size=exit_size,
+            exit_target_price=float(suggested_price or 0.0),
+            status="MANUAL_HOLD",
+            manual_reason=manual_reason,
             updated_ts=now,
         )
 
         log.warning(
-            "BATCH_SEALED batch_id=%s cid=%s paired_loss=%.4f "
-            "exit_cost_notional=%.4f exit_cost_fee=%.4f "
-            "exit_target_price=%.4f exit_size=%.0f "
-            "required_net=%.4f 说明=TAKE完成，批次已密封，进入SELL阶段",
-            batch_id, cid, paired_loss,
-            split.exit_notional, split.exit_fee,
-            target_result.price, orig_size,
-            target_result.required_net_usd,
+            "MARKET_MANUAL_HOLD batch_id=%s cid=%s market='%s' paired_loss=%.4f "
+            "exit_size=%.0f 说明=TAKE完成，已撤销机器人订单并交给人工管理",
+            batch_id, cid, batch.get("market_name") or m.question, paired_loss, exit_size,
         )
+        notifier = getattr(self.broker, "notifier", None)
+        if notifier is not None:
+            size_text = (f"{exit_size:.0f}" if abs(exit_size - round(exit_size)) < 1e-9
+                         else f"{exit_size:.2f}")
+            suggestion = (f"{size_text} 股 @ {suggested_price:.4f}"
+                          if suggested_price is not None else "无法计算有效建议价")
+            try:
+                notifier.send_markdown(
+                    "[PMBot] 市场转人工管理",
+                    "## 市场转人工管理\n"
+                    f"- 市场：{batch.get('market_name') or m.question}\n"
+                    f"- CID：{cid}\n"
+                    f"- 建议卖出：{suggestion}\n"
+                    "- 机器人已撤销该市场订单，后续不再操作。",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("MARKET_MANUAL_HOLD_NOTIFY_FAILED batch_id=%s: %s", batch_id, exc)
 
         # ── Timing stats: compute end-to-end take latency ──
         if self.metrics is not None:
